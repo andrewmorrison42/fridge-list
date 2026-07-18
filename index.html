@@ -182,6 +182,10 @@ const MSAL_CONFIG = {
 // Files.ReadWrite alone only covers files the signed-in user owns.
 const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
+// Bumped with every released build — shown in the header, startup status and Sync
+// options so any device can be checked at a glance for which build it's running.
+const APP_VERSION = 'v10';
+
 let recipesData = null;   // { recipes:[...], ingredients:[...], meta }
 let imagesData = {};      // { filename: {type, base64} }
 let shoppingData = null;  // { weekPlan:{selections:[]}, shoppingList:[], neededList:[], lastUpdated }
@@ -275,7 +279,7 @@ function init(){
   tryReconnectFolder();
   initMsal();
   render();
-  setStatus('Loaded ' + recipesData.recipes.length + ' recipes. Working from this device’s local copy.', 'ok');
+  setStatus('Loaded ' + recipesData.recipes.length + ' recipes (app ' + APP_VERSION + '). Working from this device’s local copy.', 'ok');
 }
 
 function saveRecipesLocal(){ localStorage.setItem(LS_RECIPES, JSON.stringify(recipesData)); }
@@ -1584,12 +1588,19 @@ function closeModal(){ document.getElementById('modalRoot').innerHTML=''; }
 function showSyncModal(){
   const body = el('div',{});
   body.appendChild(el('h2',{},['Sync options']));
+  body.appendChild(el('p',{class:'small-note', style:'margin-top:-6px;'},['App version: ' + APP_VERSION]));
   body.appendChild(el('p',{class:'muted'},['This app keeps a copy on this device automatically. For sync that works on every device, including Android — sign in with Microsoft below to sync through OneDrive. On desktop Chrome/Edge you can alternatively link a local folder directly.']));
 
   /* -------- OneDrive sync (works on any device, incl. Android) -------- */
   body.appendChild(el('h3',{style:'margin-bottom:4px;'},['OneDrive (recommended for Android)']));
   if(msalAccount){
     body.appendChild(el('p',{class:'small-note'},['Signed in as ' + (msalAccount.username||msalAccount.name||'your Microsoft account') + '. Checking for changes from other devices every 20 seconds while this tab is open.']));
+    if(oneDriveFolderRef){
+      // Diagnostic: two devices are only truly in sync if this ID matches on both.
+      body.appendChild(el('p',{class:'small-note', style:'word-break:break-all;'},['Connected folder ID: ' + oneDriveFolderRef.driveId + ' / ' + oneDriveFolderRef.itemId]));
+    } else {
+      body.appendChild(el('p',{class:'small-note'},['No FridgeList folder connected yet on this device — use "Sync now" below.']));
+    }
     const reSyncBtn = el('button',{class:'btn'},['Sync now']);
     reSyncBtn.addEventListener('click', ()=>{ closeModal(); loadFromOneDriveOrSeed(); startOneDrivePolling(); });
     const signOutBtn = el('button',{class:'btn secondary'},['Sign out of OneDrive']);
