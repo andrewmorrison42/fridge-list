@@ -4,9 +4,18 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>The Fridge List</title>
-<link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <meta name="theme-color" content="#435c39">
+<script>
+(function(){
+  var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if(!isIOS){
+    var l = document.createElement('link');
+    l.rel = 'manifest'; l.href = 'manifest.webmanifest';
+    document.head.appendChild(l);
+  }
+})();
+</script>
 <link rel="icon" type="image/png" href="data:image/png;base64,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">
 <style>
 :root{
@@ -187,7 +196,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v15';
+const APP_VERSION = 'v16';
 
 let recipesData = null;   // { recipes:[...], ingredients:[...], meta }
 let imagesData = {};      // { filename: {type, base64} }
