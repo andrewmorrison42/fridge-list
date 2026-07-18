@@ -492,19 +492,30 @@ async function graphFetch(path, token, opts){
   return fetch('https://graph.microsoft.com/v1.0' + path, Object.assign({}, opts, { headers }));
 }
 
-// Resolves a "FridgeList" folder to sync through. Checked in this order, and a new
-// folder is only ever created as a last resort: (1) does this account already own one
-// in their own OneDrive, (2) has someone else in the family already shared one WITH this
-// account (checked before creating anything, so a family member never ends up silently
-// creating their own disconnected folder just because they don't own one yet), (3) only
-// if genuinely nowhere — create it in the signed-in user's own drive (first-ever setup).
+// Resolves a "FridgeList" folder to sync through.
+//
+// Family members who don't own the folder should add a SHORTCUT to it in their own
+// OneDrive first (onedrive.com -> Shared -> FridgeList -> "Add shortcut to My files").
+// A shortcut shows up as a normal item at the root of their own drive, so the first
+// check below finds it directly and reliably.
+//
+// We deliberately do NOT rely on the /me/drive/sharedWithMe endpoint as the primary
+// mechanism any more: Microsoft has throttled it (sometimes returning only a single
+// result) ahead of fully retiring it in November 2026. It's kept as a best-effort
+// fallback only — something that might help, never something we depend on.
+//
+// A brand-new folder is only ever created after the human confirms it via
+// confirmCreateNewFridgeListFolder() — see resolveOrCreateFridgeListFolder() below —
+// so a family member can never silently end up with their own disconnected copy.
 async function resolveFridgeListFolder(token){
   let res = await graphFetch('/me/drive/root:/FridgeList', token);
   if(res.status === 200){
     const j = await res.json();
-    return { driveId: j.parentReference.driveId, itemId: j.id };
+    if(j.remoteItem) return { driveId: j.remoteItem.parentReference.driveId, itemId: j.remoteItem.id }; // shortcut to a shared folder
+    return { driveId: j.parentReference.driveId, itemId: j.id }; // folder we own outright
   }
 
+  // Best-effort only — known unreliable, see comment above.
   res = await graphFetch('/me/drive/sharedWithMe', token);
   if(res.status === 200){
     const j = await res.json();
@@ -512,7 +523,11 @@ async function resolveFridgeListFolder(token){
     if(match) return { driveId: match.remoteItem.parentReference.driveId, itemId: match.remoteItem.id };
   }
 
-  res = await graphFetch('/me/drive/root/children', token, {
+  return null; // not found anywhere — caller decides whether to offer creating a new one
+}
+
+async function createFridgeListFolder(token){
+  const res = await graphFetch('/me/drive/root/children', token, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: 'FridgeList', folder: {}, '@microsoft.graph.conflictBehavior': 'fail' })
@@ -522,6 +537,17 @@ async function resolveFridgeListFolder(token){
     return { driveId: j.parentReference.driveId, itemId: j.id };
   }
   return null;
+}
+
+// Wraps resolveFridgeListFolder() with a human checkpoint: if no existing folder is
+// found (owned or shortcut), ask before creating a new one, rather than silently
+// spinning up a disconnected copy for whoever forgot the shortcut step.
+async function resolveOrCreateFridgeListFolder(token){
+  const found = await resolveFridgeListFolder(token);
+  if(found) return found;
+  const proceed = confirm('No "FridgeList" folder was found in your OneDrive.\n\nIf someone in your family already set this up, you probably need to add a shortcut to their shared folder first (onedrive.com -> Shared -> FridgeList -> "Add shortcut to My files"), then try again.\n\nOtherwise, click OK to create a new, empty FridgeList folder in your own OneDrive.');
+  if(!proceed) return null;
+  return createFridgeListFolder(token);
 }
 
 async function getOneDriveFileText(driveId, folderItemId, name, token){
@@ -547,9 +573,9 @@ async function loadFromOneDriveOrSeed(){
   const token = await getGraphToken();
   if(!token){ setStatus('Could not get a OneDrive sign-in token — try "Sync options" to sign in again.', 'warn'); return; }
   try{
-    oneDriveFolderRef = await resolveFridgeListFolder(token);
+    oneDriveFolderRef = await resolveOrCreateFridgeListFolder(token);
     if(!oneDriveFolderRef){
-      setStatus('Could not find or create a "FridgeList" folder in OneDrive.', 'warn');
+      setStatus('No "FridgeList" folder connected — open Sync options to try again.', 'warn');
       return;
     }
     const { driveId, itemId } = oneDriveFolderRef;
@@ -581,6 +607,9 @@ function autoSaveToOneDrive(){
   clearTimeout(oneDriveSaveTimer);
   oneDriveSaveTimer = setTimeout(async ()=>{
     if(!oneDriveFolderRef){
+      // Background autosave never prompts — only a user-initiated sign-in/sync does.
+      // If nothing's resolved yet, skip this save; it'll go through next time the
+      // folder is properly connected via Sync options.
       const token = await getGraphToken();
       if(!token) return;
       oneDriveFolderRef = await resolveFridgeListFolder(token);
@@ -1571,7 +1600,7 @@ function showSyncModal(){
     signInBtn.disabled = !oneDriveSupported();
     signInBtn.addEventListener('click', signInOneDrive);
     body.appendChild(el('div',{class:'field'},[signInBtn]));
-    body.appendChild(el('p',{class:'small-note'},['This creates/uses a "FridgeList" folder in OneDrive — your own drive, or a folder someone in the family has already shared with you. Requires an internet connection each time the app opens or saves changes.']));
+    body.appendChild(el('p',{class:'small-note'},['Uses a "FridgeList" folder in OneDrive. If you own it, it connects automatically. If someone else in the family set it up and shared it with you, add a shortcut to it first — onedrive.com → Shared → FridgeList → "Add shortcut to My files" — then sign in here. Requires an internet connection each time the app opens or saves changes.']));
   }
 
   /* -------- Local folder link (desktop Chrome/Edge only) -------- */
