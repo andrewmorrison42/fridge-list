@@ -187,7 +187,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v14';
+const APP_VERSION = 'v15';
 
 let recipesData = null;   // { recipes:[...], ingredients:[...], meta }
 let imagesData = {};      // { filename: {type, base64} }
@@ -624,8 +624,10 @@ async function loadFromOneDriveOrSeed(){
     }
     const sText = await getOneDriveFileText(driveId, itemId, 'shopping-list.json', token);
     if(sText){
-      shoppingData = JSON.parse(sText);
-      saveShoppingLocal();
+      // Merge rather than replace, so ticks made on this device while offline/only-local
+      // survive reconnection instead of being wiped by the remote copy.
+      shoppingData = mergeShoppingData(shoppingData, JSON.parse(sText));
+      localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData));
     } else {
       await writeOneDriveFile(driveId, itemId, 'shopping-list.json', JSON.stringify(shoppingData));
     }
@@ -652,7 +654,8 @@ function autoSaveToOneDrive(){
     }
     const { driveId, itemId } = oneDriveFolderRef;
     const okR = await writeOneDriveFile(driveId, itemId, 'recipes-data.json', JSON.stringify(recipesData));
-    const okS = await writeOneDriveFile(driveId, itemId, 'shopping-list.json', JSON.stringify(shoppingData));
+    const tokenS = await getGraphToken();
+    const okS = tokenS ? await writeShoppingMerged(tokenS) : false;
     if(okR && okS) setStatus('Saved to OneDrive — ' + new Date().toLocaleTimeString(), 'ok');
     else setStatus('Could not save to OneDrive — will retry on next change.', 'warn');
     // Stamp our own write so the next poll doesn't immediately re-download what we just sent.
@@ -671,10 +674,12 @@ function startOneDrivePolling(){
   if(!msalAccount || localStorage.getItem(LS_ONEDRIVE_FLAG) !== '1') return;
   stampOneDriveTimestamps(); // baseline, so the first poll doesn't false-trigger
   oneDrivePollTimer = setInterval(pollOneDriveForChanges, ONEDRIVE_POLL_MS);
+  startShoppingFastPoll();
 }
 
 function stopOneDrivePolling(){
   if(oneDrivePollTimer){ clearInterval(oneDrivePollTimer); oneDrivePollTimer = null; }
+  stopShoppingFastPoll();
 }
 
 async function stampOneDriveTimestamps(){
@@ -720,6 +725,134 @@ async function pollOneDriveForChanges(){
       setStatus('Updated from OneDrive — ' + new Date().toLocaleTimeString(), 'ok');
     }
   }catch(e){ console.warn('OneDrive poll failed', e); }
+}
+
+/* ---------------- concurrent-shopping merge (v15) ----------------
+   Two people ticking off the same list in different parts of the supermarket used
+   to race: each device wrote the WHOLE shopping file, so the second save wiped the
+   first one's ticks. Shopping saves now merge per item instead of overwriting:
+   fetch remote, resolve each line by latest per-item timestamp (a tick beats an
+   untick when neither is stamped), then write back guarded by the file's ETag —
+   if someone else wrote in between, the write is refused and we re-merge and retry.
+   Scope: shopping list + wait-list done flags only. Recipes stay last-save-wins. */
+
+function lineMergeKey(l){
+  return l.source === 'needed' ? ('needed:' + l.neededId) : ('ing:' + (l.ingredientName||'').trim().toLowerCase());
+}
+
+function mergeShoppingData(a, b){
+  if(!a) return b;
+  if(!b) return a;
+  const ts = x => (x && x.lastUpdated) ? (Date.parse(x.lastUpdated) || 0) : 0;
+  const base = ts(a) >= ts(b) ? a : b;      // newer file wins on composition (weekPlan, list membership)
+  const other = base === a ? b : a;
+  const otherLines = {};
+  (other.shoppingList || []).forEach(l => { otherLines[lineMergeKey(l)] = l; });
+  (base.shoppingList || []).forEach(l => {
+    const o = otherLines[lineMergeKey(l)];
+    if(!o) return;
+    const lt = l.changedAt ? (Date.parse(l.changedAt) || 0) : 0;
+    const ot = o.changedAt ? (Date.parse(o.changedAt) || 0) : 0;
+    if(ot > lt){
+      l.checked = o.checked; l.removed = o.removed; l.changedAt = o.changedAt;
+    } else if(lt === 0 && ot === 0){
+      // no stamps on either side (pre-v15 data): additive — a tick/removal survives
+      l.checked = l.checked || o.checked;
+      l.removed = l.removed || o.removed;
+    }
+  });
+  const otherNeeded = {};
+  (other.neededList || []).forEach(n => { otherNeeded[n.id] = n; });
+  (base.neededList || []).forEach(n => {
+    const o = otherNeeded[n.id];
+    if(!o) return;
+    const nt = n.changedAt ? (Date.parse(n.changedAt) || 0) : 0;
+    const ot = o.changedAt ? (Date.parse(o.changedAt) || 0) : 0;
+    if(ot > nt){ n.done = o.done; n.changedAt = o.changedAt; }
+    else if(nt === 0 && ot === 0){ n.done = n.done || o.done; }
+  });
+  return base;
+}
+
+// Fetch the remote shopping file's content AND its ETag (via item metadata, since the
+// content endpoint's redirect loses reliable access to the item's ETag header).
+async function fetchRemoteShopping(token){
+  if(!oneDriveFolderRef) return null;
+  const { driveId, itemId } = oneDriveFolderRef;
+  const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/shopping-list.json', token);
+  if(res.status !== 200) return null; // 404 = not created yet
+  const meta = await res.json();
+  let data = null;
+  try{
+    const dl = meta['@microsoft.graph.downloadUrl'];
+    if(dl){ const r = await fetch(dl); if(r.ok) data = await r.json(); }
+  }catch(e){ console.warn('shopping download failed', e); }
+  return { etag: meta.eTag, modified: meta.lastModifiedDateTime, data };
+}
+
+// Merge-then-write with optimistic concurrency. On HTTP 412 (someone else wrote
+// between our read and our write) refetch, re-merge, retry.
+async function writeShoppingMerged(token){
+  const { driveId, itemId } = oneDriveFolderRef;
+  for(let attempt = 0; attempt < 3; attempt++){
+    const remote = await fetchRemoteShopping(token);
+    if(remote && remote.data){
+      shoppingData = mergeShoppingData(shoppingData, remote.data);
+      localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData));
+    }
+    const headers = { 'Content-Type': 'application/json' };
+    if(remote && remote.etag) headers['If-Match'] = remote.etag;
+    const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/shopping-list.json:/content', token, {
+      method: 'PUT', headers, body: JSON.stringify(shoppingData)
+    });
+    if(res.status === 200 || res.status === 201){
+      if(remote) oneDriveLastModified['shopping-list.json'] = null; // force next poll to restamp
+      return true;
+    }
+    if(res.status !== 412){ console.warn('shopping write failed', res.status); return false; }
+    // 412 → loop: someone saved between our fetch and our write; merge their copy in and retry
+  }
+  return writeOneDriveFile(driveId, itemId, 'shopping-list.json', JSON.stringify(shoppingData));
+}
+
+// Near-live tick sharing: while the Review Shopping List tab is open, check just the
+// shopping file every 5 seconds and merge in any remote ticks. Cheap (one metadata
+// call; content only fetched when the file actually changed).
+const SHOPPING_FAST_POLL_MS = 5000;
+let shoppingFastPollTimer = null;
+let shoppingFastPollStamp = null;
+
+function startShoppingFastPoll(){
+  stopShoppingFastPoll();
+  shoppingFastPollTimer = setInterval(async ()=>{
+    if(currentTab !== 'review') return;
+    if(document.hidden) return;
+    if(document.getElementById('modalRoot').innerHTML !== '') return;
+    if(!msalAccount || !oneDriveFolderRef || localStorage.getItem(LS_ONEDRIVE_FLAG) !== '1') return;
+    const token = await getGraphToken();
+    if(!token) return;
+    try{
+      const { driveId, itemId } = oneDriveFolderRef;
+      const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/shopping-list.json?$select=lastModifiedDateTime', token);
+      if(res.status !== 200) return;
+      const meta = await res.json();
+      if(shoppingFastPollStamp === meta.lastModifiedDateTime) return;
+      shoppingFastPollStamp = meta.lastModifiedDateTime;
+      const remote = await fetchRemoteShopping(token);
+      if(remote && remote.data){
+        const before = JSON.stringify(shoppingData);
+        shoppingData = mergeShoppingData(shoppingData, remote.data);
+        if(JSON.stringify(shoppingData) !== before){
+          localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData));
+          if(currentTab === 'review') render();
+          setStatus('Shopping list updated from the other shopper — ' + new Date().toLocaleTimeString(), 'ok');
+        }
+      }
+    }catch(e){ console.warn('fast poll failed', e); }
+  }, SHOPPING_FAST_POLL_MS);
+}
+function stopShoppingFastPoll(){
+  if(shoppingFastPollTimer){ clearInterval(shoppingFastPollTimer); shoppingFastPollTimer = null; }
 }
 
 /* ---------------- manual export / import (works in every browser) ---------------- */
@@ -1377,10 +1510,10 @@ function renderReviewTab(){
       const row = el('div',{class:'checkbox-row' + (line.checked?' removed':'')});
       const cb = el('input',{type:'checkbox'});
       cb.checked = !!line.checked;
-      cb.addEventListener('change', ()=>{ line.checked = cb.checked; persist('shopping'); row.classList.toggle('removed', line.checked); });
+      cb.addEventListener('change', ()=>{ line.checked = cb.checked; line.changedAt = new Date().toISOString(); persist('shopping'); row.classList.toggle('removed', line.checked); });
       const label = el('label',{},[ingredientLabelText(line)]);
       const rm = el('button',{class:'btn small danger', title:'Not needed this week'},['✕']);
-      rm.addEventListener('click', ()=>{ line.removed = true; persist('shopping'); render(); });
+      rm.addEventListener('click', ()=>{ line.removed = true; line.changedAt = new Date().toISOString(); persist('shopping'); render(); });
       row.appendChild(cb); row.appendChild(label);
       if(line.sources && line.sources.length){
         row.appendChild(el('span',{class:'muted', style:'font-size:.75rem;'},['(' + line.sources.join(', ') + ')']));
@@ -1398,7 +1531,7 @@ function renderReviewTab(){
       const row = el('div',{class:'checkbox-row'});
       row.appendChild(el('label',{class:'muted'},[line.ingredientName]));
       const restore = el('button',{class:'btn small secondary'},['Restore']);
-      restore.addEventListener('click', ()=>{ line.removed = false; persist('shopping'); render(); });
+      restore.addEventListener('click', ()=>{ line.removed = false; line.changedAt = new Date().toISOString(); persist('shopping'); render(); });
       row.appendChild(restore);
       rcard.appendChild(row);
     });
@@ -1494,7 +1627,7 @@ function renderNeededTab(){
     const li = el('li',{class:item.done?'done':''});
     const cb = el('input',{type:'checkbox'});
     cb.checked = item.done;
-    cb.addEventListener('change', ()=>{ item.done = cb.checked; persist('shopping'); render(); });
+    cb.addEventListener('change', ()=>{ item.done = cb.checked; item.changedAt = new Date().toISOString(); persist('shopping'); render(); });
     const label = el('label',{},[item.text]);
     const rm = el('button',{class:'btn small danger'},['Remove']);
     rm.addEventListener('click', ()=>{ shoppingData.neededList = shoppingData.neededList.filter(n=>n.id!==item.id); persist('shopping'); render(); });
