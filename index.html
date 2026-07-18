@@ -190,6 +190,8 @@ let dirHandle = null;     // FileSystemDirectoryHandle (Chrome/Edge only)
 let msalInstance = null;
 let msalAccount = null;
 let oneDriveFolderRef = null; // {driveId, itemId} for the resolved "FridgeList" folder
+let oneDrivePollTimer = null;
+let oneDriveLastModified = {}; // { 'recipes-data.json': isoString, 'shopping-list.json': isoString }
 let currentTab = 'recipes';
 let editingRecipeId = null; // null = not editing, 'new' = creating
 
@@ -432,6 +434,7 @@ async function initMsal(){
     if(msalAccount && localStorage.getItem(LS_ONEDRIVE_FLAG) === '1'){
       await loadFromOneDriveOrSeed();
       setStatus('Reconnected to OneDrive (' + (msalAccount.username||'') + ').', 'ok');
+      startOneDrivePolling();
     }
   }catch(e){
     console.error('MSAL init failed', e);
@@ -454,8 +457,10 @@ async function signInOneDrive(){
 }
 
 function signOutOneDrive(){
+  stopOneDrivePolling();
   localStorage.removeItem(LS_ONEDRIVE_FLAG);
   oneDriveFolderRef = null;
+  oneDriveLastModified = {};
   const account = msalAccount;
   msalAccount = null;
   if(msalInstance && account){
@@ -584,7 +589,71 @@ function autoSaveToOneDrive(){
     const okS = await writeOneDriveFile(driveId, itemId, 'shopping-list.json', JSON.stringify(shoppingData));
     if(okR && okS) setStatus('Saved to OneDrive — ' + new Date().toLocaleTimeString(), 'ok');
     else setStatus('Could not save to OneDrive — will retry on next change.', 'warn');
+    // Stamp our own write so the next poll doesn't immediately re-download what we just sent.
+    stampOneDriveTimestamps();
   }, 600);
+}
+
+// Lightweight near-live sync: every 20s, check the FridgeList folder's file
+// timestamps (one small metadata call) and only download+redraw if something
+// actually changed on another device. Skipped while the tab is hidden, a modal
+// is open, or the user is mid-typing — same guard the daily auto-reload uses.
+const ONEDRIVE_POLL_MS = 20000;
+
+function startOneDrivePolling(){
+  stopOneDrivePolling();
+  if(!msalAccount || localStorage.getItem(LS_ONEDRIVE_FLAG) !== '1') return;
+  stampOneDriveTimestamps(); // baseline, so the first poll doesn't false-trigger
+  oneDrivePollTimer = setInterval(pollOneDriveForChanges, ONEDRIVE_POLL_MS);
+}
+
+function stopOneDrivePolling(){
+  if(oneDrivePollTimer){ clearInterval(oneDrivePollTimer); oneDrivePollTimer = null; }
+}
+
+async function stampOneDriveTimestamps(){
+  if(!oneDriveFolderRef) return;
+  const token = await getGraphToken();
+  if(!token) return;
+  try{
+    const { driveId, itemId } = oneDriveFolderRef;
+    const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + '/children?$select=name,lastModifiedDateTime', token);
+    if(res.status !== 200) return;
+    const j = await res.json();
+    (j.value || []).forEach(item => {
+      if(item.name === 'recipes-data.json' || item.name === 'shopping-list.json'){
+        oneDriveLastModified[item.name] = item.lastModifiedDateTime;
+      }
+    });
+  }catch(e){ /* best-effort; a missed stamp just means one extra poll-triggered pull later */ }
+}
+
+async function pollOneDriveForChanges(){
+  if(document.hidden) return; // tab not visible — save the battery/data, catch up on return
+  if(document.getElementById('modalRoot').innerHTML !== '') return; // never interrupt an open modal
+  const ae = document.activeElement;
+  if(ae && (ae.tagName==='INPUT' || ae.tagName==='TEXTAREA' || ae.tagName==='SELECT')) return; // never interrupt typing
+  if(!oneDriveFolderRef || !msalAccount) return;
+  const token = await getGraphToken();
+  if(!token) return;
+  try{
+    const { driveId, itemId } = oneDriveFolderRef;
+    const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + '/children?$select=name,lastModifiedDateTime', token);
+    if(res.status !== 200) return;
+    const j = await res.json();
+    let changed = false;
+    (j.value || []).forEach(item => {
+      if(item.name === 'recipes-data.json' || item.name === 'shopping-list.json'){
+        const prev = oneDriveLastModified[item.name];
+        if(prev && prev !== item.lastModifiedDateTime) changed = true;
+        oneDriveLastModified[item.name] = item.lastModifiedDateTime;
+      }
+    });
+    if(changed){
+      await loadFromOneDriveOrSeed();
+      setStatus('Updated from OneDrive — ' + new Date().toLocaleTimeString(), 'ok');
+    }
+  }catch(e){ console.warn('OneDrive poll failed', e); }
 }
 
 /* ---------------- manual export / import (works in every browser) ---------------- */
@@ -1489,9 +1558,9 @@ function showSyncModal(){
   /* -------- OneDrive sync (works on any device, incl. Android) -------- */
   body.appendChild(el('h3',{style:'margin-bottom:4px;'},['OneDrive (recommended for Android)']));
   if(msalAccount){
-    body.appendChild(el('p',{class:'small-note'},['Signed in as ' + (msalAccount.username||msalAccount.name||'your Microsoft account') + '.']));
+    body.appendChild(el('p',{class:'small-note'},['Signed in as ' + (msalAccount.username||msalAccount.name||'your Microsoft account') + '. Checking for changes from other devices every 20 seconds while this tab is open.']));
     const reSyncBtn = el('button',{class:'btn'},['Sync now']);
-    reSyncBtn.addEventListener('click', ()=>{ closeModal(); loadFromOneDriveOrSeed(); });
+    reSyncBtn.addEventListener('click', ()=>{ closeModal(); loadFromOneDriveOrSeed(); startOneDrivePolling(); });
     const signOutBtn = el('button',{class:'btn secondary'},['Sign out of OneDrive']);
     signOutBtn.addEventListener('click', signOutOneDrive);
     body.appendChild(el('div',{class:'row', style:'margin-top:6px;'},[reSyncBtn, signOutBtn]));
