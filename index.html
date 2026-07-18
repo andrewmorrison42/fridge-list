@@ -492,32 +492,34 @@ async function graphFetch(path, token, opts){
   return fetch('https://graph.microsoft.com/v1.0' + path, Object.assign({}, opts, { headers }));
 }
 
-// Resolves (creating if necessary) a "FridgeList" folder to sync through: first in the
-// signed-in user's own OneDrive, then — for a family member who doesn't own the shared
-// drive — by looking for a folder of that name shared with them.
+// Resolves a "FridgeList" folder to sync through. Checked in this order, and a new
+// folder is only ever created as a last resort: (1) does this account already own one
+// in their own OneDrive, (2) has someone else in the family already shared one WITH this
+// account (checked before creating anything, so a family member never ends up silently
+// creating their own disconnected folder just because they don't own one yet), (3) only
+// if genuinely nowhere — create it in the signed-in user's own drive (first-ever setup).
 async function resolveFridgeListFolder(token){
   let res = await graphFetch('/me/drive/root:/FridgeList', token);
   if(res.status === 200){
     const j = await res.json();
     return { driveId: j.parentReference.driveId, itemId: j.id };
   }
-  if(res.status === 404){
-    res = await graphFetch('/me/drive/root/children', token, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'FridgeList', folder: {}, '@microsoft.graph.conflictBehavior': 'fail' })
-    });
-    if(res.status === 201){
-      const j = await res.json();
-      return { driveId: j.parentReference.driveId, itemId: j.id };
-    }
-  }
-  // Fall back to a folder named FridgeList shared with this account by someone else.
+
   res = await graphFetch('/me/drive/sharedWithMe', token);
   if(res.status === 200){
     const j = await res.json();
     const match = (j.value || []).find(it => it.name === 'FridgeList' && it.folder && it.remoteItem);
     if(match) return { driveId: match.remoteItem.parentReference.driveId, itemId: match.remoteItem.id };
+  }
+
+  res = await graphFetch('/me/drive/root/children', token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'FridgeList', folder: {}, '@microsoft.graph.conflictBehavior': 'fail' })
+  });
+  if(res.status === 201){
+    const j = await res.json();
+    return { driveId: j.parentReference.driveId, itemId: j.id };
   }
   return null;
 }
