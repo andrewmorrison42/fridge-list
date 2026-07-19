@@ -10,6 +10,11 @@
 .section-drag-handle{cursor:grab;user-select:none;font-size:1.05rem;color:var(--muted);padding:4px 6px;flex:0 0 auto;}
 .section-drag-handle:active{cursor:grabbing;}
 .dragging-section{opacity:.65;outline:2px dashed var(--accent);border-radius:6px;}
+.screen-hidden{display:none;}
+@media print{
+  body.printing-shopping .print-shopping-section.screen-hidden{display:block !important;}
+  body.printing-menu .print-menu-section.screen-hidden{display:block !important;}
+}
 </style>
 <script>
 (function(){
@@ -160,7 +165,7 @@ footer.actions{position:sticky;bottom:0;background:var(--bg);border-top:1px soli
     <button data-tab="start">Start New Shopping List</button>
     <button data-tab="review">Review Shopping List</button>
     <button data-tab="needed">Wait List</button>
-    <button data-tab="print">Print</button>
+    <button data-tab="menu">Menu list</button>
     <button data-tab="settings">Settings</button>
   </nav>
   <div class="status-bar" id="statusBar">Loading…</div>
@@ -201,7 +206,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v17';
+const APP_VERSION = 'v17.1';
 
 let recipesData = null;   // { recipes:[...], ingredients:[...], meta }
 let imagesData = {};      // { filename: {type, base64} }
@@ -775,6 +780,18 @@ function mergeShoppingData(a, b){
       l.removed = l.removed || o.removed;
     }
   });
+  // menu-tab cooked flags: merge per selection by recipeId, same latest-wins rule
+  const otherSel = {};
+  ((other.weekPlan && other.weekPlan.selections) || []).forEach(s => { otherSel[s.recipeId] = s; });
+  ((base.weekPlan && base.weekPlan.selections) || []).forEach(s => {
+    const o = otherSel[s.recipeId];
+    if(!o) return;
+    const st = s.cookedChangedAt ? (Date.parse(s.cookedChangedAt) || 0) : 0;
+    const ot2 = o.cookedChangedAt ? (Date.parse(o.cookedChangedAt) || 0) : 0;
+    if(ot2 > st){ s.cooked = o.cooked; s.cookedChangedAt = o.cookedChangedAt; }
+    else if(st === 0 && ot2 === 0){ s.cooked = s.cooked || o.cooked; }
+  });
+
   const otherNeeded = {};
   (other.neededList || []).forEach(n => { otherNeeded[n.id] = n; });
   (base.neededList || []).forEach(n => {
@@ -1097,7 +1114,7 @@ function render(){
   else if(currentTab==='start') app.appendChild(renderStartTab());
   else if(currentTab==='review') app.appendChild(renderReviewTab());
   else if(currentTab==='needed') app.appendChild(renderNeededTab());
-  else if(currentTab==='print') app.appendChild(renderPrintTab());
+  else if(currentTab==='menu') app.appendChild(renderMenuTab());
   else if(currentTab==='settings') app.appendChild(renderSettingsTab());
 }
 
@@ -1495,7 +1512,7 @@ function generateNowButton(label){
 }
 
 function renderReviewTab(){
-  const container = el('div',{});
+  const container = el('div',{class:'no-print'});
   if(shoppingData.weekPlan.selections.length===0){
     container.appendChild(el('div',{class:'empty-state'},['No recipes picked yet. Go to "Start New Shopping List" first.']));
     return container;
@@ -1565,7 +1582,19 @@ function renderReviewTab(){
     });
     container.appendChild(rcard);
   }
-  return container;
+
+  // Print just the shopping list, straight from here. The printable layout is rendered
+  // hidden alongside the screen list; printSection('shopping') reveals only it.
+  const printRow = el('div',{class:'row', style:'margin-top:14px;'});
+  const printBtn = el('button',{class:'btn'},['Print shopping list']);
+  printBtn.addEventListener('click', ()=> printSection('shopping'));
+  printRow.appendChild(printBtn);
+  container.appendChild(printRow);
+
+  const outer = el('div',{});
+  outer.appendChild(container);            // interactive content — hidden when printing
+  outer.appendChild(buildShoppingPrintSection()); // print layout — hidden on screen
+  return outer;
 }
 
 /* ---- Wait List tab ---- */
@@ -1675,51 +1704,11 @@ function printSection(which){
   setTimeout(()=> document.body.classList.remove('printing-shopping','printing-menu'), 500);
 }
 
-function renderPrintTab(){
-  const container = el('div',{});
-
-  if(shoppingData.weekPlan.selections.length===0){
-    container.appendChild(el('div',{class:'empty-state'},['Nothing planned yet — start a new shopping list first.']));
-    return container;
-  }
-
-  container.appendChild(el('p',{class:'muted no-print'},['These are two separate printouts — the weekly menu is meant for the fridge door, the shopping list for the shop. Each button prints only its own section.']));
-
-  // ---- Weekly menu checklist (fridge door) ----
-  const menuSection = el('div',{class:'print-menu-section'});
-  const menuBtnRow = el('div',{class:'row no-print', style:'margin-bottom:10px;'});
-  const menuPrintBtn = el('button',{class:'btn'},['Print weekly menu (for the fridge)']);
-  menuPrintBtn.addEventListener('click', ()=> printSection('menu'));
-  menuBtnRow.appendChild(menuPrintBtn);
-  menuSection.appendChild(menuBtnRow);
-  menuSection.appendChild(el('h2',{},['This week’s menu']));
-  menuSection.appendChild(el('p',{class:'muted print-only'},['Tick off each one as you cook it through the week.']));
-  const menuCard = el('div',{class:'card'});
-  shoppingData.weekPlan.selections.forEach(sel=>{
-    const r = recipesData.recipes.find(x=>x.id===sel.recipeId);
-    if(r) menuCard.appendChild(el('div',{class:'checkbox-row'},['☐ ' + r.name + ' — serves ' + sel.servings + (r.category?'  ('+r.category+')':'')]));
-  });
-  menuSection.appendChild(menuCard);
-  container.appendChild(menuSection);
-
-  // ---- Shopping list (for the shop) — compact, two-level, multi-column ----
-  const shopSection = el('div',{class:'print-shopping-section'});
-  const shopBtnRow = el('div',{class:'row no-print', style:'margin-bottom:10px;margin-top:20px;'});
-  const shopPrintBtn = el('button',{class:'btn'},['Print shopping list']);
-  shopPrintBtn.addEventListener('click', ()=> printSection('shopping'));
-  shopBtnRow.appendChild(shopPrintBtn);
-  shopSection.appendChild(shopBtnRow);
-  if(shoppingListIsStale()){
-    const isEmpty = !shoppingData.shoppingList || shoppingData.shoppingList.length===0;
-    shopSection.appendChild(el('div',{class:'card no-print'},[
-      el('p',{},[isEmpty
-        ? 'The shopping list hasn’t been generated for this week’s recipes yet — the menu above is ready, but the list below is empty until you generate it.'
-        : 'Your recipe selections have changed since this list was generated — regenerate so the list below matches.']),
-      generateNowButton(isEmpty ? 'Generate shopping list' : 'Regenerate shopping list')
-    ]));
-  }
+function buildShoppingPrintSection(){
+  // Printable shopping list (multi-column, category/aisle grouped). Rendered hidden on
+  // screen inside the Review tab; shown only while printSection('shopping') is active.
+  const shopSection = el('div',{class:'print-shopping-section screen-hidden'});
   shopSection.appendChild(el('div',{class:'shop-title'},['Shopping List']));
-
   const catGroups = {};
   (shoppingData.shoppingList||[]).filter(l=>!l.removed).forEach(line=>{
     const cat = line.shoppingCategory || 'Other';
@@ -1728,7 +1717,6 @@ function renderPrintTab(){
     catGroups[cat][aisle] = catGroups[cat][aisle] || [];
     catGroups[cat][aisle].push(line);
   });
-
   const shopColumns = el('div',{class:'shop-columns'});
   Object.keys(catGroups).sort((a,b)=> catSortIndex(a)-catSortIndex(b) || a.localeCompare(b)).forEach(cat=>{
     const catBlock = el('div',{class:'cat-block'});
@@ -1760,7 +1748,58 @@ function renderPrintTab(){
   });
   shopSection.appendChild(shopColumns);
   shopSection.appendChild(el('div',{class:'shop-footer print-only'},[new Date().toLocaleDateString('en-GB', {weekday:'long', year:'numeric', month:'long', day:'numeric'})]));
-  container.appendChild(shopSection);
+  return shopSection;
+}
+
+function renderMenuTab(){
+  const container = el('div',{});
+  if(shoppingData.weekPlan.selections.length===0){
+    container.appendChild(el('div',{class:'empty-state'},['Nothing planned yet — start a new shopping list first.']));
+    return container;
+  }
+
+  // ---- on-screen interactive menu: tick meals off as they're cooked ----
+  const screen = el('div',{class:'no-print'});
+  screen.appendChild(el('h2',{},['This week’s menu']));
+  screen.appendChild(el('p',{class:'muted'},['Tick each meal as you cook it through the week. Ticks sync to the other devices like the shopping list does.']));
+  const menuCard = el('div',{class:'card'});
+  shoppingData.weekPlan.selections.forEach(sel=>{
+    const r = recipesData.recipes.find(x=>x.id===sel.recipeId);
+    if(!r) return;
+    const row = el('div',{class:'checkbox-row' + (sel.cooked?' removed':'')});
+    const cb = el('input',{type:'checkbox'});
+    cb.checked = !!sel.cooked;
+    cb.addEventListener('change', ()=>{
+      sel.cooked = cb.checked;
+      sel.cookedChangedAt = new Date().toISOString();
+      persist('shopping');
+      row.classList.toggle('removed', cb.checked);
+    });
+    const label = el('label',{},[r.name + ' — serves ' + sel.servings + (r.category?'  ('+r.category+')':'')]);
+    label.addEventListener('click', ()=>{ openRecipeViewer(r.id); });
+    label.style.cursor = 'pointer';
+    row.appendChild(cb); row.appendChild(label);
+    menuCard.appendChild(row);
+  });
+  screen.appendChild(menuCard);
+  const printBtnRow = el('div',{class:'row', style:'margin-top:12px;'});
+  const menuPrintBtn = el('button',{class:'btn'},['Print weekly menu (for the fridge)']);
+  menuPrintBtn.addEventListener('click', ()=> printSection('menu'));
+  printBtnRow.appendChild(menuPrintBtn);
+  screen.appendChild(printBtnRow);
+  container.appendChild(screen);
+
+  // ---- printable fridge-door menu (hidden on screen) ----
+  const menuSection = el('div',{class:'print-menu-section screen-hidden'});
+  menuSection.appendChild(el('h2',{},['This week’s menu']));
+  menuSection.appendChild(el('p',{class:'muted print-only'},['Tick off each one as you cook it through the week.']));
+  const printCard = el('div',{class:'card'});
+  shoppingData.weekPlan.selections.forEach(sel=>{
+    const r = recipesData.recipes.find(x=>x.id===sel.recipeId);
+    if(r) printCard.appendChild(el('div',{class:'checkbox-row'},[(sel.cooked?'☑ ':'☐ ') + r.name + ' — serves ' + sel.servings + (r.category?'  ('+r.category+')':'')]));
+  });
+  menuSection.appendChild(printCard);
+  container.appendChild(menuSection);
 
   return container;
 }
@@ -1965,11 +2004,14 @@ function buildSectionHeaderRow(value){
     handle.setPointerCapture(e.pointerId);
     row.classList.add('dragging-section');
     const onMove = (ev)=>{
-      const others = Array.from(wrap.querySelectorAll('.ingredient-editor-row, .ingredient-section-row')).filter(x=>x!==row);
+      // Move among the DIRECT children of the ingredient container. Ingredient rows sit
+      // inside wrapper divs (row + hint line), so those wrappers — not the inner rows —
+      // are this heading's actual siblings.
+      const siblings = Array.from(wrap.children).filter(x=>x!==row);
       let placed = false;
-      for(const r2 of others){
-        const rect = r2.getBoundingClientRect();
-        if(ev.clientY < rect.top + rect.height/2){ wrap.insertBefore(row, r2); placed = true; break; }
+      for(const s of siblings){
+        const rect = s.getBoundingClientRect();
+        if(ev.clientY < rect.top + rect.height/2){ wrap.insertBefore(row, s); placed = true; break; }
       }
       if(!placed) wrap.appendChild(row);
     };
@@ -1988,17 +2030,16 @@ function buildSectionHeaderRow(value){
   row.appendChild(el('input',{type:'text', class:'section-name-input', placeholder:'Section heading (e.g. Icing)', value:value||''}));
 
   // One-step nudge buttons — fallback for anyone who finds dragging fiddly.
-  function siblingRow(dir){
-    let n = dir > 0 ? row.nextElementSibling : row.previousElementSibling;
-    while(n && !(n.classList.contains('ingredient-editor-row') || n.classList.contains('ingredient-section-row'))){
-      n = dir > 0 ? n.nextElementSibling : n.previousElementSibling;
-    }
-    return n;
-  }
   const upBtn = el('button',{class:'btn small secondary', type:'button', title:'Move heading up one row'},['▲']);
-  upBtn.addEventListener('click', ()=>{ const p = siblingRow(-1); if(p) row.parentElement.insertBefore(row, p); });
+  upBtn.addEventListener('click', ()=>{
+    const p = row.previousElementSibling; // direct sibling = ingredient wrapper or another heading
+    if(p) row.parentElement.insertBefore(row, p);
+  });
   const downBtn = el('button',{class:'btn small secondary', type:'button', title:'Move heading down one row'},['▼']);
-  downBtn.addEventListener('click', ()=>{ const n = siblingRow(1); if(n) row.parentElement.insertBefore(row, n.nextElementSibling); });
+  downBtn.addEventListener('click', ()=>{
+    const n = row.nextElementSibling;
+    if(n) row.parentElement.insertBefore(row, n.nextElementSibling); // null = move to end
+  });
   row.appendChild(upBtn);
   row.appendChild(downBtn);
 
