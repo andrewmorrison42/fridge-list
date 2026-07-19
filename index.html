@@ -7,9 +7,6 @@
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <meta name="theme-color" content="#435c39">
 <style>
-.section-drag-handle{cursor:grab;user-select:none;font-size:1.05rem;color:var(--muted);padding:4px 6px;flex:0 0 auto;}
-.section-drag-handle:active{cursor:grabbing;}
-.dragging-section{opacity:.65;outline:2px dashed var(--accent);border-radius:6px;}
 .screen-hidden{display:none;}
 @media print{
   body.printing-shopping .print-shopping-section.screen-hidden{display:block !important;}
@@ -206,7 +203,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v17.1';
+const APP_VERSION = 'v17.2';
 
 let recipesData = null;   // { recipes:[...], ingredients:[...], meta }
 let imagesData = {};      // { filename: {type, base64} }
@@ -1341,7 +1338,9 @@ function openRecipeEditor(id){
     rm.addEventListener('click', ()=> wrapper.remove());
     const hint = el('div',{class:'muted', style:'font-size:0.8em;padding-left:2px;'},['']);
     const updateHint = wireUnitControls(name, qty, unit, unitSel, hint, (ing&&ing.displayUnit)||null);
-    row.appendChild(name); row.appendChild(qty); row.appendChild(unit); row.appendChild(unitSel); row.appendChild(rm);
+    row.appendChild(name); row.appendChild(qty); row.appendChild(unit); row.appendChild(unitSel);
+    addMoveArrows(row, ()=>wrapper); // moves the wrapper (row + hint line) as one unit
+    row.appendChild(rm);
     wrapper.appendChild(row); wrapper.appendChild(hint);
     ingWrap.appendChild(wrapper);
   }
@@ -1480,15 +1479,8 @@ function renderStartTab(){
   draw();
 
   const footer = el('div',{class:'row', style:'margin-top:16px;'});
-  const genBtn = el('button',{class:'btn'},['Generate shopping list →']);
-  genBtn.addEventListener('click', ()=>{
-    if(shoppingData.weekPlan.selections.length===0){ alert('Pick at least one recipe first.'); return; }
-    generateShoppingList();
-    currentTab='review';
-    document.querySelectorAll('#mainNav button').forEach(b=>b.classList.toggle('active', b.dataset.tab==='review'));
-    render();
-  });
-  footer.appendChild(genBtn);
+  // (The old "Generate shopping list" button lived here — removed as redundant, since
+  // the Review Shopping List tab generates/refreshes the list automatically on entry.)
   countLabelEl = el('div',{class:'muted'},[shoppingData.weekPlan.selections.length + ' recipe(s) selected']);
   footer.appendChild(countLabelEl);
   container.appendChild(footer);
@@ -1522,6 +1514,14 @@ function renderReviewTab(){
   if(shoppingListIsStale()){
     generateShoppingList();
   }
+  // Print just the shopping list, straight from here. The printable layout is rendered
+  // hidden alongside the screen list; printSection('shopping') reveals only it.
+  const printRow = el('div',{class:'row', style:'margin-bottom:12px;'});
+  const printBtn = el('button',{class:'btn'},['Print shopping list']);
+  printBtn.addEventListener('click', ()=> printSection('shopping'));
+  printRow.appendChild(printBtn);
+  container.appendChild(printRow);
+
   container.appendChild(el('div',{class:'card'},[
     el('p',{},['Tick items off as you put them in the trolley — they’ll show struck through. The bracketed number is how many recipes this week call for that ingredient, as a steer on quantity. Use ✕ to drop something you don’t need at all; add a one-off extra below.'])
   ]));
@@ -1582,14 +1582,6 @@ function renderReviewTab(){
     });
     container.appendChild(rcard);
   }
-
-  // Print just the shopping list, straight from here. The printable layout is rendered
-  // hidden alongside the screen list; printSection('shopping') reveals only it.
-  const printRow = el('div',{class:'row', style:'margin-top:14px;'});
-  const printBtn = el('button',{class:'btn'},['Print shopping list']);
-  printBtn.addEventListener('click', ()=> printSection('shopping'));
-  printRow.appendChild(printBtn);
-  container.appendChild(printRow);
 
   const outer = el('div',{});
   outer.appendChild(container);            // interactive content — hidden when printing
@@ -1760,6 +1752,11 @@ function renderMenuTab(){
 
   // ---- on-screen interactive menu: tick meals off as they're cooked ----
   const screen = el('div',{class:'no-print'});
+  const printBtnRow = el('div',{class:'row', style:'margin-bottom:12px;'});
+  const menuPrintBtn = el('button',{class:'btn'},['Print weekly menu (for the fridge)']);
+  menuPrintBtn.addEventListener('click', ()=> printSection('menu'));
+  printBtnRow.appendChild(menuPrintBtn);
+  screen.appendChild(printBtnRow);
   screen.appendChild(el('h2',{},['This week’s menu']));
   screen.appendChild(el('p',{class:'muted'},['Tick each meal as you cook it through the week. Ticks sync to the other devices like the shopping list does.']));
   const menuCard = el('div',{class:'card'});
@@ -1782,11 +1779,6 @@ function renderMenuTab(){
     menuCard.appendChild(row);
   });
   screen.appendChild(menuCard);
-  const printBtnRow = el('div',{class:'row', style:'margin-top:12px;'});
-  const menuPrintBtn = el('button',{class:'btn'},['Print weekly menu (for the fridge)']);
-  menuPrintBtn.addEventListener('click', ()=> printSection('menu'));
-  printBtnRow.appendChild(menuPrintBtn);
-  screen.appendChild(printBtnRow);
   container.appendChild(screen);
 
   // ---- printable fridge-door menu (hidden on screen) ----
@@ -1989,59 +1981,32 @@ function wireUnitControls(name, qty, unit, unitSel, hint, presetDisplayUnit){
   return updateHint;
 }
 
+// ▲▼ buttons that move `unit` (a DIRECT child of the ingredient container — a heading
+// row, or an ingredient row's wrapper div) one position up/down. Appended into `host`.
+function addMoveArrows(host, unitProvider){
+  const upBtn = el('button',{class:'btn small secondary', type:'button', title:'Move up'},['▲']);
+  upBtn.addEventListener('click', ()=>{
+    const unit = unitProvider();
+    const p = unit.previousElementSibling;
+    if(p) unit.parentElement.insertBefore(unit, p);
+  });
+  const downBtn = el('button',{class:'btn small secondary', type:'button', title:'Move down'},['▼']);
+  downBtn.addEventListener('click', ()=>{
+    const unit = unitProvider();
+    const n = unit.nextElementSibling;
+    if(n) unit.parentElement.insertBefore(unit, n.nextElementSibling); // null = end
+  });
+  host.appendChild(upBtn);
+  host.appendChild(downBtn);
+}
+
 function buildSectionHeaderRow(value){
   const row = el('div',{class:'ingredient-section-row'});
-
-  // Drag handle: press and drag (touch or mouse) to slide the heading anywhere in
-  // the ingredient list. The row moves live as a preview; ingredient rows keep
-  // their order — only the heading relocates. Saving reads the final DOM order.
-  const handle = el('span',{class:'section-drag-handle', title:'Drag to move this heading'},['⠿']);
-  handle.style.touchAction = 'none';
-  handle.addEventListener('pointerdown', (e)=>{
-    e.preventDefault();
-    const wrap = row.parentElement;
-    if(!wrap) return;
-    handle.setPointerCapture(e.pointerId);
-    row.classList.add('dragging-section');
-    const onMove = (ev)=>{
-      // Move among the DIRECT children of the ingredient container. Ingredient rows sit
-      // inside wrapper divs (row + hint line), so those wrappers — not the inner rows —
-      // are this heading's actual siblings.
-      const siblings = Array.from(wrap.children).filter(x=>x!==row);
-      let placed = false;
-      for(const s of siblings){
-        const rect = s.getBoundingClientRect();
-        if(ev.clientY < rect.top + rect.height/2){ wrap.insertBefore(row, s); placed = true; break; }
-      }
-      if(!placed) wrap.appendChild(row);
-    };
-    const onUp = ()=>{
-      row.classList.remove('dragging-section');
-      handle.removeEventListener('pointermove', onMove);
-      handle.removeEventListener('pointerup', onUp);
-      handle.removeEventListener('pointercancel', onUp);
-    };
-    handle.addEventListener('pointermove', onMove);
-    handle.addEventListener('pointerup', onUp);
-    handle.addEventListener('pointercancel', onUp);
-  });
-  row.appendChild(handle);
 
   row.appendChild(el('input',{type:'text', class:'section-name-input', placeholder:'Section heading (e.g. Icing)', value:value||''}));
 
   // One-step nudge buttons — fallback for anyone who finds dragging fiddly.
-  const upBtn = el('button',{class:'btn small secondary', type:'button', title:'Move heading up one row'},['▲']);
-  upBtn.addEventListener('click', ()=>{
-    const p = row.previousElementSibling; // direct sibling = ingredient wrapper or another heading
-    if(p) row.parentElement.insertBefore(row, p);
-  });
-  const downBtn = el('button',{class:'btn small secondary', type:'button', title:'Move heading down one row'},['▼']);
-  downBtn.addEventListener('click', ()=>{
-    const n = row.nextElementSibling;
-    if(n) row.parentElement.insertBefore(row, n.nextElementSibling); // null = move to end
-  });
-  row.appendChild(upBtn);
-  row.appendChild(downBtn);
+  addMoveArrows(row, ()=>row);
 
   const rm = el('button',{class:'btn small danger', type:'button', title:'Remove this section heading (its ingredients stay)'},['✕']);
   rm.addEventListener('click', ()=> row.remove());
