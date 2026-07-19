@@ -203,7 +203,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v18';
+const APP_VERSION = 'v18.1';
 
 let recipesData = null;   // { recipes:[...], ingredients:[...], meta }
 let imagesData = {};      // { filename: {type, base64} }
@@ -1142,8 +1142,6 @@ function generateShoppingList(){
   }
   const arr = Object.values(lines).sort((a,b)=> (a.aisle||'').localeCompare(b.aisle||'') || a.ingredientName.localeCompare(b.ingredientName));
   arr.forEach((l,idx)=> l.key = 'line-' + idx);
-  // Carry the master list's brand/notes onto each line so shoppers see them in the shop.
-  arr.forEach(l=>{ const m = findIngredientMeta(l.ingredientName); if(m && m.notes) l.notes = m.notes; });
   // Pantry-at-home (feature-gated): recipe-derived Pantry-category lines start in the
   // "at home" group — the usual case is you already have flour/oil/spices — with a
   // one-tap "Need it" to opt in. Wait List lines and staples are ALWAYS active: the
@@ -1363,14 +1361,9 @@ function openRecipeViewer(id){
   const btnRow = el('div',{class:'row',style:'margin-top:14px;'});
   const editBtn = el('button',{class:'btn'},['Edit']);
   editBtn.addEventListener('click', ()=>{ closeModal(); openRecipeEditor(r.id); });
-  const delBtn = el('button',{class:'btn danger'},['Delete']);
-  delBtn.addEventListener('click', ()=>{
-    if(confirm('Delete "'+r.name+'"? This cannot be undone.')){
-      recipesData.recipes = recipesData.recipes.filter(x=>x.id!==r.id);
-      persist('recipes'); closeModal(); render();
-    }
-  });
-  btnRow.appendChild(editBtn); btnRow.appendChild(delBtn);
+  // No Delete here by design: destroying a recipe should take a deliberate detour
+  // through Edit, not sit one mis-tap away on the reading screen.
+  btnRow.appendChild(editBtn);
   body.appendChild(btnRow);
   openModal(body, true);
 }
@@ -1470,6 +1463,18 @@ function openRecipeEditor(id){
   const cancelBtn = el('button',{class:'btn secondary'},['Cancel']);
   cancelBtn.addEventListener('click', closeModal);
   saveRow.appendChild(saveBtn); saveRow.appendChild(cancelBtn);
+  if(!isNew){
+    // Delete lives here (and only here): reachable, but behind the deliberate step of
+    // entering Edit — moved out of the viewer where it sat one mis-tap from disaster.
+    const delRecipeBtn = el('button',{class:'btn danger', style:'margin-left:auto;'},['Delete recipe']);
+    delRecipeBtn.addEventListener('click', ()=>{
+      if(confirm('Delete "'+(r.name||'this recipe')+'"? This cannot be undone.')){
+        recipesData.recipes = recipesData.recipes.filter(x=>x.id!==id);
+        persist('recipes'); closeModal(); currentTab='recipes'; render();
+      }
+    });
+    saveRow.appendChild(delRecipeBtn);
+  }
   body.appendChild(saveRow);
   openModal(body);
 }
@@ -1576,8 +1581,7 @@ function ingredientLabelText(line){
   const countBadge = (line.sources && line.sources.length) ? ' (' + line.sources.length + ')' : '';
   const fridgeBadge = line.fromFridgeList ? ' (Wait list)' : '';
   const stapleBadge = line.fromStaples ? ' (Staple)' : '';
-  const notesBit = line.notes ? ' — ' + line.notes : '';
-  return (qtyText?qtyText+' ':'') + line.ingredientName + countBadge + fridgeBadge + stapleBadge + notesBit;
+  return (qtyText?qtyText+' ':'') + line.ingredientName + countBadge + fridgeBadge + stapleBadge;
 }
 
 function generateNowButton(label){
@@ -1831,7 +1835,6 @@ function buildShoppingPrintSection(){
         row.appendChild(el('span',{class:'item-count'},[count!==null ? '('+count+')' : '']));
         aisleBlock.appendChild(row);
         const noteBits = [];
-        if(line.notes) noteBits.push(line.notes);
         if(line.sources && line.sources.length) noteBits.push(line.sources.join(', '));
         if(line.fromFridgeList && line.aisle !== 'Wait list') noteBits.push('Wait list');
         if(line.fromStaples) noteBits.push('Staple');
@@ -2222,7 +2225,7 @@ function renderSettingsTab(){
   if(featureOn('staples')){
     container.appendChild(el('h3',{},['Staples — added to every shopping list']));
     const stCard = el('div',{class:'card'});
-    stCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},['These go on every generated list automatically, in their proper aisle. Add brands or details against the ingredient itself in the ingredient list below (e.g. which bread the family actually likes) and they\u2019ll show on the shopping list too.']));
+    stCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},['These go on every generated list automatically, in their proper aisle. Family brand preferences belong in the ingredient\u2019s NAME — rename it in the ingredient list below (e.g. "Bread (Helga\u2019s wholemeal)") and that name flows through recipes, shopping lists and printouts.']));
     const stListWrap = el('div',{});
     function drawStaples(){
       stListWrap.innerHTML = '';
@@ -2231,7 +2234,7 @@ function renderSettingsTab(){
       staples.slice().sort((a,b)=>a.localeCompare(b)).forEach(name=>{
         const meta = findIngredientMeta(name);
         const row = el('div',{class:'checkbox-row'});
-        row.appendChild(el('label',{},[name + (meta ? '' : ' — not in the ingredient list yet') + ((meta && meta.notes) ? ' — ' + meta.notes : '')]));
+        row.appendChild(el('label',{},[name + (meta ? '' : ' — not in the ingredient list yet')]));
         row.appendChild(el('span',{class:'muted', style:'font-size:.78rem;'},[meta ? (meta.aisle || 'Uncategorised') : '']));
         const rmB = el('button',{class:'btn small danger'},['✕']);
         rmB.addEventListener('click', ()=>{
@@ -2256,7 +2259,7 @@ function renderSettingsTab(){
         recipesData.settings.staples.push(canonical);
         if(!meta){
           // unknown name: create a master entry on the spot so it lands in an aisle-fixable state
-          recipesData.ingredients.push({name: canonical, shoppingUnit:'', aisle:'Uncategorised', shoppingCategory:'Other', notes:''});
+          recipesData.ingredients.push({name: canonical, shoppingUnit:'', aisle:'Uncategorised', shoppingCategory:'Other'});
         }
         persist('recipes'); drawStaples();
       }
@@ -2442,20 +2445,34 @@ function renderSettingsTab(){
   bmCard.appendChild(el('p',{class:'muted', style:'margin-bottom:0;'},['Can\'t drag (tablet, or a fussy browser)? Use "Copy button code": create any bookmark, edit it, name it Grab Recipe and paste the code as the URL. The button only reads the recipe on the page you\'re viewing and copies it to your clipboard \u2014 it sends nothing anywhere. If a site has no structured recipe data, the button tells you; select the whole page, copy, and paste that into the import box instead.']));
   container.appendChild(bmCard);
 
-  /* -------- Ingredient categories -------- */
-  container.appendChild(el('h3',{},['Ingredient categories']));
-  container.appendChild(el('p',{class:'muted', style:'margin-top:-6px;'},['Every ingredient needs an aisle and a shopping category to land in the right place on the shopping list. New ingredients — typed into a recipe or the Wait List — start out "Uncategorised" here; fix them up whenever you have a moment and every future shopping list benefits.']));
+  /* -------- Ingredient list (master) -------- */
+  container.appendChild(el('h3',{},['Ingredient list']));
+  container.appendChild(el('p',{class:'muted', style:'margin-top:-6px;'},['The master list of every ingredient the app knows: its aisle, its shopping category, and its name — which is also where family preferences live: rename "Bread" to "Bread (Helga\u2019s wholemeal)" and that name flows through recipes, shopping lists and printouts. New ingredients typed into a recipe or the Wait List start out "Uncategorised" here.']));
+
+  // Collapsed by default — nobody needs 400+ rows of ingredients on screen while
+  // changing an unrelated preference. One tap shows or hides the whole list.
+  const managerToggle = el('button',{class:'btn secondary', type:'button'},['Show ingredient list (' + recipesData.ingredients.length + ')']);
+  container.appendChild(el('div',{class:'row', style:'margin-bottom:8px;'},[managerToggle]));
+  const managerBody = el('div',{style:'display:none;'});
+  let managerOpen = false;
+  managerToggle.addEventListener('click', ()=>{
+    managerOpen = !managerOpen;
+    managerBody.style.display = managerOpen ? '' : 'none';
+    managerToggle.textContent = (managerOpen ? 'Hide' : 'Show') + ' ingredient list (' + recipesData.ingredients.length + ')';
+    if(managerOpen) drawList();
+  });
 
   const searchbar = el('div',{class:'searchbar'});
   const searchInput = el('input',{type:'search', placeholder:'Search ingredients…'});
   const filterSelect = el('select',{});
-  filterSelect.appendChild(el('option',{value:'uncategorised'},['Show: Uncategorised only']));
   filterSelect.appendChild(el('option',{value:'all'},['Show: All ingredients']));
+  filterSelect.appendChild(el('option',{value:'uncategorised'},['Show: Uncategorised only']));
   searchbar.appendChild(searchInput); searchbar.appendChild(filterSelect);
-  container.appendChild(searchbar);
+  managerBody.appendChild(searchbar);
 
 
   const ROW_CAP = 300;
+  let showAllRows = false;
   const usageIndex = buildIngredientUsageIndex();
   const USED_IN_SHOW = 5;
 
@@ -2469,7 +2486,7 @@ function renderSettingsTab(){
   const bulkActionsRow = el('div',{class:'row', style:'margin-bottom:6px;'});
   const bulkDeleteBtn = el('button',{class:'btn secondary small', type:'button'},['']);
   bulkActionsRow.appendChild(bulkDeleteBtn);
-  container.appendChild(bulkActionsRow);
+  managerBody.appendChild(bulkActionsRow);
   function updateBulkBtn(){
     const n = recipesData.ingredients.filter(isUnusedIngredient).length;
     bulkDeleteBtn.textContent = 'Delete all unused ingredients (' + n + ')';
@@ -2485,10 +2502,10 @@ function renderSettingsTab(){
   });
 
   const countNote = el('div',{class:'muted', style:'margin:8px 0;'},['']);
-  container.appendChild(countNote);
+  managerBody.appendChild(countNote);
 
   const listWrap = el('div',{});
-  container.appendChild(listWrap);
+  managerBody.appendChild(listWrap);
 
   function drawList(){
     updateBulkBtn();
@@ -2502,10 +2519,14 @@ function renderSettingsTab(){
       return true;
     }).sort((a,b)=> (a.name||'').localeCompare(b.name||''));
     const shownTotal = list.length;
-    const capped = list.slice(0, ROW_CAP);
-    countNote.textContent = capped.length + ' of ' + shownTotal + ' shown' +
-      (shownTotal > ROW_CAP ? ' (narrow your search to see more)' : '') +
-      ' · ' + totalUncategorised + ' uncategorised in total';
+    const capped = showAllRows ? list : list.slice(0, ROW_CAP);
+    countNote.innerHTML = '';
+    countNote.appendChild(el('span',{},[capped.length + ' of ' + shownTotal + ' shown · ' + totalUncategorised + ' uncategorised in total ']));
+    if(!showAllRows && shownTotal > ROW_CAP){
+      const showAllBtn = el('button',{class:'btn small secondary', type:'button'},['Show all ' + shownTotal]);
+      showAllBtn.addEventListener('click', ()=>{ showAllRows = true; drawList(); });
+      countNote.appendChild(showAllBtn);
+    }
 
     if(capped.length === 0){
       listWrap.appendChild(el('div',{class:'empty-state'},['No ingredients match.']));
@@ -2578,15 +2599,6 @@ function renderSettingsTab(){
       row.appendChild(delBtn);
       wrapper.appendChild(row);
 
-      // Brand / details the family cares about ("Helga's wholemeal", "the 400g tin") —
-      // shown on the shopping list and printout so whoever's shopping buys the right one.
-      const notesInput = el('input',{type:'text', value: ing.notes || '', placeholder:'brand / details (shown on the shopping list)', style:'width:100%;font-size:.85rem;margin-top:2px;'});
-      notesInput.addEventListener('change', ()=>{
-        ing.notes = notesInput.value.trim();
-        persist('recipes');
-      });
-      wrapper.appendChild(notesInput);
-
       // Which recipe(s) this came from — often the fastest way to tell a genuinely new
       // ingredient apart from an import artefact (typo, near-duplicate) worth fixing
       // in the recipe itself instead.
@@ -2622,7 +2634,7 @@ function renderSettingsTab(){
     const v = addNameInput.value.trim();
     if(!v) return;
     if(findIngredientMeta(v)){ alert('"' + v + '" is already in the ingredient list — search for it above to edit it.'); return; }
-    recipesData.ingredients.push({name: v, shoppingUnit:'', aisle:'Uncategorised', shoppingCategory:'Other', notes:''});
+    recipesData.ingredients.push({name: v, shoppingUnit:'', aisle:'Uncategorised', shoppingCategory:'Other'});
     persist('recipes');
     addNameInput.value = '';
     searchInput.value = v; // jump straight to the new entry so its aisle/category get set now
@@ -2631,9 +2643,9 @@ function renderSettingsTab(){
   addBtn2.addEventListener('click', addMasterDirect);
   addNameInput.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); addMasterDirect(); } });
   addWrap.appendChild(addNameInput); addWrap.appendChild(addBtn2);
-  container.insertBefore(addWrap, listWrap);
-
-  drawList();
+  managerBody.insertBefore(addWrap, listWrap);
+  container.appendChild(managerBody);
+  // list is drawn on first open — no point building 400+ rows nobody's looking at
 
   return container;
 }
