@@ -203,7 +203,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v17.3';
+const APP_VERSION = 'v17.4';
 
 let recipesData = null;   // { recipes:[...], ingredients:[...], meta }
 let imagesData = {};      // { filename: {type, base64} }
@@ -2102,6 +2102,23 @@ function buildIngredientUsageIndex(){
   return idx;
 }
 
+// Recipe finder (trial): categories optional (empty = all categories); ingredient
+// terms match case-insensitively on partial names ('chicken' finds 'Chicken thigh').
+// mode 'all' = recipe must contain every term; 'any' = at least one.
+function findRecipesByCategoryAndIngredients(cats, terms, mode){
+  const catSet = cats.map(c=>c.toLowerCase());
+  const t = terms.map(x=>x.trim().toLowerCase()).filter(Boolean);
+  return recipesData.recipes.filter(r=>{
+    if(catSet.length && !catSet.includes((r.category||'').toLowerCase())) return false;
+    if(t.length){
+      const names = (r.ingredients||[]).map(i=>(i.ingredientName||'').toLowerCase());
+      const has = term => names.some(n=>n.includes(term));
+      if(mode === 'any' ? !t.some(has) : !t.every(has)) return false;
+    }
+    return true;
+  }).sort((a,b)=>a.name.localeCompare(b.name));
+}
+
 function renderSettingsTab(){
   const container = el('div',{});
 
@@ -2159,6 +2176,99 @@ function renderSettingsTab(){
   });
 
   container.appendChild(prefCard);
+
+  /* -------- Recipe finder (trial) -------- */
+  container.appendChild(el('h3',{},['Recipe finder (trial)']));
+  const finderCard = el('div',{class:'card'});
+  finderCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},['Find recipes by category and/or by the ingredients they contain. Categories are optional — leave empty to search all. Add as many ingredients as you like; matching is on partial names, so "chicken" finds "Chicken thigh".']));
+
+  const chosenCats = [];
+  const chosenTerms = [];
+
+  // -- category picker (optional, multiple) --
+  const catRow = el('div',{class:'row', style:'align-items:center;flex-wrap:wrap;gap:6px;'});
+  catRow.appendChild(el('span',{},['Categories:']));
+  const catSel = el('select',{});
+  catSel.appendChild(el('option',{value:''},['add a category…']));
+  knownRecipeCategories().forEach(c=> catSel.appendChild(el('option',{value:c},[c])));
+  catRow.appendChild(catSel);
+  const catChips = el('span',{class:'row', style:'flex-wrap:wrap;gap:4px;'});
+  catRow.appendChild(catChips);
+  finderCard.appendChild(catRow);
+
+  // -- ingredient terms (as many as wanted) --
+  const ingRow = el('div',{class:'row', style:'align-items:center;flex-wrap:wrap;gap:6px;margin-top:8px;'});
+  ingRow.appendChild(el('span',{},['Ingredients:']));
+  const finderDlId = 'finder-ingredient-suggestions';
+  const finderDl = el('datalist',{id:finderDlId});
+  knownIngredientAllNames().forEach(n=> finderDl.appendChild(el('option',{value:n})));
+  const ingInput = el('input',{type:'text', placeholder:'type an ingredient, press Add', list:finderDlId, autocomplete:'off', style:'min-width:180px;'});
+  const ingAddBtn = el('button',{class:'btn small secondary', type:'button'},['Add']);
+  ingRow.appendChild(ingInput); ingRow.appendChild(ingAddBtn); ingRow.appendChild(finderDl);
+  const ingChips = el('span',{class:'row', style:'flex-wrap:wrap;gap:4px;'});
+  ingRow.appendChild(ingChips);
+  finderCard.appendChild(ingRow);
+
+  // -- all/any toggle --
+  const modeRow = el('div',{class:'row', style:'align-items:center;gap:6px;margin-top:8px;'});
+  modeRow.appendChild(el('span',{},['Show recipes containing']));
+  const modeSel = el('select',{});
+  modeSel.appendChild(el('option',{value:'all'},['ALL of these ingredients']));
+  modeSel.appendChild(el('option',{value:'any'},['ANY of these ingredients']));
+  modeRow.appendChild(modeSel);
+  finderCard.appendChild(modeRow);
+
+  const resultsWrap = el('div',{style:'margin-top:10px;'});
+  finderCard.appendChild(resultsWrap);
+
+  function chip(text, arr, redrawChips){
+    const c = el('span',{class:'btn small secondary', style:'cursor:pointer;', title:'Remove'},[text + ' ✕']);
+    c.addEventListener('click', ()=>{
+      const i = arr.indexOf(text);
+      if(i >= 0) arr.splice(i, 1);
+      redrawChips();
+      drawResults();
+    });
+    return c;
+  }
+  function redrawCatChips(){ catChips.innerHTML=''; chosenCats.forEach(c=> catChips.appendChild(chip(c, chosenCats, redrawCatChips))); }
+  function redrawIngChips(){ ingChips.innerHTML=''; chosenTerms.forEach(t=> ingChips.appendChild(chip(t, chosenTerms, redrawIngChips))); }
+
+  function drawResults(){
+    resultsWrap.innerHTML = '';
+    if(!chosenCats.length && !chosenTerms.length){
+      resultsWrap.appendChild(el('p',{class:'muted'},['Pick a category and/or add an ingredient to see matches.']));
+      return;
+    }
+    const matches = findRecipesByCategoryAndIngredients(chosenCats, chosenTerms, modeSel.value);
+    resultsWrap.appendChild(el('p',{class:'muted'},[matches.length + ' recipe(s) match.' + (matches.length > 100 ? ' Showing the first 100.' : '')]));
+    matches.slice(0, 100).forEach(r=>{
+      const rowEl = el('div',{class:'checkbox-row'});
+      const link = el('a',{href:'#', style:'text-decoration:none;'},[r.name]);
+      link.addEventListener('click', (e)=>{ e.preventDefault(); openRecipeViewer(r.id); });
+      rowEl.appendChild(link);
+      rowEl.appendChild(el('span',{class:'muted', style:'font-size:.8rem;'},[' — ' + (r.category||'Uncategorised') + ' · serves ' + (r.servings||'?')]));
+      resultsWrap.appendChild(rowEl);
+    });
+  }
+
+  catSel.addEventListener('change', ()=>{
+    const v = catSel.value;
+    if(v && !chosenCats.includes(v)){ chosenCats.push(v); redrawCatChips(); drawResults(); }
+    catSel.value = '';
+  });
+  function addTerm(){
+    const v = ingInput.value.trim();
+    if(v && !chosenTerms.includes(v)){ chosenTerms.push(v); redrawIngChips(); drawResults(); }
+    ingInput.value = '';
+    ingInput.focus();
+  }
+  ingAddBtn.addEventListener('click', addTerm);
+  ingInput.addEventListener('keydown', (e)=>{ if(e.key === 'Enter'){ e.preventDefault(); addTerm(); } });
+  modeSel.addEventListener('change', drawResults);
+
+  drawResults();
+  container.appendChild(finderCard);
 
   /* -------- Grab Recipe bookmarklet -------- */
   container.appendChild(el('h3',{},['Import from websites — set up the Grab Recipe button']));
