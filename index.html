@@ -203,7 +203,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v17.2';
+const APP_VERSION = 'v17.3';
 
 let recipesData = null;   // { recipes:[...], ingredients:[...], meta }
 let imagesData = {};      // { filename: {type, base64} }
@@ -273,6 +273,12 @@ function migrateIngredientsIfStale(data, seed){
   // ingredients stays version-gated, so deliberately deleted ingredients don't
   // resurrect on every page load.
   const isVersionBump = dataVersion < seedVersion;
+  // Repair pass: any master ingredient that ended up with a kitchen measure as its
+  // shopping unit (a pre-17.3 bug when adding new ingredients) is switched to mL,
+  // which unlocks the cup/TBsp/tsp dropdown for it again.
+  (data.ingredients || []).forEach(mi => {
+    if(kitchenMeasureCanon(mi.shoppingUnit)) mi.shoppingUnit = 'mL';
+  });
   const seedByName = {};
   seed.ingredients.forEach(si => { seedByName[si.name.trim().toLowerCase()] = si; });
   const seenNames = new Set();
@@ -926,6 +932,17 @@ function importData(){
 
 /* ---------------- helpers: ingredient aisle lookup, quantity parsing ---------------- */
 
+// "TBsp", "tbsp", "tablespoons", "cup", "tsp"… -> canonical measure name, or null
+// if the text isn't a kitchen measure at all.
+function kitchenMeasureCanon(u){
+  if(!u) return null;
+  const t = String(u).trim().toLowerCase();
+  if(t === 'cup' || t === 'cups') return 'cup';
+  if(t === 'tbsp' || t === 'tablespoon' || t === 'tablespoons') return 'TBsp';
+  if(t === 'tsp' || t === 'teaspoon' || t === 'teaspoons') return 'tsp';
+  return null;
+}
+
 function addNewMasterIngredients(ingredients){
   // Any ingredient name typed into a recipe that doesn't match the master list yet
   // gets added to it now — as "Uncategorised", same as the wiki-import ingredients —
@@ -933,6 +950,20 @@ function addNewMasterIngredients(ingredients){
   // shopping list is generated with no master record to ever fix.
   ingredients.forEach(ing=>{
     if(findIngredientMeta(ing.ingredientName)) return;
+    // A kitchen measure (cup/TBsp/tsp) must never become an ingredient's permanent
+    // shopping unit — that hard-locks the unit box to it forever after. Shop such
+    // ingredients in mL instead, and keep what was typed as the display measure, so
+    // the editor offers the full mL/cup/TBsp/tsp dropdown from then on.
+    const measure = kitchenMeasureCanon(ing.unit);
+    if(measure){
+      const n = parseMeasureQty(ing.quantity);
+      if(n !== null && validMeasureQty(n, measure)){
+        ing.displayQty = ing.quantity;
+        ing.displayUnit = measure;
+        ing.quantity = measureToShoppingQty(n, measure);
+      }
+      ing.unit = 'mL';
+    }
     recipesData.ingredients.push({
       name: ing.ingredientName,
       shoppingUnit: ing.unit || '',
@@ -1337,7 +1368,7 @@ function openRecipeEditor(id){
     const rm = el('button',{class:'btn small danger', type:'button'},['✕']);
     rm.addEventListener('click', ()=> wrapper.remove());
     const hint = el('div',{class:'muted', style:'font-size:0.8em;padding-left:2px;'},['']);
-    const updateHint = wireUnitControls(name, qty, unit, unitSel, hint, (ing&&ing.displayUnit)||null);
+    const updateHint = wireUnitControls(name, qty, unit, unitSel, hint, (ing&&(ing.displayUnit||kitchenMeasureCanon(ing.unit)))||null);
     row.appendChild(name); row.appendChild(qty); row.appendChild(unit); row.appendChild(unitSel);
     addMoveArrows(row, ()=>wrapper); // moves the wrapper (row + hint line) as one unit
     row.appendChild(rm);
