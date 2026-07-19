@@ -6,6 +6,11 @@
 <title>The Fridge List</title>
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <meta name="theme-color" content="#435c39">
+<style>
+.section-drag-handle{cursor:grab;user-select:none;font-size:1.05rem;color:var(--muted);padding:4px 6px;flex:0 0 auto;}
+.section-drag-handle:active{cursor:grabbing;}
+.dragging-section{opacity:.65;outline:2px dashed var(--accent);border-radius:6px;}
+</style>
 <script>
 (function(){
   var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -196,7 +201,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v16';
+const APP_VERSION = 'v17';
 
 let recipesData = null;   // { recipes:[...], ingredients:[...], meta }
 let imagesData = {};      // { filename: {type, base64} }
@@ -1206,6 +1211,20 @@ function openRecipeViewer(id){
   const body = el('div',{});
   body.appendChild(el('h2',{},[r.name]));
   body.appendChild(el('div',{class:'muted'},[(r.category||'Uncategorised')+' · serves '+(r.servings||'?')+(r.slowCooker?' · slow cooker':'')]));
+  if('wakeLock' in navigator){
+    const wakeCb = el('input',{type:'checkbox'});
+    const wakeRow = el('label',{class:'muted', style:'display:flex;align-items:center;gap:6px;margin-top:6px;cursor:pointer;font-size:.85rem;'},[wakeCb, 'Keep screen on while this recipe is open']);
+    wakeCb.addEventListener('change', async ()=>{
+      if(wakeCb.checked){
+        wakeLockWanted = true;
+        const ok = await acquireWakeLock();
+        if(!ok){ wakeCb.checked = false; wakeLockWanted = false; }
+      } else {
+        releaseWakeLock();
+      }
+    });
+    body.appendChild(wakeRow);
+  }
   if(r.sourceUrl){ body.appendChild(el('div',{class:'muted',style:'margin-top:2px;'},[el('a',{href:r.sourceUrl,target:'_blank',rel:'noopener'},['Source website ↗'])])); }
   if(r.images && r.images[0] && imagesData[r.images[0]]){
     body.appendChild(el('img',{src:'data:'+imagesData[r.images[0]].type+';base64,'+imagesData[r.images[0]].base64, style:'width:100%;max-height:260px;object-fit:cover;border-radius:8px;margin:10px 0;'}));
@@ -1760,7 +1779,30 @@ function openModal(bodyEl, wide){
   root.innerHTML = '';
   root.appendChild(backdrop);
 }
-function closeModal(){ document.getElementById('modalRoot').innerHTML=''; }
+function closeModal(){ document.getElementById('modalRoot').innerHTML=''; releaseWakeLock(); }
+
+/* ---- keep the screen on while cooking (Wake Lock API) ----
+   Available on Android Chrome and iOS Safari 16.4+ over HTTPS. The lock is
+   auto-released by the OS when the tab is hidden; we re-acquire on return if
+   the person still has the toggle on and the recipe is still open. */
+let screenWakeLock = null;
+let wakeLockWanted = false;
+
+async function acquireWakeLock(){
+  if(!('wakeLock' in navigator)) return false;
+  try{
+    screenWakeLock = await navigator.wakeLock.request('screen');
+    screenWakeLock.addEventListener('release', ()=>{ screenWakeLock = null; });
+    return true;
+  }catch(e){ console.warn('wake lock refused', e); return false; }
+}
+function releaseWakeLock(){
+  wakeLockWanted = false;
+  if(screenWakeLock){ try{ screenWakeLock.release(); }catch(e){} screenWakeLock = null; }
+}
+document.addEventListener('visibilitychange', ()=>{
+  if(!document.hidden && wakeLockWanted && !screenWakeLock) acquireWakeLock();
+});
 
 function showSyncModal(){
   const body = el('div',{});
@@ -1910,7 +1952,56 @@ function wireUnitControls(name, qty, unit, unitSel, hint, presetDisplayUnit){
 
 function buildSectionHeaderRow(value){
   const row = el('div',{class:'ingredient-section-row'});
+
+  // Drag handle: press and drag (touch or mouse) to slide the heading anywhere in
+  // the ingredient list. The row moves live as a preview; ingredient rows keep
+  // their order — only the heading relocates. Saving reads the final DOM order.
+  const handle = el('span',{class:'section-drag-handle', title:'Drag to move this heading'},['⠿']);
+  handle.style.touchAction = 'none';
+  handle.addEventListener('pointerdown', (e)=>{
+    e.preventDefault();
+    const wrap = row.parentElement;
+    if(!wrap) return;
+    handle.setPointerCapture(e.pointerId);
+    row.classList.add('dragging-section');
+    const onMove = (ev)=>{
+      const others = Array.from(wrap.querySelectorAll('.ingredient-editor-row, .ingredient-section-row')).filter(x=>x!==row);
+      let placed = false;
+      for(const r2 of others){
+        const rect = r2.getBoundingClientRect();
+        if(ev.clientY < rect.top + rect.height/2){ wrap.insertBefore(row, r2); placed = true; break; }
+      }
+      if(!placed) wrap.appendChild(row);
+    };
+    const onUp = ()=>{
+      row.classList.remove('dragging-section');
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+      handle.removeEventListener('pointercancel', onUp);
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+    handle.addEventListener('pointercancel', onUp);
+  });
+  row.appendChild(handle);
+
   row.appendChild(el('input',{type:'text', class:'section-name-input', placeholder:'Section heading (e.g. Icing)', value:value||''}));
+
+  // One-step nudge buttons — fallback for anyone who finds dragging fiddly.
+  function siblingRow(dir){
+    let n = dir > 0 ? row.nextElementSibling : row.previousElementSibling;
+    while(n && !(n.classList.contains('ingredient-editor-row') || n.classList.contains('ingredient-section-row'))){
+      n = dir > 0 ? n.nextElementSibling : n.previousElementSibling;
+    }
+    return n;
+  }
+  const upBtn = el('button',{class:'btn small secondary', type:'button', title:'Move heading up one row'},['▲']);
+  upBtn.addEventListener('click', ()=>{ const p = siblingRow(-1); if(p) row.parentElement.insertBefore(row, p); });
+  const downBtn = el('button',{class:'btn small secondary', type:'button', title:'Move heading down one row'},['▼']);
+  downBtn.addEventListener('click', ()=>{ const n = siblingRow(1); if(n) row.parentElement.insertBefore(row, n.nextElementSibling); });
+  row.appendChild(upBtn);
+  row.appendChild(downBtn);
+
   const rm = el('button',{class:'btn small danger', type:'button', title:'Remove this section heading (its ingredients stay)'},['✕']);
   rm.addEventListener('click', ()=> row.remove());
   row.appendChild(rm);
