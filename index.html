@@ -203,7 +203,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v17.4';
+const APP_VERSION = 'v18';
 
 let recipesData = null;   // { recipes:[...], ingredients:[...], meta }
 let imagesData = {};      // { filename: {type, base64} }
@@ -238,6 +238,12 @@ function defaultShoppingData(){
 // a shared folder — without touching their own recipes, additions, or edits.
 function defaultSettings(){
   return { recipeHistoryEnabled: true, notCookedRecentlyDays: 60,
+           // Feature switchboard: every optional capability ships OFF by default and its
+           // UI is entirely absent until switched on (Settings -> Features). Synced with
+           // the family's data so all devices behave the same. recipeFinder defaults ON
+           // because it was already in live use before the switchboard existed.
+           features: { staples: false, pantryAtHome: false, recipeFinder: true },
+           staples: [],
            // Shopping-list side only: what the servings box is pre-filled with when a
            // recipe is ticked for the week. 'recipe' = that recipe's own servings;
            // 'fixed' = always shoppingServingsCount. Recipe display is never scaled.
@@ -256,8 +262,17 @@ function defaultShoppingServings(recipe){
 // Fills in any settings missing from a loaded/imported recipesData without touching
 // ones the user has already changed — called from every load path via migrateIngredientsIfStale.
 function ensureSettings(data){
-  data.settings = Object.assign({}, defaultSettings(), data.settings || {});
+  const d = defaultSettings();
+  data.settings = Object.assign({}, d, data.settings || {});
+  // nested objects need their own merge, or an older saved settings blob would
+  // silently drop feature flags added in later versions
+  data.settings.features = Object.assign({}, d.features, data.settings.features || {});
+  if(!Array.isArray(data.settings.staples)) data.settings.staples = [];
   return data;
+}
+
+function featureOn(name){
+  return !!(recipesData && recipesData.settings && recipesData.settings.features && recipesData.settings.features[name]);
 }
 
 function isUnsetCategory(v){ return !v || v === 'Other'; }
@@ -776,11 +791,14 @@ function mergeShoppingData(a, b){
     const lt = l.changedAt ? (Date.parse(l.changedAt) || 0) : 0;
     const ot = o.changedAt ? (Date.parse(o.changedAt) || 0) : 0;
     if(ot > lt){
-      l.checked = o.checked; l.removed = o.removed; l.changedAt = o.changedAt;
+      l.checked = o.checked; l.removed = o.removed; l.atHome = o.atHome; l.changedAt = o.changedAt;
     } else if(lt === 0 && ot === 0){
-      // no stamps on either side (pre-v15 data): additive — a tick/removal survives
+      // no stamps on either side (pre-v15 data): additive — a tick/removal survives.
+      // atHome resolves the other way: if EITHER side says "we need it", it stays
+      // on the active list — never silently hide something someone opted to buy.
       l.checked = l.checked || o.checked;
       l.removed = l.removed || o.removed;
+      l.atHome = !!(l.atHome && o.atHome);
     }
   });
   // menu-tab cooked flags: merge per selection by recipeId, same latest-wins rule
@@ -1104,8 +1122,40 @@ function generateShoppingList(){
       };
     }
   });
+  // Staples (feature-gated): always-buy regulars appended to every generated list.
+  // If a recipe already needs the item this week, the existing line just gets flagged.
+  if(featureOn('staples')){
+    (recipesData.settings.staples || []).forEach(name=>{
+      const meta = findIngredientMeta(name);
+      const key = (meta ? meta.name : name).trim().toLowerCase();
+      if(!key) return;
+      if(lines[key]){ lines[key].fromStaples = true; return; }
+      lines[key] = {
+        ingredientName: meta ? meta.name : name,
+        unit: (meta && meta.shoppingUnit) || '',
+        aisle: (meta && meta.aisle) || 'Uncategorised',
+        shoppingCategory: (meta && meta.shoppingCategory) || 'Other',
+        totalQty: 0, hasNumeric:false, textQtyParts: [], sources: [], removed:false, checked:false,
+        source:'staple', fromStaples:true
+      };
+    });
+  }
   const arr = Object.values(lines).sort((a,b)=> (a.aisle||'').localeCompare(b.aisle||'') || a.ingredientName.localeCompare(b.ingredientName));
   arr.forEach((l,idx)=> l.key = 'line-' + idx);
+  // Carry the master list's brand/notes onto each line so shoppers see them in the shop.
+  arr.forEach(l=>{ const m = findIngredientMeta(l.ingredientName); if(m && m.notes) l.notes = m.notes; });
+  // Pantry-at-home (feature-gated): recipe-derived Pantry-category lines start in the
+  // "at home" group — the usual case is you already have flour/oil/spices — with a
+  // one-tap "Need it" to opt in. Wait List lines and staples are ALWAYS active: the
+  // wait list exists precisely because someone noted it needs buying, and staples are
+  // by definition always bought.
+  if(featureOn('pantryAtHome')){
+    arr.forEach(l=>{
+      if(l.shoppingCategory === 'Pantry' && !l.fromFridgeList && !l.fromStaples && l.source !== 'needed'){
+        l.atHome = true;
+      }
+    });
+  }
   shoppingData.shoppingList = arr;
   shoppingData.weekPlan.generatedAt = new Date().toISOString();
   shoppingData.weekPlan.lastGeneratedSignature = selectionsSignature();
@@ -1525,7 +1575,9 @@ function ingredientLabelText(line){
   if(line.textQtyParts && line.textQtyParts.length) qtyText += (qtyText?' + ':'') + line.textQtyParts.join(', ');
   const countBadge = (line.sources && line.sources.length) ? ' (' + line.sources.length + ')' : '';
   const fridgeBadge = line.fromFridgeList ? ' (Wait list)' : '';
-  return (qtyText?qtyText+' ':'') + line.ingredientName + countBadge + fridgeBadge;
+  const stapleBadge = line.fromStaples ? ' (Staple)' : '';
+  const notesBit = line.notes ? ' — ' + line.notes : '';
+  return (qtyText?qtyText+' ':'') + line.ingredientName + countBadge + fridgeBadge + stapleBadge + notesBit;
 }
 
 function generateNowButton(label){
@@ -1570,8 +1622,9 @@ function renderReviewTab(){
   addRow.appendChild(addInput); addRow.appendChild(addBtn);
   container.appendChild(addRow);
 
-  const visibleLines = shoppingData.shoppingList.filter(l=>!l.removed);
+  const visibleLines = shoppingData.shoppingList.filter(l=>!l.removed && !l.atHome);
   const removedLines = shoppingData.shoppingList.filter(l=>l.removed);
+  const atHomeLines = shoppingData.shoppingList.filter(l=>l.atHome && !l.removed);
 
   const groups = {};
   visibleLines.forEach(line=>{ (groups[line.aisle||'Other'] = groups[line.aisle||'Other']||[]).push(line); });
@@ -1591,6 +1644,11 @@ function renderReviewTab(){
       const rm = el('button',{class:'btn small danger', title:'Not needed this week'},['✕']);
       rm.addEventListener('click', ()=>{ line.removed = true; line.changedAt = new Date().toISOString(); persist('shopping'); render(); });
       row.appendChild(cb); row.appendChild(label);
+      if(featureOn('pantryAtHome')){
+        const homeBtn = el('button',{class:'btn small secondary', title:'Already have this at home'},['At home']);
+        homeBtn.addEventListener('click', ()=>{ line.atHome = true; line.changedAt = new Date().toISOString(); persist('shopping'); render(); });
+        row.appendChild(homeBtn);
+      }
       if(line.sources && line.sources.length){
         row.appendChild(el('span',{class:'muted', style:'font-size:.75rem;'},['(' + line.sources.join(', ') + ')']));
       }
@@ -1599,6 +1657,20 @@ function renderReviewTab(){
     });
     container.appendChild(g);
   });
+
+  if(atHomeLines.length){
+    const hcard = el('div',{class:'card'});
+    hcard.appendChild(el('h4',{},['At home already (' + atHomeLines.length + ') — tap "Need it" if you\u2019re out']));
+    atHomeLines.forEach(line=>{
+      const row = el('div',{class:'checkbox-row'});
+      row.appendChild(el('label',{class:'muted'},[ingredientLabelText(line)]));
+      const needBtn = el('button',{class:'btn small'},['Need it']);
+      needBtn.addEventListener('click', ()=>{ line.atHome = false; line.changedAt = new Date().toISOString(); persist('shopping'); render(); });
+      row.appendChild(needBtn);
+      hcard.appendChild(row);
+    });
+    container.appendChild(hcard);
+  }
 
   if(removedLines.length){
     const rcard = el('div',{class:'card'});
@@ -1733,7 +1805,7 @@ function buildShoppingPrintSection(){
   const shopSection = el('div',{class:'print-shopping-section screen-hidden'});
   shopSection.appendChild(el('div',{class:'shop-title'},['Shopping List']));
   const catGroups = {};
-  (shoppingData.shoppingList||[]).filter(l=>!l.removed).forEach(line=>{
+  (shoppingData.shoppingList||[]).filter(l=>!l.removed && !l.atHome).forEach(line=>{
     const cat = line.shoppingCategory || 'Other';
     const aisle = line.aisle || 'Other';
     catGroups[cat] = catGroups[cat] || {};
@@ -1759,8 +1831,10 @@ function buildShoppingPrintSection(){
         row.appendChild(el('span',{class:'item-count'},[count!==null ? '('+count+')' : '']));
         aisleBlock.appendChild(row);
         const noteBits = [];
+        if(line.notes) noteBits.push(line.notes);
         if(line.sources && line.sources.length) noteBits.push(line.sources.join(', '));
         if(line.fromFridgeList && line.aisle !== 'Wait list') noteBits.push('Wait list');
+        if(line.fromStaples) noteBits.push('Staple');
         if(noteBits.length){
           aisleBlock.appendChild(el('div',{class:'item-note'},[noteBits.join('  ·  ')]));
         }
@@ -2122,8 +2196,83 @@ function findRecipesByCategoryAndIngredients(cats, terms, mode){
 function renderSettingsTab(){
   const container = el('div',{});
 
+  /* -------- Features switchboard -------- */
+  container.appendChild(el('h3',{style:'margin-top:0;'},['Features']));
+  const featCard = el('div',{class:'card'});
+  featCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},['Optional capabilities for different ways of using the app. Off means completely invisible — no buttons, no sections. Settings sync to the whole family.']));
+  [
+    ['staples',      'Staples list', 'Regular items (milk, bread…) automatically added to every generated shopping list.'],
+    ['pantryAtHome', 'Pantry items start as "at home"', 'Pantry-category items on a new list start in an "At home already" group with one tap to add them if you\u2019re out. Wait List items and staples always stay on the buy list.'],
+    ['recipeFinder', 'Recipe finder', 'Search recipes by category and the ingredients they contain (below on this tab).'],
+  ].forEach(([key, label, desc])=>{
+    const cb = el('input',{type:'checkbox'});
+    cb.checked = featureOn(key);
+    cb.addEventListener('change', ()=>{
+      recipesData.settings.features[key] = cb.checked;
+      persist('recipes');
+      render(); // gated sections appear/disappear immediately
+    });
+    const lab = el('label',{style:'display:flex;gap:8px;align-items:flex-start;cursor:pointer;margin-top:8px;'},[cb,
+      el('span',{},[el('strong',{},[label]), el('span',{class:'muted', style:'display:block;font-size:.82rem;'},[desc])])]);
+    featCard.appendChild(lab);
+  });
+  container.appendChild(featCard);
+
+  /* -------- Staples list (feature-gated) -------- */
+  if(featureOn('staples')){
+    container.appendChild(el('h3',{},['Staples — added to every shopping list']));
+    const stCard = el('div',{class:'card'});
+    stCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},['These go on every generated list automatically, in their proper aisle. Add brands or details against the ingredient itself in the ingredient list below (e.g. which bread the family actually likes) and they\u2019ll show on the shopping list too.']));
+    const stListWrap = el('div',{});
+    function drawStaples(){
+      stListWrap.innerHTML = '';
+      const staples = recipesData.settings.staples || [];
+      if(!staples.length) stListWrap.appendChild(el('p',{class:'muted'},['No staples yet — add your regulars below.']));
+      staples.slice().sort((a,b)=>a.localeCompare(b)).forEach(name=>{
+        const meta = findIngredientMeta(name);
+        const row = el('div',{class:'checkbox-row'});
+        row.appendChild(el('label',{},[name + (meta ? '' : ' — not in the ingredient list yet') + ((meta && meta.notes) ? ' — ' + meta.notes : '')]));
+        row.appendChild(el('span',{class:'muted', style:'font-size:.78rem;'},[meta ? (meta.aisle || 'Uncategorised') : '']));
+        const rmB = el('button',{class:'btn small danger'},['✕']);
+        rmB.addEventListener('click', ()=>{
+          recipesData.settings.staples = (recipesData.settings.staples||[]).filter(s=>s!==name);
+          persist('recipes'); drawStaples();
+        });
+        row.appendChild(rmB);
+        stListWrap.appendChild(row);
+      });
+    }
+    const stDlId = 'staples-ingredient-suggestions';
+    const stDl = el('datalist',{id:stDlId});
+    knownIngredientAllNames().forEach(n=> stDl.appendChild(el('option',{value:n})));
+    const stInput = el('input',{type:'text', placeholder:'ingredient name…', list:stDlId, autocomplete:'off', style:'min-width:200px;'});
+    const stAdd = el('button',{class:'btn small', type:'button'},['Add staple']);
+    function addStaple(){
+      const v = stInput.value.trim();
+      if(!v) return;
+      const meta = findIngredientMeta(v);
+      const canonical = meta ? meta.name : v;
+      if(!(recipesData.settings.staples||[]).some(s=>s.toLowerCase()===canonical.toLowerCase())){
+        recipesData.settings.staples.push(canonical);
+        if(!meta){
+          // unknown name: create a master entry on the spot so it lands in an aisle-fixable state
+          recipesData.ingredients.push({name: canonical, shoppingUnit:'', aisle:'Uncategorised', shoppingCategory:'Other', notes:''});
+        }
+        persist('recipes'); drawStaples();
+      }
+      stInput.value=''; stInput.focus();
+    }
+    stAdd.addEventListener('click', addStaple);
+    stInput.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); addStaple(); } });
+    const stRow = el('div',{class:'row', style:'align-items:center;gap:6px;margin-bottom:8px;'},[stInput, stAdd, stDl]);
+    stCard.appendChild(stRow);
+    stCard.appendChild(stListWrap);
+    drawStaples();
+    container.appendChild(stCard);
+  }
+
   /* -------- Preferences -------- */
-  container.appendChild(el('h3',{style:'margin-top:0;'},['Preferences']));
+  container.appendChild(el('h3',{},['Preferences']));
   const prefCard = el('div',{class:'card'});
   const historyRow = el('div',{class:'row', style:'align-items:center;'});
   const historyCb = el('input',{type:'checkbox'});
@@ -2177,8 +2326,9 @@ function renderSettingsTab(){
 
   container.appendChild(prefCard);
 
-  /* -------- Recipe finder (trial) -------- */
-  container.appendChild(el('h3',{},['Recipe finder (trial)']));
+  /* -------- Recipe finder (feature-gated) -------- */
+  if(featureOn('recipeFinder')){
+  container.appendChild(el('h3',{},['Recipe finder']));
   const finderCard = el('div',{class:'card'});
   finderCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},['Find recipes by category and/or by the ingredients they contain. Categories are optional — leave empty to search all. Add as many ingredients as you like; matching is on partial names, so "chicken" finds "Chicken thigh".']));
 
@@ -2269,6 +2419,7 @@ function renderSettingsTab(){
 
   drawResults();
   container.appendChild(finderCard);
+  } // end recipeFinder gate
 
   /* -------- Grab Recipe bookmarklet -------- */
   container.appendChild(el('h3',{},['Import from websites — set up the Grab Recipe button']));
@@ -2427,6 +2578,15 @@ function renderSettingsTab(){
       row.appendChild(delBtn);
       wrapper.appendChild(row);
 
+      // Brand / details the family cares about ("Helga's wholemeal", "the 400g tin") —
+      // shown on the shopping list and printout so whoever's shopping buys the right one.
+      const notesInput = el('input',{type:'text', value: ing.notes || '', placeholder:'brand / details (shown on the shopping list)', style:'width:100%;font-size:.85rem;margin-top:2px;'});
+      notesInput.addEventListener('change', ()=>{
+        ing.notes = notesInput.value.trim();
+        persist('recipes');
+      });
+      wrapper.appendChild(notesInput);
+
       // Which recipe(s) this came from — often the fastest way to tell a genuinely new
       // ingredient apart from an import artefact (typo, near-duplicate) worth fixing
       // in the recipe itself instead.
@@ -2452,6 +2612,27 @@ function renderSettingsTab(){
   }
   searchInput.addEventListener('input', drawList);
   filterSelect.addEventListener('change', drawList);
+
+  // Direct add: for things bought occasionally but not tied to any recipe or staple —
+  // gets a proper aisle/category so anyone can find it in the shop via Wait List.
+  const addWrap = el('div',{class:'row', style:'align-items:center;gap:6px;margin:10px 0;'});
+  const addNameInput = el('input',{type:'text', placeholder:'add a new ingredient…', style:'min-width:200px;'});
+  const addBtn2 = el('button',{class:'btn small', type:'button'},['Add ingredient']);
+  function addMasterDirect(){
+    const v = addNameInput.value.trim();
+    if(!v) return;
+    if(findIngredientMeta(v)){ alert('"' + v + '" is already in the ingredient list — search for it above to edit it.'); return; }
+    recipesData.ingredients.push({name: v, shoppingUnit:'', aisle:'Uncategorised', shoppingCategory:'Other', notes:''});
+    persist('recipes');
+    addNameInput.value = '';
+    searchInput.value = v; // jump straight to the new entry so its aisle/category get set now
+    drawList();
+  }
+  addBtn2.addEventListener('click', addMasterDirect);
+  addNameInput.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); addMasterDirect(); } });
+  addWrap.appendChild(addNameInput); addWrap.appendChild(addBtn2);
+  container.insertBefore(addWrap, listWrap);
+
   drawList();
 
   return container;
