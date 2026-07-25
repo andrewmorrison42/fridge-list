@@ -233,7 +233,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v19.0';
+const APP_VERSION = 'v19.1';
 
 let recipesData = null;   // { recipes:[...], ingredients:[...], meta }
 let imagesData = {};      // { filename: {type, base64} }
@@ -1335,31 +1335,23 @@ function syncNeededFromLine(line, done){
   });
 }
 
-// Shopping trip finished: clear the shopping list, and drop the Wait List
-// entries that were actually ticked off IN THIS TRIP.
-//
-// The test is the tick on the shopping line, not the entry's `done` flag. Those
-// are not the same thing: an entry can carry `done` from having been ticked on
-// the Wait List tab weeks ago, without ever reaching a shopping list. Pruning on
-// `done` swept those out too — things never bought and never shopped for. A line
-// struck out with the ✕ button doesn't count as bought either.
+// Shopping trip finished: clear the shopping list, and drop every ticked Wait List
+// entry. `done` is the single source of truth and both routes set it: ticking the
+// line in the aisle (via syncNeededFromLine — the item was bought, regardless of
+// whether the line came from a recipe or the Wait List), or ticking the entry
+// directly on the Wait List tab (not required, or already bought). Either way the
+// entry has served its purpose and goes.
 function finishShopping(){
-  const purchased = {};
-  (shoppingData.shoppingList || []).forEach(l=>{
-    if(!l.checked || l.removed) return;
-    const ids = (l.neededIds && l.neededIds.length) ? l.neededIds : (l.neededId ? [l.neededId] : []);
-    ids.forEach(id=>{ purchased[id] = true; });
-  });
-  const going = shoppingData.neededList.filter(n=> purchased[n.id]);
+  const going = shoppingData.neededList.filter(n=> n.done);
   const names = going.slice(0,8).map(n=>'  \u2022 ' + n.text).join('\n')
     + (going.length > 8 ? '\n  \u2026and ' + (going.length-8) + ' more' : '');
   const msg = 'Mark this shopping as done?\n\nThe shopping list will be cleared.'
     + (going.length
-        ? '\n\nThese ' + going.length + ' Wait List item(s) were ticked off and will be removed:\n' + names
-        : '\n\nNothing on the Wait List was ticked off, so the Wait List is left as it is.')
+        ? '\n\nThese ' + going.length + ' ticked Wait List item(s) will be removed:\n' + names
+        : '\n\nNothing on the Wait List is ticked off, so the Wait List is left as it is.')
     + '\n\nYour menu list and recipe picks are not touched.';
   if(!confirm(msg)) return;
-  shoppingData.neededList = shoppingData.neededList.filter(n=> !purchased[n.id]);
+  shoppingData.neededList = shoppingData.neededList.filter(n=> !n.done);
   shoppingData.shoppingList = [];
   shoppingData.weekPlan.shoppingDoneAt = new Date().toISOString();
   shoppingData.weekPlan.lastGeneratedRecipeSignature = recipeSelectionsSignature();
