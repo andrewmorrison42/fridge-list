@@ -283,7 +283,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v21.0';
+const APP_VERSION = 'v21.1';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -1132,7 +1132,12 @@ function applyMergedShopping(merged){
   shoppingData = merged;
   try{ localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData)); }
   catch(e){ storageBlockedReason = 'Could not save locally (' + ((e && e.message) || e) + ').'; }
-  if(currentTab === 'review' || currentTab === 'needed' || currentTab === 'menu') rerenderPreservingScroll();
+  if(currentTab !== 'review' && currentTab !== 'needed' && currentTab !== 'menu') return;
+  // Never rebuild the DOM while the browser is capturing it for print — Safari's
+  // capture happens well after window.print() returns, so a poll landing in that
+  // window would otherwise redraw the page out from under the printer.
+  if(isPrinting()){ printRenderPending = true; return; }
+  rerenderPreservingScroll();
 }
 
 // Look a line up by its merge key at the moment of the tap, rather than trusting the
@@ -2607,12 +2612,57 @@ function renderNeededTab(){
   return container;
 }
 
-/* ---- Print tab ---- */
+/* ---- Print tab ----
+   v21.1: this printed a blank sheet in Safari. Both halves of the old four-liner were
+   unsafe there:
+
+   1. window.print() was called in the same tick as the class that reveals the printable
+      section. Chrome flushes style and layout before printing; Safari can snapshot the
+      page as it was *before* the class landed — so it captured a page where the
+      print-only section was still display:none.
+   2. The class was then removed on a fixed 500ms timer. window.print() blocks in Chrome
+      until the dialog closes, so the timer only ran afterwards and all was well. In
+      Safari — on iOS especially, where printing goes through the share sheet — print()
+      returns immediately and the capture happens later. 500ms in, the class was gone:
+      the print-only section reverted to display:none and everything else is .no-print
+      (display:none !important when printing). A page with every element hidden is
+      exactly the blank sheet being reported.
+
+   So: let the style change take effect before printing, and undo it on the browser's
+   own after-print signal rather than on a guess. The printing-* classes are referenced
+   only inside @media print blocks, so if neither signal ever fires they have no effect
+   on screen and the next printSection() call clears them anyway. */
+let printRenderPending = false;
+
+function isPrinting(){
+  return document.body.classList.contains('printing-shopping')
+      || document.body.classList.contains('printing-menu');
+}
+
+function clearPrintMode(){
+  if(!isPrinting()) return;
+  document.body.classList.remove('printing-shopping','printing-menu');
+  // A sync that landed while the print dialog was open had its repaint deferred so it
+  // couldn't rebuild the page mid-capture; run it now.
+  if(printRenderPending){ printRenderPending = false; render(); }
+}
+
 function printSection(which){
   document.body.classList.remove('printing-shopping','printing-menu');
   document.body.classList.add(which==='shopping' ? 'printing-shopping' : 'printing-menu');
-  window.print();
-  setTimeout(()=> document.body.classList.remove('printing-shopping','printing-menu'), 500);
+  // Force a style/layout flush, then hand Safari a frame to apply it before printing.
+  void document.body.offsetHeight;
+  requestAnimationFrame(()=> requestAnimationFrame(()=> window.print()));
+}
+
+// afterprint covers Chrome, Edge, Firefox and Safari 13+; the matchMedia('print')
+// transition covers older Safari, which never fires afterprint at all.
+window.addEventListener('afterprint', clearPrintMode);
+if(window.matchMedia){
+  const printMq = window.matchMedia('print');
+  const onPrintChange = e => { if(!e.matches) clearPrintMode(); };
+  if(printMq.addEventListener) printMq.addEventListener('change', onPrintChange);
+  else if(printMq.addListener) printMq.addListener(onPrintChange);
 }
 
 function buildShoppingPrintSection(){
