@@ -52,24 +52,44 @@ function extract(name) {
   throw new Error('Unbalanced braces while extracting ' + name + '() from index.html');
 }
 
+/* Pull `const NAME = <single-line value>;` out of index.html, so shared constants are
+   read from the source rather than duplicated here where they could drift. */
+function extractConst(name){
+  const m = html.match(new RegExp('const\\s+' + name + '\\s*=\\s*([^;]+);'));
+  if (!m) throw new Error('Could not find const ' + name + ' in index.html');
+  return m[0];
+}
+
 // Keep this in step with the constant in index.html; asserted below so it can't drift.
 const TICK_TIE_WINDOW_MS = 10000;
 
 const FUNCS = ['tsOf', 'tripIdOf', 'mergeFlag', 'flagStamp', 'mergeShoppingLine',
                'mergeShoppingData', 'lineMergeKey', 'selectionsSignature',
-               'recipeSelectionsSignature', 'shoppingListIsStale'];
+               'recipeSelectionsSignature', 'shoppingListIsStale',
+               'featureOn', 'stapleQtyFor', 'parseQty', 'fmtQty',
+               'displayUnit', 'lineQtyText'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
 vm.runInContext(
   'const TICK_TIE_WINDOW_MS = ' + TICK_TIE_WINDOW_MS + ';\n' +
   'let shoppingData = null;\n' +
+  'let recipesData = { recipes: [], ingredients: [], settings: { features: {}, staples: [], stapleQty: {} } };\n' +
+  extractConst('COUNT_UNITS') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
-  '             tripIdOf, setShoppingData: d => { shoppingData = d; } };',
+  '             tripIdOf, parseQty, lineQtyText, displayUnit,' +
+  '             setShoppingData: d => { shoppingData = d; },' +
+  '             setRecipesData: d => { recipesData = d; } };',
   sandbox
 );
-const { mergeShoppingData, selectionsSignature, shoppingListIsStale, setShoppingData } = sandbox.api;
+const { mergeShoppingData, selectionsSignature, shoppingListIsStale,
+        parseQty, lineQtyText, displayUnit, setShoppingData, setRecipesData } = sandbox.api;
+
+// Most tests don't care about staples; give them an inert default.
+const noStaples = () => setRecipesData(
+  { recipes: [], ingredients: [], settings: { features: { staples: false }, staples: [], stapleQty: {} } });
+noStaples();
 
 /* ---------- fixtures ---------- */
 
@@ -270,6 +290,83 @@ group('a trip in progress is not treated as stale');
   data.shoppingList[0].checked = true;
   setShoppingData(data);
   ok('still not stale once items are ticked', shoppingListIsStale() === false);
+}
+
+group('changing a staple refreshes the list without ending the trip');
+{
+  const withStaples = qty => setRecipesData({
+    recipes: [], ingredients: [],
+    settings: { features: { staples: true }, staples: ['Milk'], stapleQty: { Milk: qty } }
+  });
+  const data = {
+    weekPlan: { selections: [{ recipeId: 'r1', servings: 4 }], generatedAt: T(0), tripId: TRIP, shoppingDoneAt: null },
+    shoppingList: [line('Milk', { checked: true, checkedAt: T(1000) })],
+    neededList: [], lastUpdated: T(0)
+  };
+  setShoppingData(data);
+
+  withStaples('2 L');
+  const before = selectionsSignature();
+  withStaples('3 L');
+  ok('editing a quantity changes the signature', selectionsSignature() !== before);
+
+  // ...but not the recipe signature, so it is a same-trip refresh and the carry-forward
+  // in generateShoppingList keeps the shopper's ticks.
+  const recipeSig = vm.runInContext('recipeSelectionsSignature()', sandbox);
+  withStaples('2 L');
+  ok('and never the recipe signature (so the trip continues)',
+     vm.runInContext('recipeSelectionsSignature()', sandbox) === recipeSig);
+
+  data.weekPlan.lastGeneratedSignature = selectionsSignature();
+  data.weekPlan.lastGeneratedRecipeSignature = recipeSig;
+  setShoppingData(data);
+  ok('not stale once regenerated', shoppingListIsStale() === false);
+  withStaples('4 L');
+  setShoppingData(data);
+  ok('stale again after another quantity edit', shoppingListIsStale() === true);
+
+  // With the feature off, staples must not influence the signature at all.
+  setRecipesData({ recipes: [], ingredients: [],
+                   settings: { features: { staples: false }, staples: ['Milk'], stapleQty: { Milk: '9 L' } } });
+  const off = selectionsSignature();
+  setRecipesData({ recipes: [], ingredients: [],
+                   settings: { features: { staples: false }, staples: [], stapleQty: {} } });
+  ok('staples are ignored while the feature is off', selectionsSignature() === off);
+  noStaples();
+}
+
+group('quantities read the way the ingredient is ordinarily called');
+{
+  // 'qty' is the master's way of recording "each"; nobody says "1 qty Banana".
+  ok('a count unit is not printed', displayUnit('qty') === '');
+  ok('...case-insensitively', displayUnit('Qty') === '' && displayUnit('EACH') === '');
+  ok('a real unit is left alone', displayUnit('g') === 'g' && displayUnit('mL') === 'mL');
+  ok('a blank unit stays blank', displayUnit('') === '' && displayUnit(undefined) === '');
+
+  ok('counted items show just the number',
+     lineQtyText({ hasNumeric: true, totalQty: 6, unit: 'qty' }) === '6');
+  ok('weighed items keep their unit',
+     lineQtyText({ hasNumeric: true, totalQty: 850, unit: 'g' }) === '850 g');
+  ok('a staple amount is appended after a plus',
+     lineQtyText({ hasNumeric: true, totalQty: 125, unit: 'mL', textQtyParts: ['2 L'] }) === '125 mL + 2 L');
+  ok('a staple-only line shows just its own amount',
+     lineQtyText({ hasNumeric: false, textQtyParts: ['1 loaf'] }) === '1 loaf');
+  ok('an amountless line shows nothing',
+     lineQtyText({ hasNumeric: false, textQtyParts: [] }) === '');
+}
+
+group('quantity parsing');
+{
+  // Regression: ".5" failed the old pattern, so it was never summed into the
+  // ingredient's total and showed on the list as a bare ".5".
+  ok('a leading decimal point parses', parseQty('.5') === 0.5);
+  ok('a trailing decimal point parses', parseQty('1.') === 1);
+  ok('plain numbers still parse', parseQty('2') === 2 && parseQty(3) === 3 && parseQty('0.25') === 0.25);
+  ok('fraction characters still parse', parseQty('½') === 0.5 && parseQty('1½') === 1.5);
+  ok('written fractions still parse', parseQty('1/2') === 0.5);
+  ok('a lone point is not a number', parseQty('.') === null);
+  ok('non-numeric amounts stay text', parseQty('to taste') === null && parseQty('1-2') === null);
+  ok('empty stays empty', parseQty('') === null && parseQty(null) === null && parseQty(undefined) === null);
 }
 
 /* ---------- result ---------- */
