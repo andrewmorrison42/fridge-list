@@ -2580,13 +2580,37 @@ function displayUnit(unit){
   return COUNT_UNITS.indexOf(u.toLowerCase()) === -1 ? u : '';
 }
 
+/* v21.4: once an amount reaches a kilo or a litre, show it in the larger unit —
+   "2.125 L" reads better on a list than "2125 mL". Exact by instruction: no rounding,
+   so 1250 g is 1.25 kg and 1001 g is 1.001 kg, not "1 kg". */
+const UNIT_ROLLUP = { g: { to: 'kg', per: 1000 }, ml: { to: 'L', per: 1000 } };
+
+function rollUpQty(n, unit){
+  const r = UNIT_ROLLUP[(unit || '').trim().toLowerCase()];
+  if(!r || !(n >= r.per)) return null;
+  return { qty: n / r.per, unit: r.to };
+}
+
+/* Exact decimal with trailing zeros trimmed. The toFixed only clears floating-point
+   noise from the division — a millionth of a kilo is a milligram — it is not a rounding
+   step at any scale a shopping list can see. fmtQty is NOT used here: it rounds to two
+   decimals, which would turn 1001 g into "1 kg". */
+function fmtExactQty(n){
+  return Number(n.toFixed(6)).toString();
+}
+
 // The quantity column for one shopping line: the summed recipe amount, plus any
 // free-text amounts (staple quantities, non-numeric recipe quantities) after a "+".
 function lineQtyText(line){
   let t = '';
   if(line.hasNumeric){
-    const u = displayUnit(line.unit);
-    t = fmtQty(line.totalQty) + (u ? ' ' + u : '');
+    const rolled = rollUpQty(line.totalQty, line.unit);
+    if(rolled){
+      t = fmtExactQty(rolled.qty) + ' ' + rolled.unit;
+    } else {
+      const u = displayUnit(line.unit);
+      t = fmtQty(line.totalQty) + (u ? ' ' + u : '');
+    }
   }
   if(line.textQtyParts && line.textQtyParts.length) t += (t ? ' + ' : '') + line.textQtyParts.join(', ');
   return t;

@@ -67,7 +67,7 @@ const FUNCS = ['tsOf', 'tripIdOf', 'mergeFlag', 'flagStamp', 'mergeShoppingLine'
                'mergeShoppingData', 'lineMergeKey', 'selectionsSignature',
                'recipeSelectionsSignature', 'shoppingListIsStale',
                'featureOn', 'stapleQtyFor', 'stapleQtyToShopping', 'parseQty', 'fmtQty',
-               'displayUnit', 'lineQtyText', 'findIngredientMeta'];
+               'displayUnit', 'lineQtyText', 'findIngredientMeta', 'rollUpQty', 'fmtExactQty'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -77,6 +77,7 @@ vm.runInContext(
   'let recipesData = { recipes: [], ingredients: [], settings: { features: {}, staples: [], stapleQty: {} } };\n' +
   extractConst('COUNT_UNITS') + '\n' +
   extractConst('MEASURE_ML') + '\n' +
+  extractConst('UNIT_ROLLUP') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
@@ -410,6 +411,33 @@ group('staple amounts are numbers in the shopping unit');
   ok('a name never set returns null', stapleQtyFor('Nothing') === null);
   ok('lookup is case-insensitive', stapleQtyFor('milk') === 2000);
   noStaples();
+}
+
+group('kilos and litres above a thousand');
+{
+  const q = (total, unit) => lineQtyText({ hasNumeric: true, totalQty: total, unit: unit });
+  ok('under a kilo stays in grams', q(850, 'g') === '850 g');
+  ok('under a litre stays in millilitres', q(125, 'mL') === '125 mL');
+  ok('exactly a kilo rolls up', q(1000, 'g') === '1 kg', q(1000, 'g'));
+  ok('exactly a litre rolls up', q(1000, 'mL') === '1 L', q(1000, 'mL'));
+  ok('over a kilo rolls up', q(1500, 'g') === '1.5 kg', q(1500, 'g'));
+  ok('over a litre rolls up', q(2125, 'mL') === '2.125 L', q(2125, 'mL'));
+
+  // "No rounding": these are the cases fmtQty would have quietly flattened.
+  ok('1001 g is not "1 kg"', q(1001, 'g') === '1.001 kg', q(1001, 'g'));
+  ok('1250 g keeps both decimals', q(1250, 'g') === '1.25 kg', q(1250, 'g'));
+  ok('2001 mL is not "2 L"', q(2001, 'mL') === '2.001 L', q(2001, 'mL'));
+  ok('no floating-point tail is shown', q(1100, 'g') === '1.1 kg', q(1100, 'g'));
+
+  // Only weights and volumes roll up.
+  ok('counts never roll up', q(2000, 'qty') === '2000', q(2000, 'qty'));
+  ok('unitless amounts never roll up', q(5000, '') === '5000', q(5000, ''));
+  ok('the unit match is case-insensitive', q(1500, 'ML') === '1.5 L', q(1500, 'ML'));
+
+  // A rolled-up amount still sits in front of any free-text part.
+  ok('free-text parts still follow',
+     lineQtyText({ hasNumeric: true, totalQty: 1500, unit: 'g', textQtyParts: ['a splash'] })
+       === '1.5 kg + a splash');
 }
 
 /* ---------- result ---------- */
