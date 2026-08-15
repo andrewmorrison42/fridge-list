@@ -1,0 +1,15 @@
+{
+  "name": "fridge-list",
+  "version": "21.2.0",
+  "private": true,
+  "description": "Family recipes, weekly menu and shopping list — a single self-contained page.",
+  "scripts": {
+    "test": "node test/run-tests.js",
+    "test:browser": "node test/browser-tests.js",
+    "test:all": "node test/run-tests.js && node test/browser-tests.js",
+    "postinstall-browser": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.47.0"
+  }
+}
