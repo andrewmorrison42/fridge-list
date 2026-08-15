@@ -67,7 +67,7 @@ const FUNCS = ['tsOf', 'tripIdOf', 'mergeFlag', 'flagStamp', 'mergeShoppingLine'
                'mergeShoppingData', 'lineMergeKey', 'selectionsSignature',
                'recipeSelectionsSignature', 'shoppingListIsStale',
                'featureOn', 'stapleQtyFor', 'parseQty', 'fmtQty',
-               'displayUnit', 'lineQtyText'];
+               'displayUnit', 'lineQtyText', 'findIngredientMeta', 'auditQuantityUnits'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -76,15 +76,19 @@ vm.runInContext(
   'let shoppingData = null;\n' +
   'let recipesData = { recipes: [], ingredients: [], settings: { features: {}, staples: [], stapleQty: {} } };\n' +
   extractConst('COUNT_UNITS') + '\n' +
+  extractConst('QTY_AUDIT_FLOOR') + '\n' +
+  extractConst('QTY_AUDIT_SKIP_AISLES') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
-  '             tripIdOf, parseQty, lineQtyText, displayUnit,' +
+  '             tripIdOf, parseQty, lineQtyText, displayUnit, auditQuantityUnits,' +
+  '             QTY_AUDIT_FLOOR_VALUE: QTY_AUDIT_FLOOR,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
 );
 const { mergeShoppingData, selectionsSignature, shoppingListIsStale,
-        parseQty, lineQtyText, displayUnit, setShoppingData, setRecipesData } = sandbox.api;
+        parseQty, lineQtyText, displayUnit, auditQuantityUnits, QTY_AUDIT_FLOOR_VALUE,
+        setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
 const noStaples = () => setRecipesData(
@@ -367,6 +371,54 @@ group('quantity parsing');
   ok('a lone point is not a number', parseQty('.') === null);
   ok('non-numeric amounts stay text', parseQty('to taste') === null && parseQty('1-2') === null);
   ok('empty stays empty', parseQty('') === null && parseQty(null) === null && parseQty(undefined) === null);
+}
+
+group('the shopping-unit audit');
+{
+  const ing = (name, unit, aisle) => ({ name, shoppingUnit: unit, aisle, shoppingCategory: 'x' });
+  const rec = (id, name, ings) => ({ id, name, ingredients: ings });
+  setRecipesData({
+    settings: { features: {}, staples: [], stapleQty: {} },
+    ingredients: [
+      ing('Potatoes', 'g', 'Vegetables'),
+      ing('Salt', 'g', 'Spices'),
+      ing('Milk', 'mL', 'Dairy'),
+      ing('Banana', 'qty', 'Fruit'),
+      ing('Butter', 'g', 'Dairy')
+    ],
+    recipes: [
+      rec('r1', 'Shepherd’s Pie', [
+        { ingredientName: 'Potatoes', quantity: 4 },              // 4 potatoes, not 4 g
+        { ingredientName: 'Salt', quantity: 1 },                  // seasoning: excluded
+        { ingredientName: 'Butter', quantity: 400 }               // fine
+      ]),
+      rec('r2', 'Pancakes', [
+        { ingredientName: 'Milk', quantity: 2 },                  // too small for mL
+        { ingredientName: 'Banana', quantity: 2 },                // counted: no floor applies
+        { ingredientName: 'Potatoes', quantity: 1, displayUnit: 'cup' }, // converted properly
+        { ingredientName: 'Unknown thing', quantity: 1 }          // not in the master
+      ])
+    ]
+  });
+  const groups = auditQuantityUnits();
+  const names = groups.map(g => g.ingredientName).sort();
+  ok('flags an amount too small for its unit', names.indexOf('Potatoes') !== -1, names);
+  ok('flags it for millilitres too', names.indexOf('Milk') !== -1, names);
+  ok('leaves seasonings out', names.indexOf('Salt') === -1, names);
+  ok('ignores counted ingredients', names.indexOf('Banana') === -1, names);
+  ok('ignores plausible amounts', names.indexOf('Butter') === -1, names);
+  ok('ignores amounts entered with a kitchen measure',
+     (groups.find(g => g.ingredientName === 'Potatoes') || { issues: [] }).issues.length === 1, groups);
+  ok('ignores ingredients not in the master', names.indexOf('Unknown thing') === -1, names);
+  ok('reports the recipe it came from',
+     (groups.find(g => g.ingredientName === 'Potatoes') || { issues: [{}] }).issues[0].recipeId === 'r1');
+  ok('the floor is one teaspoon', QTY_AUDIT_FLOOR_VALUE === 5, QTY_AUDIT_FLOOR_VALUE);
+
+  setRecipesData({ settings: { features: {}, staples: [], stapleQty: {} },
+                   ingredients: [ing('Butter', 'g', 'Dairy')],
+                   recipes: [rec('r1', 'Toast', [{ ingredientName: 'Butter', quantity: 20 }])] });
+  ok('clean data produces nothing to report', auditQuantityUnits().length === 0);
+  noStaples();
 }
 
 /* ---------- result ---------- */

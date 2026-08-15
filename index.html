@@ -3333,6 +3333,45 @@ function findRecipesByCategoryAndIngredients(cats, terms, mode){
   }).sort((a,b)=>a.name.localeCompare(b.name));
 }
 
+/* ---- v21.3: shopping-unit audit ----
+   The shopping list sums an ingredient across recipes, which is only meaningful if
+   every recipe recorded its amount in that ingredient's shopping unit. wireUnitControls
+   enforces that for anything entered through the editor, but recipes that predate it
+   (and the ones imported from the old database) can hold an amount in some other unit
+   entirely — "Potatoes: 4", meaning four potatoes, on an ingredient bought by weight.
+   Those quantities then sum to something far too small and the list under-orders.
+
+   Deliberately a floor check rather than anything cleverer: below one teaspoon there is
+   no real amount of a g/mL ingredient, so anything under it is wrong. It cannot catch a
+   count that happens to look like a plausible weight, and it never guesses an intent —
+   "4" could be four potatoes, 400 g, or 4 x 200 g, and picking one would quietly corrupt
+   a recipe. It reports; a human decides. */
+const QTY_AUDIT_FLOOR = 5;                 // one teaspoon: the smallest real kitchen measure
+const QTY_AUDIT_SKIP_AISLES = ['spices'];  // a pinch of salt is not worth chasing
+
+function auditQuantityUnits(){
+  const groups = {};
+  (recipesData.recipes || []).forEach(recipe=>{
+    (recipe.ingredients || []).forEach(ing=>{
+      const meta = findIngredientMeta(ing.ingredientName);
+      if(!meta) return;                                     // unknown ingredient: nothing to check against
+      const unit = meta.shoppingUnit;
+      if(unit !== 'g' && unit !== 'mL') return;             // counts have no floor to test
+      if(QTY_AUDIT_SKIP_AISLES.indexOf((meta.aisle||'').trim().toLowerCase()) !== -1) return;
+      if(ing.displayUnit) return;                           // a recorded kitchen measure was converted properly
+      const q = parseQty(ing.quantity);
+      if(q === null || q <= 0 || q >= QTY_AUDIT_FLOOR) return;
+      const key = meta.name;
+      if(!groups[key]) groups[key] = { ingredientName: meta.name, shoppingUnit: unit,
+                                       aisle: meta.aisle || 'Uncategorised', issues: [] };
+      groups[key].issues.push({ recipeId: recipe.id, recipeName: recipe.name, quantity: q });
+    });
+  });
+  // Most-affected first: that is the order they are worth working through.
+  return Object.values(groups).sort((a,b)=>
+    b.issues.length - a.issues.length || a.ingredientName.localeCompare(b.ingredientName));
+}
+
 function renderSettingsTab(){
   const container = el('div',{});
 
@@ -3604,6 +3643,54 @@ function renderSettingsTab(){
   bmCard.appendChild(bmRow);
   bmCard.appendChild(el('p',{class:'muted', style:'margin-bottom:0;'},['Can\'t drag (tablet, or a fussy browser)? Use "Copy button code": create any bookmark, edit it, name it Grab Recipe and paste the code as the URL. The button only reads the recipe on the page you\'re viewing and copies it to your clipboard \u2014 it sends nothing anywhere. If a site has no structured recipe data, the button tells you; select the whole page, copy, and paste that into the import box instead.']));
   container.appendChild(bmCard);
+
+  /* -------- Shopping-unit audit -------- */
+  container.appendChild(el('h3',{},['Amounts that look wrong for their unit']));
+  const auditGroups = auditQuantityUnits();
+  const auditCount = auditGroups.reduce((n,g)=> n + g.issues.length, 0);
+  const auCard = el('div',{class:'card'});
+  auCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
+    'The shopping list adds an ingredient up across every recipe that needs it, which only works if each recipe records the amount in that ingredient’s shopping unit. The recipe editor enforces that now — pick cup, TBsp or tsp and it converts — but older recipes were entered before it did.'
+  ]));
+  auCard.appendChild(el('p',{class:'muted'},[
+    'Listed below is every amount smaller than one teaspoon (' + QTY_AUDIT_FLOOR + ' g or mL) that has no kitchen measure recorded, because nothing real is bought in those quantities. "Potatoes: 4 g" almost certainly means four potatoes, and until it is corrected the shopping list asks for 4 g of them. Seasonings are left out — a pinch of salt is not worth chasing.'
+  ]));
+  auCard.appendChild(el('p',{class:'muted'},[
+    'This is a read-only check: nothing here changes your recipes. It also only catches amounts that are too small to be real — an ingredient recorded as "10" meaning ten of them looks perfectly normal to it.'
+  ]));
+  if(!auditCount){
+    auCard.appendChild(el('p',{},['✓ Nothing to flag — every amount checked matches its shopping unit.']));
+  } else {
+    const auSummary = el('p',{},[el('strong',{},[auditCount + ' amount(s) across ' + auditGroups.length + ' ingredient(s) to check.'])]);
+    auCard.appendChild(auSummary);
+    const auWrap = el('div',{});
+    auWrap.style.display = 'none';
+    const auToggle = el('button',{class:'btn secondary', type:'button'},['Show the list']);
+    auToggle.addEventListener('click', ()=>{
+      const open = auWrap.style.display !== 'none';
+      auWrap.style.display = open ? 'none' : '';
+      auToggle.textContent = open ? 'Show the list' : 'Hide the list';
+    });
+    auCard.appendChild(auToggle);
+    auditGroups.forEach(g=>{
+      const block = el('div',{style:'margin-top:12px;'});
+      block.appendChild(el('div',{},[
+        el('strong',{},[g.ingredientName]),
+        el('span',{class:'muted', style:'font-size:.8rem;'},['  ·  bought in ' + g.shoppingUnit + '  ·  ' + g.aisle])
+      ]));
+      g.issues.forEach(is=>{
+        const row = el('div',{class:'checkbox-row'});
+        row.appendChild(el('label',{},[fmtQty(is.quantity) + ' ' + g.shoppingUnit + ' in ' + is.recipeName]));
+        const open = el('button',{class:'btn small secondary', type:'button'},['Open recipe']);
+        open.addEventListener('click', ()=> openRecipeViewer(is.recipeId));
+        row.appendChild(open);
+        block.appendChild(row);
+      });
+      auWrap.appendChild(block);
+    });
+    auCard.appendChild(auWrap);
+  }
+  container.appendChild(auCard);
 
   /* -------- Ingredient list (master) -------- */
   container.appendChild(el('h3',{},['Ingredient list']));
