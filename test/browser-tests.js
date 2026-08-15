@@ -300,6 +300,24 @@ async function suiteStapleQuantities(browser) {
        await page.evaluate(() => [...document.querySelectorAll('button')]
          .some(b => b.textContent.trim() === 'Add staple')));
 
+    // The shopping-unit audit renders on this same tab; make sure it draws and expands
+    // against the real recipe data rather than throwing halfway through Settings.
+    const audit = await page.evaluate(() => {
+      const h = [...document.querySelectorAll('h3')].find(x => /Amounts that look wrong/.test(x.textContent));
+      if (!h) return null;
+      const strong = h.nextElementSibling.querySelector('strong');
+      return { summary: strong ? strong.textContent : null };
+    });
+    ok('the shopping-unit audit renders', audit !== null, audit);
+    ok('and reports a count', audit && /\d+ amount\(s\)/.test(audit.summary || ''), audit);
+    await page.click('button:has-text("Show the list")');
+    await page.waitForTimeout(300);
+    const expanded = await page.evaluate(() => {
+      const h = [...document.querySelectorAll('h3')].find(x => /Amounts that look wrong/.test(x.textContent));
+      return h.nextElementSibling.querySelectorAll('.checkbox-row').length;
+    });
+    ok('and lists the offending amounts when expanded', expanded > 0, expanded);
+
     // Add a staple that no recipe uses, with a free-text quantity.
     await page.fill('input[placeholder="ingredient name…"]', 'Kitchen roll');
     await page.fill('input[placeholder="qty"]', '2 rolls');
