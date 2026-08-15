@@ -66,8 +66,8 @@ const TICK_TIE_WINDOW_MS = 10000;
 const FUNCS = ['tsOf', 'tripIdOf', 'mergeFlag', 'flagStamp', 'mergeShoppingLine',
                'mergeShoppingData', 'lineMergeKey', 'selectionsSignature',
                'recipeSelectionsSignature', 'shoppingListIsStale',
-               'featureOn', 'stapleQtyFor', 'parseQty', 'fmtQty',
-               'displayUnit', 'lineQtyText', 'findIngredientMeta', 'auditQuantityUnits'];
+               'featureOn', 'stapleQtyFor', 'stapleQtyToShopping', 'parseQty', 'fmtQty',
+               'displayUnit', 'lineQtyText', 'findIngredientMeta', 'rollUpQty', 'fmtExactQty'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -76,18 +76,17 @@ vm.runInContext(
   'let shoppingData = null;\n' +
   'let recipesData = { recipes: [], ingredients: [], settings: { features: {}, staples: [], stapleQty: {} } };\n' +
   extractConst('COUNT_UNITS') + '\n' +
-  extractConst('QTY_AUDIT_FLOOR') + '\n' +
-  extractConst('QTY_AUDIT_SKIP_AISLES') + '\n' +
+  extractConst('MEASURE_ML') + '\n' +
+  extractConst('UNIT_ROLLUP') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
-  '             tripIdOf, parseQty, lineQtyText, displayUnit, auditQuantityUnits,' +
-  '             QTY_AUDIT_FLOOR_VALUE: QTY_AUDIT_FLOOR,' +
+  '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
 );
 const { mergeShoppingData, selectionsSignature, shoppingListIsStale,
-        parseQty, lineQtyText, displayUnit, auditQuantityUnits, QTY_AUDIT_FLOOR_VALUE,
+        parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -309,15 +308,15 @@ group('changing a staple refreshes the list without ending the trip');
   };
   setShoppingData(data);
 
-  withStaples('2 L');
+  withStaples(2000);
   const before = selectionsSignature();
-  withStaples('3 L');
+  withStaples(3000);
   ok('editing a quantity changes the signature', selectionsSignature() !== before);
 
   // ...but not the recipe signature, so it is a same-trip refresh and the carry-forward
   // in generateShoppingList keeps the shopper's ticks.
   const recipeSig = vm.runInContext('recipeSelectionsSignature()', sandbox);
-  withStaples('2 L');
+  withStaples(2000);
   ok('and never the recipe signature (so the trip continues)',
      vm.runInContext('recipeSelectionsSignature()', sandbox) === recipeSig);
 
@@ -325,13 +324,13 @@ group('changing a staple refreshes the list without ending the trip');
   data.weekPlan.lastGeneratedRecipeSignature = recipeSig;
   setShoppingData(data);
   ok('not stale once regenerated', shoppingListIsStale() === false);
-  withStaples('4 L');
+  withStaples(4000);
   setShoppingData(data);
   ok('stale again after another quantity edit', shoppingListIsStale() === true);
 
   // With the feature off, staples must not influence the signature at all.
   setRecipesData({ recipes: [], ingredients: [],
-                   settings: { features: { staples: false }, staples: ['Milk'], stapleQty: { Milk: '9 L' } } });
+                   settings: { features: { staples: false }, staples: ['Milk'], stapleQty: { Milk: 9000 } } });
   const off = selectionsSignature();
   setRecipesData({ recipes: [], ingredients: [],
                    settings: { features: { staples: false }, staples: [], stapleQty: {} } });
@@ -373,52 +372,72 @@ group('quantity parsing');
   ok('empty stays empty', parseQty('') === null && parseQty(null) === null && parseQty(undefined) === null);
 }
 
-group('the shopping-unit audit');
+group('staple amounts are numbers in the shopping unit');
 {
-  const ing = (name, unit, aisle) => ({ name, shoppingUnit: unit, aisle, shoppingCategory: 'x' });
-  const rec = (id, name, ings) => ({ id, name, ingredients: ings });
-  setRecipesData({
-    settings: { features: {}, staples: [], stapleQty: {} },
-    ingredients: [
-      ing('Potatoes', 'g', 'Vegetables'),
-      ing('Salt', 'g', 'Spices'),
-      ing('Milk', 'mL', 'Dairy'),
-      ing('Banana', 'qty', 'Fruit'),
-      ing('Butter', 'g', 'Dairy')
-    ],
-    recipes: [
-      rec('r1', 'Shepherd’s Pie', [
-        { ingredientName: 'Potatoes', quantity: 4 },              // 4 potatoes, not 4 g
-        { ingredientName: 'Salt', quantity: 1 },                  // seasoning: excluded
-        { ingredientName: 'Butter', quantity: 400 }               // fine
-      ]),
-      rec('r2', 'Pancakes', [
-        { ingredientName: 'Milk', quantity: 2 },                  // too small for mL
-        { ingredientName: 'Banana', quantity: 2 },                // counted: no floor applies
-        { ingredientName: 'Potatoes', quantity: 1, displayUnit: 'cup' }, // converted properly
-        { ingredientName: 'Unknown thing', quantity: 1 }          // not in the master
-      ])
-    ]
-  });
-  const groups = auditQuantityUnits();
-  const names = groups.map(g => g.ingredientName).sort();
-  ok('flags an amount too small for its unit', names.indexOf('Potatoes') !== -1, names);
-  ok('flags it for millilitres too', names.indexOf('Milk') !== -1, names);
-  ok('leaves seasonings out', names.indexOf('Salt') === -1, names);
-  ok('ignores counted ingredients', names.indexOf('Banana') === -1, names);
-  ok('ignores plausible amounts', names.indexOf('Butter') === -1, names);
-  ok('ignores amounts entered with a kitchen measure',
-     (groups.find(g => g.ingredientName === 'Potatoes') || { issues: [] }).issues.length === 1, groups);
-  ok('ignores ingredients not in the master', names.indexOf('Unknown thing') === -1, names);
-  ok('reports the recipe it came from',
-     (groups.find(g => g.ingredientName === 'Potatoes') || { issues: [{}] }).issues[0].recipeId === 'r1');
-  ok('the floor is one teaspoon', QTY_AUDIT_FLOOR_VALUE === 5, QTY_AUDIT_FLOOR_VALUE);
+  // A bare number is already in the ingredient's unit.
+  ok('a plain number passes through', stapleQtyToShopping('2000', 'mL') === 2000);
+  ok('decimals are kept', stapleQtyToShopping('1.5', 'g') === 1.5);
 
-  setRecipesData({ settings: { features: {}, staples: [], stapleQty: {} },
-                   ingredients: [ing('Butter', 'g', 'Dairy')],
-                   recipes: [rec('r1', 'Toast', [{ ingredientName: 'Butter', quantity: 20 }])] });
-  ok('clean data produces nothing to report', auditQuantityUnits().length === 0);
+  // The everyday larger units convert rather than being rejected.
+  ok('litres become millilitres', stapleQtyToShopping('2 L', 'mL') === 2000);
+  ok('...case-insensitively', stapleQtyToShopping('2l', 'mL') === 2000);
+  ok('millilitres stay put', stapleQtyToShopping('500 mL', 'mL') === 500);
+  ok('kilograms become grams', stapleQtyToShopping('1 kg', 'g') === 1000);
+  ok('grams stay put', stapleQtyToShopping('250 g', 'g') === 250);
+  ok('kitchen measures convert for volumes', stapleQtyToShopping('2 cup', 'mL') === 500);
+
+  // A unit that makes no sense for the ingredient has no numeric reading, and
+  // guessing one would put a wrong number on the shopping list.
+  ok('litres on a weighed ingredient are rejected', stapleQtyToShopping('2 L', 'g') === null);
+  ok('a pack name is rejected', stapleQtyToShopping('1 loaf', 'g') === null);
+  ok('blank is rejected', stapleQtyToShopping('', 'g') === null && stapleQtyToShopping(null, 'g') === null);
+  ok('zero and negatives are rejected',
+     stapleQtyToShopping('0', 'g') === null && stapleQtyToShopping('-2', 'g') === null);
+
+  // v21.3 wrote free text into this map; it has to survive the upgrade.
+  const migrated = { recipes: [], ingredients: [
+      { name: 'Milk', shoppingUnit: 'mL', aisle: 'Dairy' },
+      { name: 'Flour', shoppingUnit: 'g', aisle: 'Baking' },
+      { name: 'Banana', shoppingUnit: 'qty', aisle: 'Fruit' },
+      { name: 'Bread', shoppingUnit: 'g', aisle: 'Bakery' }
+    ],
+    settings: { features: { staples: true }, staples: ['Milk','Flour','Banana','Bread'],
+                stapleQty: { Milk: '2 L', Flour: '1 kg', Banana: '6', Bread: '1 loaf' } } };
+  setRecipesData(migrated);
+  ok('an old "2 L" reads as 2000 mL', stapleQtyFor('Milk') === 2000, stapleQtyFor('Milk'));
+  ok('an old "1 kg" reads as 1000 g', stapleQtyFor('Flour') === 1000);
+  ok('an old bare count is unchanged', stapleQtyFor('Banana') === 6);
+  ok('an old "1 loaf" has no numeric reading', stapleQtyFor('Bread') === null);
+  ok('a name never set returns null', stapleQtyFor('Nothing') === null);
+  ok('lookup is case-insensitive', stapleQtyFor('milk') === 2000);
   noStaples();
+}
+
+group('kilos and litres above a thousand');
+{
+  const q = (total, unit) => lineQtyText({ hasNumeric: true, totalQty: total, unit: unit });
+  ok('under a kilo stays in grams', q(850, 'g') === '850 g');
+  ok('under a litre stays in millilitres', q(125, 'mL') === '125 mL');
+  ok('exactly a kilo rolls up', q(1000, 'g') === '1 kg', q(1000, 'g'));
+  ok('exactly a litre rolls up', q(1000, 'mL') === '1 L', q(1000, 'mL'));
+  ok('over a kilo rolls up', q(1500, 'g') === '1.5 kg', q(1500, 'g'));
+  ok('over a litre rolls up', q(2125, 'mL') === '2.125 L', q(2125, 'mL'));
+
+  // "No rounding": these are the cases fmtQty would have quietly flattened.
+  ok('1001 g is not "1 kg"', q(1001, 'g') === '1.001 kg', q(1001, 'g'));
+  ok('1250 g keeps both decimals', q(1250, 'g') === '1.25 kg', q(1250, 'g'));
+  ok('2001 mL is not "2 L"', q(2001, 'mL') === '2.001 L', q(2001, 'mL'));
+  ok('no floating-point tail is shown', q(1100, 'g') === '1.1 kg', q(1100, 'g'));
+
+  // Only weights and volumes roll up.
+  ok('counts never roll up', q(2000, 'qty') === '2000', q(2000, 'qty'));
+  ok('unitless amounts never roll up', q(5000, '') === '5000', q(5000, ''));
+  ok('the unit match is case-insensitive', q(1500, 'ML') === '1.5 L', q(1500, 'ML'));
+
+  // A rolled-up amount still sits in front of any free-text part.
+  ok('free-text parts still follow',
+     lineQtyText({ hasNumeric: true, totalQty: 1500, unit: 'g', textQtyParts: ['a splash'] })
+       === '1.5 kg + a splash');
 }
 
 /* ---------- result ---------- */
