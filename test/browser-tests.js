@@ -279,6 +279,117 @@ async function suiteWriteSplitting(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+async function suiteStapleQuantities(browser) {
+  group('staples carry a quantity onto the list');
+  const srv = await serve(8176);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  try {
+    await page.goto('http://localhost:8176/', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1800);
+
+    // The staples list is feature-gated. Ensure it ends up ON rather than blindly
+    // toggling — it already ships enabled in the seed data, so a click would turn it off.
+    await page.click('#mainNav button[data-tab="settings"]');
+    await page.waitForTimeout(500);
+    const wasOn = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem('fma_recipes_v4')).settings.features.staples);
+    if (!wasOn) { await page.click('text="Staples list"'); await page.waitForTimeout(600); }
+    ok('the staples section is available',
+       await page.evaluate(() => [...document.querySelectorAll('button')]
+         .some(b => b.textContent.trim() === 'Add staple')));
+
+    // Add a staple that no recipe uses, with a free-text quantity.
+    await page.fill('input[placeholder="ingredient name…"]', 'Kitchen roll');
+    await page.fill('input[placeholder="qty"]', '2 rolls');
+    await page.click('button:has-text("Add staple")');
+    await page.waitForTimeout(500);
+
+    const stored = await page.evaluate(() => {
+      const s = JSON.parse(localStorage.getItem('fma_recipes_v4')).settings;
+      return { staples: s.staples, qty: s.stapleQty };
+    });
+    ok('the staple is stored as a plain string (old builds still parse it)',
+       stored.staples.every(s => typeof s === 'string'), stored.staples);
+    ok('the quantity is stored alongside, not inside', stored.qty['Kitchen roll'] === '2 rolls', stored.qty);
+
+    // Generate a list and check the quantity reaches it.
+    await buildAList(page);
+    const line = await page.evaluate(() => {
+      const sd = JSON.parse(localStorage.getItem('fma_shopping_v4'));
+      return sd.shoppingList.find(l => /kitchen roll/i.test(l.ingredientName)) || null;
+    });
+    ok('the staple is on the generated list', !!line, line);
+    ok('carrying its quantity', line && (line.textQtyParts || []).indexOf('2 rolls') !== -1, line);
+
+    const shown = await page.evaluate(() => {
+      const row = [...document.querySelectorAll('.shop-row')]
+        .find(r => /kitchen roll/i.test(r.textContent));
+      return row ? row.querySelector('.shop-name').textContent : null;
+    });
+    ok('and showing it on screen', shown && shown.indexOf('2 rolls') !== -1, shown);
+
+    const printed = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('.print-shopping-section .item-row')]
+        .find(r => /kitchen roll/i.test(r.textContent));
+      return rows ? rows.textContent : null;
+    });
+    ok('and on the printout', printed && printed.indexOf('2 rolls') !== -1, printed);
+
+    // Editing a quantity must reach a list that has already been generated — and must
+    // not cost the shopper their ticks doing it.
+    const rows = await page.$$('.shop-row');
+    await rows[0].$eval('input[type=checkbox]', c => c.click());
+    await page.waitForTimeout(200);
+    const tickedBefore = (await readShopping(page)).shoppingList.filter(l => l.checked).length;
+
+    await page.click('#mainNav button[data-tab="settings"]');
+    await page.waitForTimeout(500);
+    const qtyBox = await page.$('input[aria-label="Quantity of Kitchen roll"]');
+    ok('the quantity is editable on an existing staple', !!qtyBox);
+    await qtyBox.fill('5 rolls');
+    await qtyBox.evaluate(e => e.blur());
+    await page.waitForTimeout(400);
+
+    await page.click('#mainNav button[data-tab="review"]');
+    await page.waitForTimeout(700);
+    const after = await readShopping(page);
+    const updated = after.shoppingList.find(l => /kitchen roll/i.test(l.ingredientName));
+    ok('the edited quantity reaches the existing list',
+       updated && (updated.textQtyParts || []).indexOf('5 rolls') !== -1, updated && updated.textQtyParts);
+    ok('and the old quantity is gone', updated && (updated.textQtyParts || []).indexOf('2 rolls') === -1,
+       updated && updated.textQtyParts);
+    ok('ticks survive the staple edit',
+       after.shoppingList.filter(l => l.checked).length === tickedBefore,
+       { before: tickedBefore, after: after.shoppingList.filter(l => l.checked).length });
+
+    // A staple a recipe also needs shows BOTH amounts, rather than one replacing the other.
+    const target = await page.evaluate(() => {
+      const sd = JSON.parse(localStorage.getItem('fma_shopping_v4'));
+      const l = sd.shoppingList.find(x => x.hasNumeric && x.sources && x.sources.length);
+      return l ? l.ingredientName : null;
+    });
+    if (target) {
+      await page.click('#mainNav button[data-tab="settings"]');
+      await page.waitForTimeout(500);
+      await page.fill('input[placeholder="ingredient name…"]', target);
+      await page.fill('input[placeholder="qty"]', '1 extra');
+      await page.click('button:has-text("Add staple")');
+      await page.waitForTimeout(500);
+      await page.click('#mainNav button[data-tab="review"]');
+      await page.waitForTimeout(700);
+      const merged = await page.evaluate(n => {
+        const sd = JSON.parse(localStorage.getItem('fma_shopping_v4'));
+        return sd.shoppingList.find(x => x.ingredientName === n) || null;
+      }, target);
+      ok('a recipe amount and a staple amount are both kept',
+         merged && merged.hasNumeric && (merged.textQtyParts || []).indexOf('1 extra') !== -1, merged);
+    }
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 async function suitePrinting(browser) {
   group('printing survives Safari capturing the page late');
   const srv = await serve(8174);
@@ -404,7 +515,8 @@ async function suiteOfflineAndSession(browser) {
     // A suite that throws is a failed suite, not a reason to abandon the run — the
     // remaining suites still have something useful to say about the build.
     for (const suite of [suiteTicksSurviveRebuild, suiteRemoteMergeKeepsTicks,
-                         suiteWriteSplitting, suitePrinting, suiteOfflineAndSession]) {
+                         suiteWriteSplitting, suiteStapleQuantities,
+                         suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
       catch (e) {
         fail++; failures.push(suite.name);

@@ -57,19 +57,28 @@ const TICK_TIE_WINDOW_MS = 10000;
 
 const FUNCS = ['tsOf', 'tripIdOf', 'mergeFlag', 'flagStamp', 'mergeShoppingLine',
                'mergeShoppingData', 'lineMergeKey', 'selectionsSignature',
-               'recipeSelectionsSignature', 'shoppingListIsStale'];
+               'recipeSelectionsSignature', 'shoppingListIsStale',
+               'featureOn', 'stapleQtyFor'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
 vm.runInContext(
   'const TICK_TIE_WINDOW_MS = ' + TICK_TIE_WINDOW_MS + ';\n' +
   'let shoppingData = null;\n' +
+  'let recipesData = { recipes: [], ingredients: [], settings: { features: {}, staples: [], stapleQty: {} } };\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
-  '             tripIdOf, setShoppingData: d => { shoppingData = d; } };',
+  '             tripIdOf, setShoppingData: d => { shoppingData = d; },' +
+  '             setRecipesData: d => { recipesData = d; } };',
   sandbox
 );
-const { mergeShoppingData, selectionsSignature, shoppingListIsStale, setShoppingData } = sandbox.api;
+const { mergeShoppingData, selectionsSignature, shoppingListIsStale,
+        setShoppingData, setRecipesData } = sandbox.api;
+
+// Most tests don't care about staples; give them an inert default.
+const noStaples = () => setRecipesData(
+  { recipes: [], ingredients: [], settings: { features: { staples: false }, staples: [], stapleQty: {} } });
+noStaples();
 
 /* ---------- fixtures ---------- */
 
@@ -270,6 +279,49 @@ group('a trip in progress is not treated as stale');
   data.shoppingList[0].checked = true;
   setShoppingData(data);
   ok('still not stale once items are ticked', shoppingListIsStale() === false);
+}
+
+group('changing a staple refreshes the list without ending the trip');
+{
+  const withStaples = qty => setRecipesData({
+    recipes: [], ingredients: [],
+    settings: { features: { staples: true }, staples: ['Milk'], stapleQty: { Milk: qty } }
+  });
+  const data = {
+    weekPlan: { selections: [{ recipeId: 'r1', servings: 4 }], generatedAt: T(0), tripId: TRIP, shoppingDoneAt: null },
+    shoppingList: [line('Milk', { checked: true, checkedAt: T(1000) })],
+    neededList: [], lastUpdated: T(0)
+  };
+  setShoppingData(data);
+
+  withStaples('2 L');
+  const before = selectionsSignature();
+  withStaples('3 L');
+  ok('editing a quantity changes the signature', selectionsSignature() !== before);
+
+  // ...but not the recipe signature, so it is a same-trip refresh and the carry-forward
+  // in generateShoppingList keeps the shopper's ticks.
+  const recipeSig = vm.runInContext('recipeSelectionsSignature()', sandbox);
+  withStaples('2 L');
+  ok('and never the recipe signature (so the trip continues)',
+     vm.runInContext('recipeSelectionsSignature()', sandbox) === recipeSig);
+
+  data.weekPlan.lastGeneratedSignature = selectionsSignature();
+  data.weekPlan.lastGeneratedRecipeSignature = recipeSig;
+  setShoppingData(data);
+  ok('not stale once regenerated', shoppingListIsStale() === false);
+  withStaples('4 L');
+  setShoppingData(data);
+  ok('stale again after another quantity edit', shoppingListIsStale() === true);
+
+  // With the feature off, staples must not influence the signature at all.
+  setRecipesData({ recipes: [], ingredients: [],
+                   settings: { features: { staples: false }, staples: ['Milk'], stapleQty: { Milk: '9 L' } } });
+  const off = selectionsSignature();
+  setRecipesData({ recipes: [], ingredients: [],
+                   settings: { features: { staples: false }, staples: [], stapleQty: {} } });
+  ok('staples are ignored while the feature is off', selectionsSignature() === off);
+  noStaples();
 }
 
 /* ---------- result ---------- */

@@ -328,7 +328,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v21.2';
+const APP_VERSION = 'v21.3';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -436,6 +436,16 @@ function defaultSettings(){
            // because it was already in live use before the switchboard existed.
            features: { staples: false, pantryAtHome: false, recipeFinder: true },
            staples: [],
+           /* How much of each staple to buy, keyed by the staple's canonical name:
+              { "Milk": "2 L", "bread (loaf)": "1" }. Deliberately held OUTSIDE the
+              staples array so the array stays a plain list of strings — a device still
+              on v21.2 reads this file, and turning its entries into objects would break
+              its settings screen and its list generation outright. An older device just
+              ignores this map and behaves exactly as it does today.
+              Free text on purpose: staples are bought in packs ("1 loaf", "2 bags",
+              "6"), not in the mL and grams that recipes use, so inferring a unit from
+              the ingredient master would produce confident nonsense like "2 mL Milk". */
+           stapleQty: {},
            // Shopping-list side only: what the servings box is pre-filled with when a
            // recipe is ticked for the week. 'recipe' = that recipe's own servings;
            // 'fixed' = always shoppingServingsCount. Recipe display is never scaled.
@@ -460,7 +470,28 @@ function ensureSettings(data){
   // silently drop feature flags added in later versions
   data.settings.features = Object.assign({}, d.features, data.settings.features || {});
   if(!Array.isArray(data.settings.staples)) data.settings.staples = [];
+  const q = data.settings.stapleQty;
+  if(!q || typeof q !== 'object' || Array.isArray(q)) data.settings.stapleQty = {};
   return data;
+}
+
+// Quantity for a staple, matched case-insensitively so a rename in the ingredient
+// master (or a differently-cased entry from another device) doesn't lose it.
+function stapleQtyFor(name){
+  const map = (recipesData.settings && recipesData.settings.stapleQty) || {};
+  if(map[name]) return String(map[name]).trim();
+  const norm = (name||'').trim().toLowerCase();
+  const hit = Object.keys(map).find(k => k.trim().toLowerCase() === norm);
+  return hit ? String(map[hit]).trim() : '';
+}
+
+function setStapleQty(name, qty){
+  if(!recipesData.settings.stapleQty) recipesData.settings.stapleQty = {};
+  const map = recipesData.settings.stapleQty;
+  const norm = (name||'').trim().toLowerCase();
+  Object.keys(map).forEach(k => { if(k.trim().toLowerCase() === norm) delete map[k]; });
+  const v = (qty||'').trim();
+  if(v) map[name] = v;
 }
 
 function featureOn(name){
@@ -1726,7 +1757,16 @@ function selectionsSignature(){
       .sort((a,b)=> a.r < b.r ? -1 : a.r > b.r ? 1 : 0),
     fridge: shoppingData.neededList
       .map(n=>n.id)
-      .sort()
+      .sort(),
+    /* v21.3: staples and their quantities count as a real change too, so editing an
+       amount actually reaches a list that has already been generated. This only ever
+       triggers a SAME-trip refresh — trip identity comes from recipeSelectionsSignature,
+       which staples are deliberately not part of — so the rebuild carries every tick
+       across rather than resetting the trip. */
+    staples: featureOn('staples')
+      ? (recipesData.settings.staples || []).slice().sort()
+          .map(n => n + ' ' + stapleQtyFor(n))
+      : []
   });
 }
 
@@ -1810,13 +1850,22 @@ function generateShoppingList(){
       const meta = findIngredientMeta(name);
       const key = (meta ? meta.name : name).trim().toLowerCase();
       if(!key) return;
-      if(lines[key]){ lines[key].fromStaples = true; return; }
+      /* The staple's quantity rides in textQtyParts, which both the screen and the
+         printout already render verbatim. When a recipe needs the same ingredient the
+         two show side by side — "500 mL + 2 L" — rather than one silently replacing
+         the other: the recipes need their share AND you still restock the usual pack. */
+      const qty = stapleQtyFor(meta ? meta.name : name);
+      if(lines[key]){
+        lines[key].fromStaples = true;
+        if(qty) lines[key].textQtyParts.push(qty);
+        return;
+      }
       lines[key] = {
         ingredientName: meta ? meta.name : name,
         unit: (meta && meta.shoppingUnit) || '',
         aisle: (meta && meta.aisle) || 'Uncategorised',
         shoppingCategory: (meta && meta.shoppingCategory) || 'Other',
-        totalQty: 0, hasNumeric:false, textQtyParts: [], sources: [], removed:false, checked:false,
+        totalQty: 0, hasNumeric:false, textQtyParts: qty ? [qty] : [], sources: [], removed:false, checked:false,
         source:'staple', fromStaples:true
       };
     });
@@ -3288,6 +3337,7 @@ function renderSettingsTab(){
     container.appendChild(el('h3',{},['Staples — added to every shopping list']));
     const stCard = el('div',{class:'card'});
     stCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},['These go on every generated list automatically, in their proper aisle. Family brand preferences belong in the ingredient\u2019s NAME — rename it in the ingredient list below (e.g. "Bread (Helga\u2019s wholemeal)") and that name flows through recipes, shopping lists and printouts.']));
+    stCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},['The quantity box is how much you normally buy — write it however you say it: "2", "1 loaf", "2 x 500 g". It shows on the shopping list and on the printout. Leave it blank for anything you buy without thinking about the amount. If a recipe needs the same ingredient that week, both amounts are shown so neither gets forgotten.']));
     const stListWrap = el('div',{});
     function drawStaples(){
       stListWrap.innerHTML = '';
@@ -3298,9 +3348,24 @@ function renderSettingsTab(){
         const row = el('div',{class:'checkbox-row'});
         row.appendChild(el('label',{},[name + (meta ? '' : ' — not in the ingredient list yet')]));
         row.appendChild(el('span',{class:'muted', style:'font-size:.78rem;'},[meta ? (meta.aisle || 'Uncategorised') : '']));
+        // How many to buy. Saved on the way out of the field rather than per keystroke,
+        // so a staples edit doesn't fire a save (and an upload) for every character.
+        const qtyIn = el('input',{type:'text', value: stapleQtyFor(name), placeholder:'qty',
+                                  'aria-label':'Quantity of ' + name,
+                                  style:'width:74px;flex:0 0 auto;text-align:center;'});
+        const commit = ()=>{
+          const v = qtyIn.value.trim();
+          if(v === stapleQtyFor(name)) return;
+          setStapleQty(name, v);
+          persist('recipes');
+        };
+        qtyIn.addEventListener('blur', commit);
+        qtyIn.addEventListener('keydown', e=>{ if(e.key === 'Enter'){ e.preventDefault(); qtyIn.blur(); } });
+        row.appendChild(qtyIn);
         const rmB = el('button',{class:'btn small danger'},['✕']);
         rmB.addEventListener('click', ()=>{
           recipesData.settings.staples = (recipesData.settings.staples||[]).filter(s=>s!==name);
+          setStapleQty(name, '');   // don't leave the quantity behind for a re-add
           persist('recipes'); drawStaples();
         });
         row.appendChild(rmB);
@@ -3310,26 +3375,33 @@ function renderSettingsTab(){
     const stDlId = 'staples-ingredient-suggestions';
     const stDl = el('datalist',{id:stDlId});
     knownIngredientAllNames().forEach(n=> stDl.appendChild(el('option',{value:n})));
-    const stInput = el('input',{type:'text', placeholder:'ingredient name…', list:stDlId, autocomplete:'off', style:'min-width:200px;'});
+    const stInput = el('input',{type:'text', placeholder:'ingredient name…', list:stDlId, autocomplete:'off', style:'min-width:160px;'});
+    const stQty = el('input',{type:'text', placeholder:'qty', 'aria-label':'Quantity',
+                              style:'width:74px;flex:0 0 auto;text-align:center;'});
     const stAdd = el('button',{class:'btn small', type:'button'},['Add staple']);
     function addStaple(){
       const v = stInput.value.trim();
       if(!v) return;
       const meta = findIngredientMeta(v);
       const canonical = meta ? meta.name : v;
-      if(!(recipesData.settings.staples||[]).some(s=>s.toLowerCase()===canonical.toLowerCase())){
+      const already = (recipesData.settings.staples||[]).some(s=>s.toLowerCase()===canonical.toLowerCase());
+      if(!already){
         recipesData.settings.staples.push(canonical);
         if(!meta){
           // unknown name: create a master entry on the spot so it lands in an aisle-fixable state
           recipesData.ingredients.push({name: canonical, shoppingUnit:'', aisle:'Uncategorised', shoppingCategory:'Other'});
         }
-        persist('recipes'); drawStaples();
       }
-      stInput.value=''; stInput.focus();
+      // Setting a quantity on something already listed is a legitimate way to correct it,
+      // so apply it whether or not the staple itself was new.
+      if(stQty.value.trim() || !already) setStapleQty(canonical, stQty.value);
+      persist('recipes'); drawStaples();
+      stInput.value=''; stQty.value=''; stInput.focus();
     }
     stAdd.addEventListener('click', addStaple);
     stInput.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); addStaple(); } });
-    const stRow = el('div',{class:'row', style:'align-items:center;gap:6px;margin-bottom:8px;'},[stInput, stAdd, stDl]);
+    stQty.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); addStaple(); } });
+    const stRow = el('div',{class:'row', style:'align-items:center;gap:6px;margin-bottom:8px;'},[stInput, stQty, stAdd, stDl]);
     stCard.appendChild(stRow);
     stCard.appendChild(stListWrap);
     drawStaples();
