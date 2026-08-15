@@ -283,7 +283,24 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v20.0';
+const APP_VERSION = 'v21.0';
+
+/* ---- v21 concurrent-shopping identity ----
+   A stable per-device id, and a skew window for tick conflicts. Two phones in the
+   same shop can be a second or two apart on the clock, which is enough for a plain
+   last-write-wins comparison to throw away a tick. Inside this window a tick beats
+   an untick; outside it, a deliberate untick still works normally. */
+const LS_DEVICE_ID = 'fma_device_id_v1';
+const TICK_TIE_WINDOW_MS = 10000;
+
+function deviceId(){
+  let id = localStorage.getItem(LS_DEVICE_ID);
+  if(!id){
+    id = 'd' + Math.random().toString(36).slice(2, 10);
+    try{ localStorage.setItem(LS_DEVICE_ID, id); }catch(e){}
+  }
+  return id;
+}
 
 /* ---- v20 sync-health state ----
    lastWriteError is set by the two write paths so autoSaveToOneDrive can turn an
@@ -324,7 +341,7 @@ function loadSeed(){
 }
 
 function defaultShoppingData(){
-  return { weekPlan: { selections: [], generatedAt: null }, shoppingList: [], neededList: [], lastUpdated: null, updatedBy: '' };
+  return { weekPlan: { selections: [], generatedAt: null, tripId: null }, shoppingList: [], neededList: [], lastUpdated: null, updatedBy: '' };
 }
 
 // Refreshes the ingredient master's category/aisle/unit data from the bundled seed
@@ -843,8 +860,7 @@ async function loadFromOneDriveOrSeed(){
     if(sText){
       // Merge rather than replace, so ticks made on this device while offline/only-local
       // survive reconnection instead of being wiped by the remote copy.
-      shoppingData = mergeShoppingData(shoppingData, JSON.parse(sText));
-      localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData));
+      applyMergedShopping(mergeShoppingData(shoppingData, JSON.parse(sText)));
     } else {
       await writeOneDriveFile(driveId, itemId, 'shopping-list.json', JSON.stringify(shoppingData));
     }
@@ -965,53 +981,173 @@ function lineMergeKey(l){
   return l.source === 'needed' ? ('needed:' + l.neededId) : ('ing:' + (l.ingredientName||'').trim().toLowerCase());
 }
 
+function tsOf(v){ return v ? (Date.parse(v) || 0) : 0; }
+
+/* The identity of a shopping trip. Explicit from v21 on; derived from generatedAt for
+   files written by older builds, so both devices independently agree on the same id
+   for the same list without needing a migration write. */
+function tripIdOf(sd){
+  const wp = sd && sd.weekPlan;
+  if(!wp) return null;
+  return wp.tripId || (wp.generatedAt ? 'gen:' + wp.generatedAt : null);
+}
+
+/* Resolve one boolean across two copies of the same line.
+   Each flag now carries its own stamp (checkedAt / removedAt / atHomeAt) instead of
+   sharing one `changedAt`. Sharing a single stamp meant that one shopper marking an
+   item "at home" also overwrote the other shopper's tick on that item, because all
+   three flags were copied across as a block.
+   `tickBias` makes ticks additive inside the clock-skew window: two phones are rarely
+   perfectly in sync, and losing a tick is far more damaging than briefly keeping one. */
+function mergeFlag(aVal, aAt, bVal, bAt, fallback, tickBias){
+  const at = tsOf(aAt), bt = tsOf(bAt);
+  if(at && bt){
+    if(tickBias && Math.abs(at - bt) <= TICK_TIE_WINDOW_MS && (aVal || bVal)){
+      return { val: true, at: at >= bt ? aAt : bAt };
+    }
+    return at >= bt ? { val: !!aVal, at: aAt } : { val: !!bVal, at: bAt };
+  }
+  // Only one side stamped: it wins, unless that would drop a tick the other side holds.
+  if(at) return (tickBias && bVal && !aVal) ? { val: true, at: aAt } : { val: !!aVal, at: aAt };
+  if(bt) return (tickBias && aVal && !bVal) ? { val: true, at: bAt } : { val: !!bVal, at: bAt };
+  return { val: fallback(!!aVal, !!bVal), at: null };
+}
+
+// Back-compat: a pre-v21 line has one `changedAt` covering all three flags.
+function flagStamp(line, field){
+  if(line[field + 'At']) return line[field + 'At'];
+  return line[field] ? (line.changedAt || null) : null;
+}
+
+function mergeShoppingLine(x, y){
+  // Composition (name, aisle, quantities, sources) comes from the more recently
+  // touched copy; only the three shopper flags are resolved field by field.
+  const xNewer = tsOf(x.changedAt) >= tsOf(y.changedAt);
+  const out = Object.assign({}, xNewer ? y : x, xNewer ? x : y);
+  const c = mergeFlag(x.checked, flagStamp(x,'checked'), y.checked, flagStamp(y,'checked'),
+                      (p,q)=> p || q, true);
+  const r = mergeFlag(x.removed, flagStamp(x,'removed'), y.removed, flagStamp(y,'removed'),
+                      (p,q)=> p || q, false);
+  // atHome resolves the other way: if EITHER side says "we need it", it stays on the
+  // active list — never silently hide something someone opted to buy.
+  const h = mergeFlag(x.atHome, flagStamp(x,'atHome'), y.atHome, flagStamp(y,'atHome'),
+                      (p,q)=> p && q, false);
+  out.checked = c.val; if(c.at) out.checkedAt = c.at; else delete out.checkedAt;
+  out.removed = r.val; if(r.at) out.removedAt = r.at; else delete out.removedAt;
+  out.atHome  = h.val; if(h.at) out.atHomeAt  = h.at; else delete out.atHomeAt;
+  out.changedAt = [c.at, r.at, h.at, x.changedAt, y.changedAt]
+    .reduce((best, v)=> tsOf(v) > tsOf(best) ? v : best, null);
+  return out;
+}
+
+/* v21 merge. Pure — it builds a new object rather than mutating either input, so a
+   caller can never be left holding a half-merged copy.
+   Composition rule: when both sides are working on the SAME trip, the line set is the
+   UNION of both. The old version iterated the "newer" file's lines only, which meant a
+   line the other shopper had added (a manual extra, say) was silently dropped if your
+   save happened to land second. Across different trips the newer trip wins outright —
+   its list is the real one, and last trip's ticks must not leak into it. */
 function mergeShoppingData(a, b){
   if(!a) return b;
   if(!b) return a;
-  const ts = x => (x && x.lastUpdated) ? (Date.parse(x.lastUpdated) || 0) : 0;
-  const base = ts(a) >= ts(b) ? a : b;      // newer file wins on composition (weekPlan, list membership)
-  const other = base === a ? b : a;
-  const otherLines = {};
-  (other.shoppingList || []).forEach(l => { otherLines[lineMergeKey(l)] = l; });
-  (base.shoppingList || []).forEach(l => {
-    const o = otherLines[lineMergeKey(l)];
-    if(!o) return;
-    const lt = l.changedAt ? (Date.parse(l.changedAt) || 0) : 0;
-    const ot = o.changedAt ? (Date.parse(o.changedAt) || 0) : 0;
-    if(ot > lt){
-      l.checked = o.checked; l.removed = o.removed; l.atHome = o.atHome; l.changedAt = o.changedAt;
-    } else if(lt === 0 && ot === 0){
-      // no stamps on either side (pre-v15 data): additive — a tick/removal survives.
-      // atHome resolves the other way: if EITHER side says "we need it", it stays
-      // on the active list — never silently hide something someone opted to buy.
-      l.checked = l.checked || o.checked;
-      l.removed = l.removed || o.removed;
-      l.atHome = !!(l.atHome && o.atHome);
+
+  const aTrip = tripIdOf(a), bTrip = tripIdOf(b);
+  const sameTrip = !!aTrip && aTrip === bTrip;
+  const aGen = tsOf(a.weekPlan && a.weekPlan.generatedAt);
+  const bGen = tsOf(b.weekPlan && b.weekPlan.generatedAt);
+  // Newer file by wall clock, used for everything that isn't resolved item by item.
+  const primary = tsOf(a.lastUpdated) >= tsOf(b.lastUpdated) ? a : b;
+  const secondary = primary === a ? b : a;
+
+  const out = Object.assign({}, secondary, primary);
+  out.weekPlan = Object.assign({}, secondary.weekPlan, primary.weekPlan);
+
+  if(!sameTrip){
+    // Different trips: the one generated later is authoritative, wholesale.
+    const winner = aGen === bGen ? primary : (aGen > bGen ? a : b);
+    out.shoppingList = (winner.shoppingList || []).map(l=> Object.assign({}, l));
+    out.weekPlan = Object.assign({}, winner.weekPlan);
+  } else {
+    const byKey = new Map();
+    const order = [];
+    const take = l=>{
+      const k = lineMergeKey(l);
+      if(byKey.has(k)) byKey.set(k, mergeShoppingLine(byKey.get(k), l));
+      else { byKey.set(k, Object.assign({}, l)); order.push(k); }
+    };
+    (primary.shoppingList || []).forEach(take);
+    (secondary.shoppingList || []).forEach(take);
+    out.shoppingList = order.map(k=> byKey.get(k));
+
+    /* "Shopping is done" empties the list on purpose. Under a union that would be
+       undone the moment the other phone — still holding a full list — synced, so a
+       finish recorded on either device ends the trip for both. */
+    const doneAt = [a.weekPlan && a.weekPlan.shoppingDoneAt, b.weekPlan && b.weekPlan.shoppingDoneAt]
+      .reduce((best, v)=> tsOf(v) > tsOf(best) ? v : best, null);
+    if(doneAt){
+      out.weekPlan = Object.assign({}, out.weekPlan, { shoppingDoneAt: doneAt });
+      out.shoppingList = [];
     }
-  });
+    out.weekPlan.tripId = aTrip;
+  }
+
   // menu-tab cooked flags: merge per selection by recipeId, same latest-wins rule
-  const otherSel = {};
-  ((other.weekPlan && other.weekPlan.selections) || []).forEach(s => { otherSel[s.recipeId] = s; });
-  ((base.weekPlan && base.weekPlan.selections) || []).forEach(s => {
-    const o = otherSel[s.recipeId];
-    if(!o) return;
-    const st = s.cookedChangedAt ? (Date.parse(s.cookedChangedAt) || 0) : 0;
-    const ot2 = o.cookedChangedAt ? (Date.parse(o.cookedChangedAt) || 0) : 0;
-    if(ot2 > st){ s.cooked = o.cooked; s.cookedChangedAt = o.cookedChangedAt; }
-    else if(st === 0 && ot2 === 0){ s.cooked = s.cooked || o.cooked; }
+  const secSel = {};
+  ((secondary.weekPlan && secondary.weekPlan.selections) || []).forEach(s => { secSel[s.recipeId] = s; });
+  out.weekPlan.selections = ((primary.weekPlan && primary.weekPlan.selections) || []).map(s=>{
+    const o = secSel[s.recipeId];
+    if(!o) return Object.assign({}, s);
+    const st = tsOf(s.cookedChangedAt), ot = tsOf(o.cookedChangedAt);
+    const m = Object.assign({}, s);
+    if(ot > st){ m.cooked = o.cooked; m.cookedChangedAt = o.cookedChangedAt; }
+    else if(st === 0 && ot === 0){ m.cooked = s.cooked || o.cooked; }
+    return m;
   });
 
-  const otherNeeded = {};
-  (other.neededList || []).forEach(n => { otherNeeded[n.id] = n; });
-  (base.neededList || []).forEach(n => {
-    const o = otherNeeded[n.id];
-    if(!o) return;
-    const nt = n.changedAt ? (Date.parse(n.changedAt) || 0) : 0;
-    const ot = o.changedAt ? (Date.parse(o.changedAt) || 0) : 0;
-    if(ot > nt){ n.done = o.done; n.changedAt = o.changedAt; }
-    else if(nt === 0 && ot === 0){ n.done = n.done || o.done; }
+  // Wait List: membership follows the newer file (a deletion there is deliberate and
+  // has no tombstone to merge against), but each entry's done flag resolves by stamp.
+  const secNeeded = {};
+  (secondary.neededList || []).forEach(n => { secNeeded[n.id] = n; });
+  out.neededList = (primary.neededList || []).map(n=>{
+    const o = secNeeded[n.id];
+    if(!o) return Object.assign({}, n);
+    const nt = tsOf(n.changedAt), ot = tsOf(o.changedAt);
+    const m = Object.assign({}, n);
+    if(ot > nt){ m.done = o.done; m.changedAt = o.changedAt; }
+    else if(nt === 0 && ot === 0){ m.done = n.done || o.done; }
+    return m;
   });
-  return base;
+
+  return out;
+}
+
+/* ---- v21: one way in and out of shoppingData ----
+   Every rendered shopping row closes over its line object. A merge can hand back a
+   different object graph (it always does now that the merge is pure), so swapping
+   shoppingData without repainting left every checkbox on screen wired to an orphaned
+   line: the tick appeared to register, the row struck through, and then persist()
+   serialised the NEW state where the tick had never happened. That is what made ticks
+   "come back" only after a refresh. State swaps and repaints now happen together. */
+function applyMergedShopping(merged){
+  shoppingData = merged;
+  try{ localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData)); }
+  catch(e){ storageBlockedReason = 'Could not save locally (' + ((e && e.message) || e) + ').'; }
+  if(currentTab === 'review' || currentTab === 'needed' || currentTab === 'menu') rerenderPreservingScroll();
+}
+
+// Look a line up by its merge key at the moment of the tap, rather than trusting the
+// object the row was drawn from — see applyMergedShopping.
+function findShoppingLine(key){
+  return (shoppingData.shoppingList || []).find(l=> lineMergeKey(l) === key) || null;
+}
+
+/* Stamp one flag with its own timestamp. `changedAt` is still written so that a device
+   left on v20 keeps resolving these lines exactly as it did before. */
+function stampLine(line, field){
+  const now = new Date().toISOString();
+  line[field + 'At'] = now;
+  line.changedAt = now;
+  line.changedBy = deviceId();
 }
 
 // Fetch the remote shopping file's content AND its ETag (via item metadata, since the
@@ -1037,8 +1173,9 @@ async function writeShoppingMerged(token){
   for(let attempt = 0; attempt < 3; attempt++){
     const remote = await fetchRemoteShopping(token);
     if(remote && remote.data){
-      shoppingData = mergeShoppingData(shoppingData, remote.data);
-      localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData));
+      // Must go through applyMergedShopping: this runs on every tick, and when the
+      // other shopper has saved in the meantime the merge returns a fresh object.
+      applyMergedShopping(mergeShoppingData(shoppingData, remote.data));
     }
     const headers = { 'Content-Type': 'application/json' };
     if(remote && remote.etag) headers['If-Match'] = remote.etag;
@@ -1047,6 +1184,13 @@ async function writeShoppingMerged(token){
     });
     if(res.status === 200 || res.status === 201){
       if(remote) oneDriveLastModified['shopping-list.json'] = null; // force next poll to restamp
+      // Adopt our own write's timestamp so the fast poll doesn't immediately download
+      // and re-merge the file we just sent — that echo was one more chance to swap the
+      // state object out from under a list somebody is actively ticking.
+      try{
+        const wrote = await res.json();
+        if(wrote && wrote.lastModifiedDateTime) shoppingFastPollStamp = wrote.lastModifiedDateTime;
+      }catch(e){ /* body already consumed or not JSON — harmless */ }
       return true;
     }
     if(res.status !== 412){
@@ -1066,38 +1210,53 @@ const SHOPPING_FAST_POLL_MS = 5000;
 let shoppingFastPollTimer = null;
 let shoppingFastPollStamp = null;
 
-function startShoppingFastPoll(){
-  stopShoppingFastPoll();
-  shoppingFastPollTimer = setInterval(async ()=>{
-    if(currentTab !== 'review') return;
-    if(document.hidden) return;
-    if(document.getElementById('modalRoot').innerHTML !== '') return;
-    if(!msalAccount || !oneDriveFolderRef || localStorage.getItem(LS_ONEDRIVE_FLAG) !== '1') return;
+let shoppingPollInFlight = false;
+
+async function pollShoppingNow(){
+  if(currentTab !== 'review') return;
+  if(document.hidden) return;
+  if(document.getElementById('modalRoot').innerHTML !== '') return;
+  if(!msalAccount || !oneDriveFolderRef || localStorage.getItem(LS_ONEDRIVE_FLAG) !== '1') return;
+  // A poll can now be triggered by the timer AND by waking the screen; overlapping
+  // runs would merge the same remote copy twice and repaint mid-tap.
+  if(shoppingPollInFlight) return;
+  shoppingPollInFlight = true;
+  try{
     const token = await getGraphToken();
     if(!token) return;
-    try{
-      const { driveId, itemId } = oneDriveFolderRef;
-      const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/shopping-list.json?$select=lastModifiedDateTime', token);
-      if(res.status !== 200) return;
-      const meta = await res.json();
-      if(shoppingFastPollStamp === meta.lastModifiedDateTime) return;
-      shoppingFastPollStamp = meta.lastModifiedDateTime;
-      const remote = await fetchRemoteShopping(token);
-      if(remote && remote.data){
-        const before = JSON.stringify(shoppingData);
-        shoppingData = mergeShoppingData(shoppingData, remote.data);
-        if(JSON.stringify(shoppingData) !== before){
-          localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData));
-          if(currentTab === 'review') render();
-          setStatus('Shopping list updated from the other shopper — ' + new Date().toLocaleTimeString(), 'ok');
-        }
+    const { driveId, itemId } = oneDriveFolderRef;
+    const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/shopping-list.json?$select=lastModifiedDateTime', token);
+    if(res.status !== 200) return;
+    const meta = await res.json();
+    if(shoppingFastPollStamp === meta.lastModifiedDateTime) return;
+    shoppingFastPollStamp = meta.lastModifiedDateTime;
+    const remote = await fetchRemoteShopping(token);
+    if(remote && remote.data){
+      const before = JSON.stringify(shoppingData);
+      const merged = mergeShoppingData(shoppingData, remote.data);
+      if(JSON.stringify(merged) !== before){
+        applyMergedShopping(merged);
+        setStatus('Shopping list updated from the other shopper — ' + new Date().toLocaleTimeString(), 'ok');
       }
-    }catch(e){ console.warn('fast poll failed', e); }
-  }, SHOPPING_FAST_POLL_MS);
+    }
+  }catch(e){ console.warn('fast poll failed', e); }
+  finally{ shoppingPollInFlight = false; }
+}
+
+function startShoppingFastPoll(){
+  stopShoppingFastPoll();
+  shoppingFastPollTimer = setInterval(pollShoppingNow, SHOPPING_FAST_POLL_MS);
 }
 function stopShoppingFastPoll(){
   if(shoppingFastPollTimer){ clearInterval(shoppingFastPollTimer); shoppingFastPollTimer = null; }
 }
+
+/* Phones blank the screen constantly in a shop, and a hidden tab skips its polls.
+   Waking up should show the other shopper's ticks immediately rather than after
+   another full interval. */
+document.addEventListener('visibilitychange', ()=>{
+  if(!document.hidden) pollShoppingNow();
+});
 
 /* ---------------- manual export / import (works in every browser) ---------------- */
 
@@ -1364,13 +1523,18 @@ function catSortIndex(c){
 // picked, and which Wait List items are currently active (not done). Adding or
 // removing a wait list item changes this just as much as changing a recipe pick does,
 // so either one needs to mark the list stale.
+/* v21: the signature deliberately ignores each Wait List entry's `done` flag and
+   keys off membership only. Ticking an item off in the aisle sets `done` (see
+   syncNeededFromLine), so a signature that filtered on it changed the moment anyone
+   started shopping — which made the list look "stale" and had renderReviewTab
+   silently rebuild it, wiping every tick on the trip. Adding or removing a Wait
+   List entry still counts as a real change; shopping from the list does not. */
 function selectionsSignature(){
   return JSON.stringify({
     sel: shoppingData.weekPlan.selections
       .map(s=>({r:s.recipeId, s:s.servings}))
       .sort((a,b)=> a.r < b.r ? -1 : a.r > b.r ? 1 : 0),
     fridge: shoppingData.neededList
-      .filter(n=>!n.done)
       .map(n=>n.id)
       .sort()
   });
@@ -1379,6 +1543,18 @@ function selectionsSignature(){
 function generateShoppingList(){
   const lines = {}; // key -> {ingredientName, unit, aisle, totalQty, textQtyParts:[], sources:[]}
   const generatedNow = new Date().toISOString();
+  /* v21: regeneration is a reconciliation, not a rebuild. It used to hand back a
+     brand new set of lines with checked:false, so any refresh of this tab mid-trip
+     threw away the shopper's progress. Snapshot what's on the list now, keyed the
+     same way the sync merge keys it, and carry the per-line state back on below —
+     but only when this is still the SAME trip. A genuine change to the week's
+     recipe picks starts a new trip, where a clean unticked list is what's wanted. */
+  const prevByKey = {};
+  (shoppingData.shoppingList || []).forEach(l=>{ prevByKey[lineMergeKey(l)] = l; });
+  const prevTripId = tripIdOf(shoppingData);
+  const sameTrip = !!prevTripId
+    && !shoppingData.weekPlan.shoppingDoneAt
+    && shoppingData.weekPlan.lastGeneratedRecipeSignature === recipeSelectionsSignature();
   shoppingData.weekPlan.selections.forEach(sel=>{
     const recipe = recipesData.recipes.find(r=>r.id===sel.recipeId);
     if(!recipe) return;
@@ -1406,7 +1582,16 @@ function generateShoppingList(){
   // that way "onions" restocking sits with the onions a recipe already needs, not off
   // in its own list. Anything that doesn't match a known ingredient falls back to its
   // own "Wait list" section at the end.
-  shoppingData.neededList.filter(n=>!n.done).forEach(n=>{
+  /* A Wait List entry is dropped from the list once it's done — but ticking it off in
+     the aisle is what sets `done`, so during a trip that would make the line vanish
+     from under the shopper rather than show as ticked. Keep any entry that is already
+     part of this trip's list; the carry-forward below then restores its tick. */
+  const stillOnTrip = n => {
+    if(!sameTrip) return false;
+    const m = findIngredientMeta(n.text);
+    return !!prevByKey[m ? ('ing:' + (m.name||'').trim().toLowerCase()) : ('needed:' + n.id)];
+  };
+  shoppingData.neededList.filter(n=> !n.done || stillOnTrip(n)).forEach(n=>{
     const meta = findIngredientMeta(n.text);
     if(meta){
       const key = meta.name.trim().toLowerCase();
@@ -1460,8 +1645,29 @@ function generateShoppingList(){
       }
     });
   }
+  // Carry the trip's progress across the rebuild (ticks, removals, and any explicit
+  // "Need it"/"At home" choice) together with the stamps the sync merge resolves on.
+  // Without the stamps a carried-over tick would look unstamped to the other device
+  // and lose to its stale copy of the same line.
+  if(sameTrip){
+    arr.forEach(l=>{
+      const p = prevByKey[lineMergeKey(l)];
+      if(!p) return;
+      l.checked = !!p.checked;
+      l.checkedAt = p.checkedAt || (p.checked ? (p.changedAt || null) : null);
+      l.removed = !!p.removed;
+      l.removedAt = p.removedAt || (p.removed ? (p.changedAt || null) : null);
+      if(p.atHomeAt){ l.atHome = !!p.atHome; l.atHomeAt = p.atHomeAt; }
+      else if(p.atHome === false && l.atHome){ l.atHome = false; } // pre-v21 "Need it"
+      if(p.changedAt) l.changedAt = p.changedAt;
+    });
+  }
   shoppingData.shoppingList = arr;
-  shoppingData.weekPlan.generatedAt = new Date().toISOString();
+  shoppingData.weekPlan.generatedAt = generatedNow;
+  /* The trip id is what lets the merge tell "the same list, edited by two people"
+     apart from "a genuinely newer list". It must survive a same-trip rebuild, or
+     each device would call its own rebuild a new trip and discard the other's work. */
+  shoppingData.weekPlan.tripId = sameTrip ? prevTripId : ('trip:' + generatedNow + ':' + deviceId());
   shoppingData.weekPlan.shoppingDoneAt = null; // a fresh list is an unfinished list
   shoppingData.weekPlan.lastGeneratedRecipeSignature = recipeSelectionsSignature();
   shoppingData.weekPlan.lastGeneratedSignature = selectionsSignature();
@@ -1498,7 +1704,7 @@ function finishShopping(){
   const going = shoppingData.neededList.filter(n=> n.done);
   const names = going.slice(0,8).map(n=>'  \u2022 ' + n.text).join('\n')
     + (going.length > 8 ? '\n  \u2026and ' + (going.length-8) + ' more' : '');
-  const msg = 'Mark this shopping as done?\n\nThe shopping list will be cleared.'
+  const msg = 'Mark this shopping as done?\n\nThe shopping list will be cleared — including on anyone else’s phone shopping from the same list.'
     + (going.length
         ? '\n\nThese ' + going.length + ' ticked Wait List item(s) will be removed:\n' + names
         : '\n\nNothing on the Wait List is ticked off, so the Wait List is left as it is.')
@@ -2173,7 +2379,9 @@ function renderReviewTab(){
   addBtn.addEventListener('click', ()=>{
     const v = addInput.value.trim();
     if(!v) return;
-    shoppingData.shoppingList.push({key:'manual-'+Date.now(), ingredientName:v, unit:'', aisle:'Other', shoppingCategory:'Other', totalQty:0, hasNumeric:false, textQtyParts:[], sources:[], removed:false, checked:false, source:'manual'});
+    // Stamped on creation so the union merge keeps it: an extra added by one shopper
+    // used to be dropped if the other phone's save happened to land second.
+    shoppingData.shoppingList.push({key:'manual-'+Date.now(), ingredientName:v, unit:'', aisle:'Other', shoppingCategory:'Other', totalQty:0, hasNumeric:false, textQtyParts:[], sources:[], removed:false, checked:false, source:'manual', changedAt:new Date().toISOString(), changedBy:deviceId()});
     addInput.value='';
     persist('shopping'); rerenderPreservingScroll();
   });
@@ -2199,18 +2407,24 @@ function renderReviewTab(){
     groups[aisle].forEach(line=>{
       /* v20 row layout. The whole name area is one ~52px tap target that toggles the
          tick; the destructive controls sit past the label so a mis-tap lands on text.
-         Ticking still mutates in place — no re-render, no scroll jump. */
+         Ticking still mutates in place — no re-render, no scroll jump.
+         v21: resolve the line by its merge key at tap time. A sync landing between the
+         draw and the tap replaces the object this row was built from, and mutating that
+         stale copy is exactly how a tick used to vanish. */
+      const lineKey = lineMergeKey(line);
       const row = el('div',{class:'shop-row' + (line.checked?' ticked':'')});
       const tap = el('label',{class:'shop-tap'});
       const cb = el('input',{type:'checkbox'});
       cb.checked = !!line.checked;
       cb.addEventListener('change', ()=>{
-        line.checked = cb.checked;
-        line.changedAt = new Date().toISOString();
-        syncNeededFromLine(line, cb.checked);
+        const live = findShoppingLine(lineKey);
+        if(!live){ rerenderPreservingScroll(); return; }
+        live.checked = cb.checked;
+        stampLine(live, 'checked');
+        syncNeededFromLine(live, cb.checked);
         persist('shopping');
-        row.classList.toggle('ticked', line.checked);
-        if(hideTickedItems && line.checked) rerenderPreservingScroll();
+        row.classList.toggle('ticked', live.checked);
+        if(hideTickedItems && live.checked) rerenderPreservingScroll();
         else updateShopProgress();
       });
       const nameWrap = el('div',{});
@@ -2225,11 +2439,19 @@ function renderReviewTab(){
       const acts = el('div',{class:'shop-acts'});
       if(featureOn('pantryAtHome')){
         const homeBtn = el('button',{class:'btn tap secondary', title:'Already have this at home'},['At home']);
-        homeBtn.addEventListener('click', ()=>{ line.atHome = true; line.changedAt = new Date().toISOString(); persist('shopping'); rerenderPreservingScroll(); });
+        homeBtn.addEventListener('click', ()=>{
+          const live = findShoppingLine(lineKey);
+          if(live){ live.atHome = true; stampLine(live, 'atHome'); persist('shopping'); }
+          rerenderPreservingScroll();
+        });
         acts.appendChild(homeBtn);
       }
       const rm = el('button',{class:'btn tap danger', title:'Not needed this week'},['✕']);
-      rm.addEventListener('click', ()=>{ line.removed = true; line.changedAt = new Date().toISOString(); persist('shopping'); rerenderPreservingScroll(); });
+      rm.addEventListener('click', ()=>{
+        const live = findShoppingLine(lineKey);
+        if(live){ live.removed = true; stampLine(live, 'removed'); persist('shopping'); }
+        rerenderPreservingScroll();
+      });
       acts.appendChild(rm);
       row.appendChild(acts);
       g.appendChild(row);
@@ -2243,8 +2465,13 @@ function renderReviewTab(){
     atHomeLines.forEach(line=>{
       const row = el('div',{class:'checkbox-row'});
       row.appendChild(el('label',{class:'muted'},[ingredientLabelText(line)]));
+      const needKey = lineMergeKey(line);
       const needBtn = el('button',{class:'btn tap'},['Need it']);
-      needBtn.addEventListener('click', ()=>{ line.atHome = false; line.changedAt = new Date().toISOString(); persist('shopping'); rerenderPreservingScroll(); });
+      needBtn.addEventListener('click', ()=>{
+        const live = findShoppingLine(needKey);
+        if(live){ live.atHome = false; stampLine(live, 'atHome'); persist('shopping'); }
+        rerenderPreservingScroll();
+      });
       row.appendChild(needBtn);
       hcard.appendChild(row);
     });
@@ -2257,8 +2484,13 @@ function renderReviewTab(){
     removedLines.forEach(line=>{
       const row = el('div',{class:'checkbox-row'});
       row.appendChild(el('label',{class:'muted'},[line.ingredientName]));
+      const restoreKey = lineMergeKey(line);
       const restore = el('button',{class:'btn tap secondary'},['Restore']);
-      restore.addEventListener('click', ()=>{ line.removed = false; line.changedAt = new Date().toISOString(); persist('shopping'); rerenderPreservingScroll(); });
+      restore.addEventListener('click', ()=>{
+        const live = findShoppingLine(restoreKey);
+        if(live){ live.removed = false; stampLine(live, 'removed'); persist('shopping'); }
+        rerenderPreservingScroll();
+      });
       row.appendChild(restore);
       rcard.appendChild(row);
     });
@@ -2358,7 +2590,12 @@ function renderNeededTab(){
     const li = el('li',{class:item.done?'done':''});
     const cb = el('input',{type:'checkbox'});
     cb.checked = item.done;
-    cb.addEventListener('change', ()=>{ item.done = cb.checked; item.changedAt = new Date().toISOString(); persist('shopping'); render(); });
+    cb.addEventListener('change', ()=>{
+      // Resolve by id at tap time — a sync may have replaced the entry object.
+      const live = shoppingData.neededList.find(n=> n.id === item.id);
+      if(live){ live.done = cb.checked; live.changedAt = new Date().toISOString(); persist('shopping'); }
+      render();
+    });
     const label = el('label',{},[item.text]);
     const rm = el('button',{class:'btn small danger'},['Remove']);
     rm.addEventListener('click', ()=>{ shoppingData.neededList = shoppingData.neededList.filter(n=>n.id!==item.id); persist('shopping'); render(); });
