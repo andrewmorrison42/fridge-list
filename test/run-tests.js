@@ -52,13 +52,22 @@ function extract(name) {
   throw new Error('Unbalanced braces while extracting ' + name + '() from index.html');
 }
 
+/* Pull `const NAME = <single-line value>;` out of index.html, so shared constants are
+   read from the source rather than duplicated here where they could drift. */
+function extractConst(name){
+  const m = html.match(new RegExp('const\\s+' + name + '\\s*=\\s*([^;]+);'));
+  if (!m) throw new Error('Could not find const ' + name + ' in index.html');
+  return m[0];
+}
+
 // Keep this in step with the constant in index.html; asserted below so it can't drift.
 const TICK_TIE_WINDOW_MS = 10000;
 
 const FUNCS = ['tsOf', 'tripIdOf', 'mergeFlag', 'flagStamp', 'mergeShoppingLine',
                'mergeShoppingData', 'lineMergeKey', 'selectionsSignature',
                'recipeSelectionsSignature', 'shoppingListIsStale',
-               'featureOn', 'stapleQtyFor'];
+               'featureOn', 'stapleQtyFor', 'parseQty', 'fmtQty',
+               'displayUnit', 'lineQtyText'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -66,14 +75,16 @@ vm.runInContext(
   'const TICK_TIE_WINDOW_MS = ' + TICK_TIE_WINDOW_MS + ';\n' +
   'let shoppingData = null;\n' +
   'let recipesData = { recipes: [], ingredients: [], settings: { features: {}, staples: [], stapleQty: {} } };\n' +
+  extractConst('COUNT_UNITS') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
-  '             tripIdOf, setShoppingData: d => { shoppingData = d; },' +
+  '             tripIdOf, parseQty, lineQtyText, displayUnit,' +
+  '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
 );
 const { mergeShoppingData, selectionsSignature, shoppingListIsStale,
-        setShoppingData, setRecipesData } = sandbox.api;
+        parseQty, lineQtyText, displayUnit, setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
 const noStaples = () => setRecipesData(
@@ -322,6 +333,40 @@ group('changing a staple refreshes the list without ending the trip');
                    settings: { features: { staples: false }, staples: [], stapleQty: {} } });
   ok('staples are ignored while the feature is off', selectionsSignature() === off);
   noStaples();
+}
+
+group('quantities read the way the ingredient is ordinarily called');
+{
+  // 'qty' is the master's way of recording "each"; nobody says "1 qty Banana".
+  ok('a count unit is not printed', displayUnit('qty') === '');
+  ok('...case-insensitively', displayUnit('Qty') === '' && displayUnit('EACH') === '');
+  ok('a real unit is left alone', displayUnit('g') === 'g' && displayUnit('mL') === 'mL');
+  ok('a blank unit stays blank', displayUnit('') === '' && displayUnit(undefined) === '');
+
+  ok('counted items show just the number',
+     lineQtyText({ hasNumeric: true, totalQty: 6, unit: 'qty' }) === '6');
+  ok('weighed items keep their unit',
+     lineQtyText({ hasNumeric: true, totalQty: 850, unit: 'g' }) === '850 g');
+  ok('a staple amount is appended after a plus',
+     lineQtyText({ hasNumeric: true, totalQty: 125, unit: 'mL', textQtyParts: ['2 L'] }) === '125 mL + 2 L');
+  ok('a staple-only line shows just its own amount',
+     lineQtyText({ hasNumeric: false, textQtyParts: ['1 loaf'] }) === '1 loaf');
+  ok('an amountless line shows nothing',
+     lineQtyText({ hasNumeric: false, textQtyParts: [] }) === '');
+}
+
+group('quantity parsing');
+{
+  // Regression: ".5" failed the old pattern, so it was never summed into the
+  // ingredient's total and showed on the list as a bare ".5".
+  ok('a leading decimal point parses', parseQty('.5') === 0.5);
+  ok('a trailing decimal point parses', parseQty('1.') === 1);
+  ok('plain numbers still parse', parseQty('2') === 2 && parseQty(3) === 3 && parseQty('0.25') === 0.25);
+  ok('fraction characters still parse', parseQty('½') === 0.5 && parseQty('1½') === 1.5);
+  ok('written fractions still parse', parseQty('1/2') === 0.5);
+  ok('a lone point is not a number', parseQty('.') === null);
+  ok('non-numeric amounts stay text', parseQty('to taste') === null && parseQty('1-2') === null);
+  ok('empty stays empty', parseQty('') === null && parseQty(null) === null && parseQty(undefined) === null);
 }
 
 /* ---------- result ---------- */

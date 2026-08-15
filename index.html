@@ -1714,7 +1714,11 @@ function parseQty(q){
   if(fracMap[s] !== undefined) return fracMap[s];
   const m = s.match(/^(\d+)\s*[½¼¾⅓⅔⅛]$/);
   if(m && fracMap[s.slice(-1)] !== undefined) return parseInt(m[1],10) + fracMap[s.slice(-1)];
-  if(/^\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+  // Accept a leading or trailing decimal point too (".5", "1."). The old pattern
+  // required a digit before the point, so a quantity written ".5" failed to parse and
+  // fell through to the text branch below — it then showed on the list as a bare ".5"
+  // instead of being added into that ingredient's total.
+  if(/^(\d+(\.\d*)?|\.\d+)$/.test(s)) return parseFloat(s);
   if(/^\d+\/\d+$/.test(s)){ const [a,b] = s.split('/'); return parseFloat(a)/parseFloat(b); }
   return null; // ranges, "to taste", etc: not summable, keep as text
 }
@@ -2497,10 +2501,34 @@ function renderStartTab(){
 }
 
 /* ---- Review Shopping List tab ---- */
+
+/* v21.3: show each ingredient in the unit it's ordinarily called by.
+   'qty' is the ingredient master's way of recording "each" — 120 of the 446
+   ingredients use it — and printing it literally gave "1 qty Banana", "12 qty Eggs".
+   Nobody says that; the ordinary way to say it is just the number. Real units (g, mL)
+   ARE how those ingredients are ordinarily called, so they print exactly as before.
+   This only affects how a quantity is displayed — nothing is stored or converted, so
+   the ingredient master and the recipe editor are untouched. */
+const COUNT_UNITS = ['qty', 'each', 'ea', 'count', 'pc', 'pcs'];
+function displayUnit(unit){
+  const u = (unit || '').trim();
+  return COUNT_UNITS.indexOf(u.toLowerCase()) === -1 ? u : '';
+}
+
+// The quantity column for one shopping line: the summed recipe amount, plus any
+// free-text amounts (staple quantities, non-numeric recipe quantities) after a "+".
+function lineQtyText(line){
+  let t = '';
+  if(line.hasNumeric){
+    const u = displayUnit(line.unit);
+    t = fmtQty(line.totalQty) + (u ? ' ' + u : '');
+  }
+  if(line.textQtyParts && line.textQtyParts.length) t += (t ? ' + ' : '') + line.textQtyParts.join(', ');
+  return t;
+}
+
 function ingredientLabelText(line){
-  let qtyText = '';
-  if(line.hasNumeric) qtyText = fmtQty(line.totalQty) + (line.unit?' '+line.unit:'');
-  if(line.textQtyParts && line.textQtyParts.length) qtyText += (qtyText?' + ':'') + line.textQtyParts.join(', ');
+  const qtyText = lineQtyText(line);
   const countBadge = (line.sources && line.sources.length) ? ' (' + line.sources.length + ')' : '';
   const fridgeBadge = line.fromFridgeList ? ' (Wait list)' : '';
   const stapleBadge = line.fromStaples ? ' (Staple)' : '';
@@ -2927,9 +2955,7 @@ function buildShoppingPrintSection(){
       const aisleBlock = el('div',{class:'aisle-block'});
       aisleBlock.appendChild(el('div',{class:'aisle-header'},[aisle]));
       aisles[aisle].sort((a,b)=>a.ingredientName.localeCompare(b.ingredientName)).forEach(line=>{
-        let qtyText = '';
-        if(line.hasNumeric) qtyText = fmtQty(line.totalQty) + (line.unit?' '+line.unit:'');
-        if(line.textQtyParts && line.textQtyParts.length) qtyText += (qtyText?' + ':'') + line.textQtyParts.join(', ');
+        const qtyText = lineQtyText(line);   // same rendering as the on-screen list
         const count = (line.sources && line.sources.length) ? line.sources.length : null;
         const row = el('div',{class:'item-row'});
         row.appendChild(el('span',{class:'item-name'},['☐ ' + line.ingredientName]));
