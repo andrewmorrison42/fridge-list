@@ -328,7 +328,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v21.3';
+const APP_VERSION = 'v21.4';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -437,14 +437,15 @@ function defaultSettings(){
            features: { staples: false, pantryAtHome: false, recipeFinder: true },
            staples: [],
            /* How much of each staple to buy, keyed by the staple's canonical name:
-              { "Milk": "2 L", "bread (loaf)": "1" }. Deliberately held OUTSIDE the
-              staples array so the array stays a plain list of strings — a device still
-              on v21.2 reads this file, and turning its entries into objects would break
-              its settings screen and its list generation outright. An older device just
+              { "Milk": 2000, "Eggs (whole)": 12 }. Deliberately held OUTSIDE the staples
+              array so the array stays a plain list of strings — a device still on v21.2
+              reads this file, and turning its entries into objects would break its
+              settings screen and its list generation outright. An older device just
               ignores this map and behaves exactly as it does today.
-              Free text on purpose: staples are bought in packs ("1 loaf", "2 bags",
-              "6"), not in the mL and grams that recipes use, so inferring a unit from
-              the ingredient master would produce confident nonsense like "2 mL Milk". */
+              v21.4: a plain NUMBER in that ingredient's own shopping unit, so a staple
+              amount adds into the recipe total for the same ingredient and the list
+              shows one figure. v21.3 held free text here, which could only ever sit
+              alongside the recipe amount as "125 mL + 2 L". */
            stapleQty: {},
            // Shopping-list side only: what the servings box is pre-filled with when a
            // recipe is ticked for the week. 'recipe' = that recipe's own servings;
@@ -472,26 +473,89 @@ function ensureSettings(data){
   if(!Array.isArray(data.settings.staples)) data.settings.staples = [];
   const q = data.settings.stapleQty;
   if(!q || typeof q !== 'object' || Array.isArray(q)) data.settings.stapleQty = {};
+  else migrateStapleQty(data);
   return data;
 }
 
-// Quantity for a staple, matched case-insensitively so a rename in the ingredient
-// master (or a differently-cased entry from another device) doesn't lose it.
-function stapleQtyFor(name){
-  const map = (recipesData.settings && recipesData.settings.stapleQty) || {};
-  if(map[name]) return String(map[name]).trim();
-  const norm = (name||'').trim().toLowerCase();
-  const hit = Object.keys(map).find(k => k.trim().toLowerCase() === norm);
-  return hit ? String(map[hit]).trim() : '';
+/* v21.3 stored staple amounts as free text ("2 L", "1 loaf"); v21.4 stores a number in
+   the ingredient's own shopping unit so it can be added to the recipe total. Convert
+   what has a defensible numeric reading and drop what does not — "1 loaf" has no
+   meaning in grams, and inventing one would put a wrong number on the shopping list.
+   Takes `data` rather than reading the global, because this runs during startup before
+   recipesData is assigned. */
+function migrateStapleQty(data){
+  const map = data.settings.stapleQty;
+  const byName = {};
+  (data.ingredients || []).forEach(i => { byName[(i.name||'').trim().toLowerCase()] = i; });
+  Object.keys(map).forEach(name=>{
+    const v = map[name];
+    if(typeof v === 'number'){ if(!(v > 0)) delete map[name]; return; }
+    const meta = byName[(name||'').trim().toLowerCase()];
+    const n = stapleQtyToShopping(v, meta && meta.shoppingUnit);
+    if(n === null) delete map[name]; else map[name] = n;
+  });
 }
 
+/* Read a typed staple amount as a number in `unit`. A bare number is already in that
+   unit; the everyday larger units convert; anything else has no numeric reading. */
+function stapleQtyToShopping(raw, unit){
+  const s = String(raw == null ? '' : raw).trim();
+  if(!s) return null;
+  const m = s.match(/^([0-9.,/½¼¾⅓⅔⅛\s]+?)\s*([a-zA-Z]*)$/);
+  if(!m) return null;
+  const n = parseQty(m[1].replace(/,/g, '').trim());
+  if(n === null || !(n > 0)) return null;
+  const suffix = (m[2] || '').toLowerCase();
+  if(!suffix) return n;                                   // already in the shopping unit
+  if(unit === 'mL'){
+    if(suffix === 'ml') return n;
+    if(suffix === 'l')  return n * 1000;
+    if(MEASURE_ML[m[2]]) return n * MEASURE_ML[m[2]];     // cup / TBsp / tsp
+  }
+  if(unit === 'g'){
+    if(suffix === 'g')  return n;
+    if(suffix === 'kg') return n * 1000;
+  }
+  return null;
+}
+
+// Quantity for a staple as a number in its shopping unit, or null if none is set.
+// Matched case-insensitively so a rename in the ingredient master (or a
+// differently-cased entry from another device) doesn't lose it.
+function stapleQtyFor(name){
+  const map = (recipesData.settings && recipesData.settings.stapleQty) || {};
+  let v = map[name];
+  if(v === undefined){
+    const norm = (name||'').trim().toLowerCase();
+    const hit = Object.keys(map).find(k => k.trim().toLowerCase() === norm);
+    if(hit !== undefined) v = map[hit];
+  }
+  if(typeof v === 'number') return v > 0 ? v : null;
+  // Not migrated yet: a phone still on v21.3 writes free text into this map and syncs
+  // it across. Read it the same way the migration would rather than depending on
+  // having been through it.
+  const meta = findIngredientMeta(name);
+  return stapleQtyToShopping(v, meta && meta.shoppingUnit);
+}
+
+// `qty` is whatever was typed; it is stored as a number in the ingredient's shopping
+// unit, or cleared when blank or unreadable.
 function setStapleQty(name, qty){
   if(!recipesData.settings.stapleQty) recipesData.settings.stapleQty = {};
   const map = recipesData.settings.stapleQty;
   const norm = (name||'').trim().toLowerCase();
   Object.keys(map).forEach(k => { if(k.trim().toLowerCase() === norm) delete map[k]; });
-  const v = (qty||'').trim();
-  if(v) map[name] = v;
+  const meta = findIngredientMeta(name);
+  const n = stapleQtyToShopping(qty, meta && meta.shoppingUnit);
+  if(n !== null) map[name] = n;
+}
+
+// What to label the amount box with in Settings. 'qty' means "each", which reads
+// better than the raw token beside a number someone is about to type.
+function stapleUnitLabel(name){
+  const meta = findIngredientMeta(name);
+  const u = (meta && meta.shoppingUnit) || '';
+  return u === '' ? 'each' : (displayUnit(u) || 'each');
 }
 
 function featureOn(name){
@@ -1769,7 +1833,7 @@ function selectionsSignature(){
        across rather than resetting the trip. */
     staples: featureOn('staples')
       ? (recipesData.settings.staples || []).slice().sort()
-          .map(n => n + ' ' + stapleQtyFor(n))
+          .map(n => { const q = stapleQtyFor(n); return n + ' ' + (q === null ? '' : q); })
       : []
   });
 }
@@ -1854,14 +1918,14 @@ function generateShoppingList(){
       const meta = findIngredientMeta(name);
       const key = (meta ? meta.name : name).trim().toLowerCase();
       if(!key) return;
-      /* The staple's quantity rides in textQtyParts, which both the screen and the
-         printout already render verbatim. When a recipe needs the same ingredient the
-         two show side by side — "500 mL + 2 L" — rather than one silently replacing
-         the other: the recipes need their share AND you still restock the usual pack. */
+      /* v21.4: the staple amount is a number in this ingredient's shopping unit, so it
+         adds straight into the running total the recipes contribute to. When a recipe
+         needs the same ingredient you now get one figure — "2125 mL" — instead of the
+         "125 mL + 2 L" the free-text version could only manage. */
       const qty = stapleQtyFor(meta ? meta.name : name);
       if(lines[key]){
         lines[key].fromStaples = true;
-        if(qty) lines[key].textQtyParts.push(qty);
+        if(qty !== null){ lines[key].totalQty += qty; lines[key].hasNumeric = true; }
         return;
       }
       lines[key] = {
@@ -1869,7 +1933,8 @@ function generateShoppingList(){
         unit: (meta && meta.shoppingUnit) || '',
         aisle: (meta && meta.aisle) || 'Uncategorised',
         shoppingCategory: (meta && meta.shoppingCategory) || 'Other',
-        totalQty: 0, hasNumeric:false, textQtyParts: qty ? [qty] : [], sources: [], removed:false, checked:false,
+        totalQty: qty === null ? 0 : qty, hasNumeric: qty !== null,
+        textQtyParts: [], sources: [], removed:false, checked:false,
         source:'staple', fromStaples:true
       };
     });
@@ -3333,45 +3398,6 @@ function findRecipesByCategoryAndIngredients(cats, terms, mode){
   }).sort((a,b)=>a.name.localeCompare(b.name));
 }
 
-/* ---- v21.3: shopping-unit audit ----
-   The shopping list sums an ingredient across recipes, which is only meaningful if
-   every recipe recorded its amount in that ingredient's shopping unit. wireUnitControls
-   enforces that for anything entered through the editor, but recipes that predate it
-   (and the ones imported from the old database) can hold an amount in some other unit
-   entirely — "Potatoes: 4", meaning four potatoes, on an ingredient bought by weight.
-   Those quantities then sum to something far too small and the list under-orders.
-
-   Deliberately a floor check rather than anything cleverer: below one teaspoon there is
-   no real amount of a g/mL ingredient, so anything under it is wrong. It cannot catch a
-   count that happens to look like a plausible weight, and it never guesses an intent —
-   "4" could be four potatoes, 400 g, or 4 x 200 g, and picking one would quietly corrupt
-   a recipe. It reports; a human decides. */
-const QTY_AUDIT_FLOOR = 5;                 // one teaspoon: the smallest real kitchen measure
-const QTY_AUDIT_SKIP_AISLES = ['spices'];  // a pinch of salt is not worth chasing
-
-function auditQuantityUnits(){
-  const groups = {};
-  (recipesData.recipes || []).forEach(recipe=>{
-    (recipe.ingredients || []).forEach(ing=>{
-      const meta = findIngredientMeta(ing.ingredientName);
-      if(!meta) return;                                     // unknown ingredient: nothing to check against
-      const unit = meta.shoppingUnit;
-      if(unit !== 'g' && unit !== 'mL') return;             // counts have no floor to test
-      if(QTY_AUDIT_SKIP_AISLES.indexOf((meta.aisle||'').trim().toLowerCase()) !== -1) return;
-      if(ing.displayUnit) return;                           // a recorded kitchen measure was converted properly
-      const q = parseQty(ing.quantity);
-      if(q === null || q <= 0 || q >= QTY_AUDIT_FLOOR) return;
-      const key = meta.name;
-      if(!groups[key]) groups[key] = { ingredientName: meta.name, shoppingUnit: unit,
-                                       aisle: meta.aisle || 'Uncategorised', issues: [] };
-      groups[key].issues.push({ recipeId: recipe.id, recipeName: recipe.name, quantity: q });
-    });
-  });
-  // Most-affected first: that is the order they are worth working through.
-  return Object.values(groups).sort((a,b)=>
-    b.issues.length - a.issues.length || a.ingredientName.localeCompare(b.ingredientName));
-}
-
 function renderSettingsTab(){
   const container = el('div',{});
 
@@ -3402,7 +3428,7 @@ function renderSettingsTab(){
     container.appendChild(el('h3',{},['Staples — added to every shopping list']));
     const stCard = el('div',{class:'card'});
     stCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},['These go on every generated list automatically, in their proper aisle. Family brand preferences belong in the ingredient\u2019s NAME — rename it in the ingredient list below (e.g. "Bread (Helga\u2019s wholemeal)") and that name flows through recipes, shopping lists and printouts.']));
-    stCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},['The quantity box is how much you normally buy — write it however you say it: "2", "1 loaf", "2 x 500 g". It shows on the shopping list and on the printout. Leave it blank for anything you buy without thinking about the amount. If a recipe needs the same ingredient that week, both amounts are shown so neither gets forgotten.']));
+    stCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},['The quantity box is how much you normally buy, in that ingredient’s own shopping unit — the unit is shown beside each box, so "Milk" in mL takes 2000 for two litres, and anything counted just takes the number. Leave it blank for anything you buy without thinking about the amount. If a recipe needs the same ingredient that week the two are added together, so the list shows a single amount to buy.']));
     const stListWrap = el('div',{});
     function drawStaples(){
       stListWrap.innerHTML = '';
@@ -3413,20 +3439,26 @@ function renderSettingsTab(){
         const row = el('div',{class:'checkbox-row'});
         row.appendChild(el('label',{},[name + (meta ? '' : ' — not in the ingredient list yet')]));
         row.appendChild(el('span',{class:'muted', style:'font-size:.78rem;'},[meta ? (meta.aisle || 'Uncategorised') : '']));
-        // How many to buy. Saved on the way out of the field rather than per keystroke,
-        // so a staples edit doesn't fire a save (and an upload) for every character.
-        const qtyIn = el('input',{type:'text', value: stapleQtyFor(name), placeholder:'qty',
+        /* How many to buy, in this ingredient's own shopping unit — the unit is shown
+           beside the box so there is nothing to guess. Saved on the way out of the field
+           rather than per keystroke, so an edit doesn't fire a save (and an upload) for
+           every character. Anything unreadable clears the amount and the box snaps back,
+           rather than silently keeping a number nobody typed. */
+        const current = stapleQtyFor(name);
+        const qtyIn = el('input',{type:'text', inputmode:'decimal',
+                                  value: current === null ? '' : fmtQty(current), placeholder:'qty',
                                   'aria-label':'Quantity of ' + name,
                                   style:'width:74px;flex:0 0 auto;text-align:center;'});
         const commit = ()=>{
-          const v = qtyIn.value.trim();
-          if(v === stapleQtyFor(name)) return;
-          setStapleQty(name, v);
+          setStapleQty(name, qtyIn.value);
+          const now = stapleQtyFor(name);
+          qtyIn.value = now === null ? '' : fmtQty(now);
           persist('recipes');
         };
         qtyIn.addEventListener('blur', commit);
         qtyIn.addEventListener('keydown', e=>{ if(e.key === 'Enter'){ e.preventDefault(); qtyIn.blur(); } });
         row.appendChild(qtyIn);
+        row.appendChild(el('span',{class:'muted', style:'font-size:.78rem;flex:0 0 auto;'},[stapleUnitLabel(name)]));
         const rmB = el('button',{class:'btn small danger'},['✕']);
         rmB.addEventListener('click', ()=>{
           recipesData.settings.staples = (recipesData.settings.staples||[]).filter(s=>s!==name);
@@ -3441,7 +3473,9 @@ function renderSettingsTab(){
     const stDl = el('datalist',{id:stDlId});
     knownIngredientAllNames().forEach(n=> stDl.appendChild(el('option',{value:n})));
     const stInput = el('input',{type:'text', placeholder:'ingredient name…', list:stDlId, autocomplete:'off', style:'min-width:160px;'});
-    const stQty = el('input',{type:'text', placeholder:'qty', 'aria-label':'Quantity',
+    // No unit label here: which unit applies isn't known until an ingredient is named.
+    // Each row below shows its own unit once the staple exists.
+    const stQty = el('input',{type:'text', inputmode:'decimal', placeholder:'qty', 'aria-label':'Quantity',
                               style:'width:74px;flex:0 0 auto;text-align:center;'});
     const stAdd = el('button',{class:'btn small', type:'button'},['Add staple']);
     function addStaple(){
@@ -3643,54 +3677,6 @@ function renderSettingsTab(){
   bmCard.appendChild(bmRow);
   bmCard.appendChild(el('p',{class:'muted', style:'margin-bottom:0;'},['Can\'t drag (tablet, or a fussy browser)? Use "Copy button code": create any bookmark, edit it, name it Grab Recipe and paste the code as the URL. The button only reads the recipe on the page you\'re viewing and copies it to your clipboard \u2014 it sends nothing anywhere. If a site has no structured recipe data, the button tells you; select the whole page, copy, and paste that into the import box instead.']));
   container.appendChild(bmCard);
-
-  /* -------- Shopping-unit audit -------- */
-  container.appendChild(el('h3',{},['Amounts that look wrong for their unit']));
-  const auditGroups = auditQuantityUnits();
-  const auditCount = auditGroups.reduce((n,g)=> n + g.issues.length, 0);
-  const auCard = el('div',{class:'card'});
-  auCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
-    'The shopping list adds an ingredient up across every recipe that needs it, which only works if each recipe records the amount in that ingredient’s shopping unit. The recipe editor enforces that now — pick cup, TBsp or tsp and it converts — but older recipes were entered before it did.'
-  ]));
-  auCard.appendChild(el('p',{class:'muted'},[
-    'Listed below is every amount smaller than one teaspoon (' + QTY_AUDIT_FLOOR + ' g or mL) that has no kitchen measure recorded, because nothing real is bought in those quantities. "Potatoes: 4 g" almost certainly means four potatoes, and until it is corrected the shopping list asks for 4 g of them. Seasonings are left out — a pinch of salt is not worth chasing.'
-  ]));
-  auCard.appendChild(el('p',{class:'muted'},[
-    'This is a read-only check: nothing here changes your recipes. It also only catches amounts that are too small to be real — an ingredient recorded as "10" meaning ten of them looks perfectly normal to it.'
-  ]));
-  if(!auditCount){
-    auCard.appendChild(el('p',{},['✓ Nothing to flag — every amount checked matches its shopping unit.']));
-  } else {
-    const auSummary = el('p',{},[el('strong',{},[auditCount + ' amount(s) across ' + auditGroups.length + ' ingredient(s) to check.'])]);
-    auCard.appendChild(auSummary);
-    const auWrap = el('div',{});
-    auWrap.style.display = 'none';
-    const auToggle = el('button',{class:'btn secondary', type:'button'},['Show the list']);
-    auToggle.addEventListener('click', ()=>{
-      const open = auWrap.style.display !== 'none';
-      auWrap.style.display = open ? 'none' : '';
-      auToggle.textContent = open ? 'Show the list' : 'Hide the list';
-    });
-    auCard.appendChild(auToggle);
-    auditGroups.forEach(g=>{
-      const block = el('div',{style:'margin-top:12px;'});
-      block.appendChild(el('div',{},[
-        el('strong',{},[g.ingredientName]),
-        el('span',{class:'muted', style:'font-size:.8rem;'},['  ·  bought in ' + g.shoppingUnit + '  ·  ' + g.aisle])
-      ]));
-      g.issues.forEach(is=>{
-        const row = el('div',{class:'checkbox-row'});
-        row.appendChild(el('label',{},[fmtQty(is.quantity) + ' ' + g.shoppingUnit + ' in ' + is.recipeName]));
-        const open = el('button',{class:'btn small secondary', type:'button'},['Open recipe']);
-        open.addEventListener('click', ()=> openRecipeViewer(is.recipeId));
-        row.appendChild(open);
-        block.appendChild(row);
-      });
-      auWrap.appendChild(block);
-    });
-    auCard.appendChild(auWrap);
-  }
-  container.appendChild(auCard);
 
   /* -------- Ingredient list (master) -------- */
   container.appendChild(el('h3',{},['Ingredient list']));

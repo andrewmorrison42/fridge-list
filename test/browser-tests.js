@@ -280,7 +280,7 @@ async function suiteWriteSplitting(browser) {
 }
 
 async function suiteStapleQuantities(browser) {
-  group('staples carry a quantity onto the list');
+  group('staple amounts add into the shopping list');
   const srv = await serve(8176);
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
@@ -300,27 +300,10 @@ async function suiteStapleQuantities(browser) {
        await page.evaluate(() => [...document.querySelectorAll('button')]
          .some(b => b.textContent.trim() === 'Add staple')));
 
-    // The shopping-unit audit renders on this same tab; make sure it draws and expands
-    // against the real recipe data rather than throwing halfway through Settings.
-    const audit = await page.evaluate(() => {
-      const h = [...document.querySelectorAll('h3')].find(x => /Amounts that look wrong/.test(x.textContent));
-      if (!h) return null;
-      const strong = h.nextElementSibling.querySelector('strong');
-      return { summary: strong ? strong.textContent : null };
-    });
-    ok('the shopping-unit audit renders', audit !== null, audit);
-    ok('and reports a count', audit && /\d+ amount\(s\)/.test(audit.summary || ''), audit);
-    await page.click('button:has-text("Show the list")');
-    await page.waitForTimeout(300);
-    const expanded = await page.evaluate(() => {
-      const h = [...document.querySelectorAll('h3')].find(x => /Amounts that look wrong/.test(x.textContent));
-      return h.nextElementSibling.querySelectorAll('.checkbox-row').length;
-    });
-    ok('and lists the offending amounts when expanded', expanded > 0, expanded);
-
-    // Add a staple that no recipe uses, with a free-text quantity.
+    // Add a staple that no recipe uses. Amounts are numbers in the ingredient's own
+    // shopping unit; "Kitchen roll" is new, so it is counted and the number stands alone.
     await page.fill('input[placeholder="ingredient name…"]', 'Kitchen roll');
-    await page.fill('input[placeholder="qty"]', '2 rolls');
+    await page.fill('input[placeholder="qty"]', '2');
     await page.click('button:has-text("Add staple")');
     await page.waitForTimeout(500);
 
@@ -330,32 +313,33 @@ async function suiteStapleQuantities(browser) {
     });
     ok('the staple is stored as a plain string (old builds still parse it)',
        stored.staples.every(s => typeof s === 'string'), stored.staples);
-    ok('the quantity is stored alongside, not inside', stored.qty['Kitchen roll'] === '2 rolls', stored.qty);
+    ok('the amount is stored alongside as a number', stored.qty['Kitchen roll'] === 2, stored.qty);
 
-    // Generate a list and check the quantity reaches it.
+    // Generate a list and check the amount reaches it as a real quantity.
     await buildAList(page);
     const line = await page.evaluate(() => {
       const sd = JSON.parse(localStorage.getItem('fma_shopping_v4'));
       return sd.shoppingList.find(l => /kitchen roll/i.test(l.ingredientName)) || null;
     });
     ok('the staple is on the generated list', !!line, line);
-    ok('carrying its quantity', line && (line.textQtyParts || []).indexOf('2 rolls') !== -1, line);
+    ok('counted as a numeric amount, not free text',
+       line && line.hasNumeric === true && line.totalQty === 2 && (line.textQtyParts || []).length === 0, line);
 
     const shown = await page.evaluate(() => {
       const row = [...document.querySelectorAll('.shop-row')]
         .find(r => /kitchen roll/i.test(r.textContent));
       return row ? row.querySelector('.shop-name').textContent : null;
     });
-    ok('and showing it on screen', shown && shown.indexOf('2 rolls') !== -1, shown);
+    ok('and showing on screen', shown && /^2 Kitchen roll/.test(shown.trim()), shown);
 
     const printed = await page.evaluate(() => {
-      const rows = [...document.querySelectorAll('.print-shopping-section .item-row')]
-        .find(r => /kitchen roll/i.test(r.textContent));
-      return rows ? rows.textContent : null;
+      const r = [...document.querySelectorAll('.print-shopping-section .item-row')]
+        .find(x => /kitchen roll/i.test(x.textContent));
+      return r ? r.textContent : null;
     });
-    ok('and on the printout', printed && printed.indexOf('2 rolls') !== -1, printed);
+    ok('and on the printout', printed && printed.indexOf('2') !== -1, printed);
 
-    // Editing a quantity must reach a list that has already been generated — and must
+    // Editing an amount must reach a list that has already been generated — and must
     // not cost the shopper their ticks doing it.
     const rows = await page.$$('.shop-row');
     await rows[0].$eval('input[type=checkbox]', c => c.click());
@@ -365,8 +349,8 @@ async function suiteStapleQuantities(browser) {
     await page.click('#mainNav button[data-tab="settings"]');
     await page.waitForTimeout(500);
     const qtyBox = await page.$('input[aria-label="Quantity of Kitchen roll"]');
-    ok('the quantity is editable on an existing staple', !!qtyBox);
-    await qtyBox.fill('5 rolls');
+    ok('the amount is editable on an existing staple', !!qtyBox);
+    await qtyBox.fill('5');
     await qtyBox.evaluate(e => e.blur());
     await page.waitForTimeout(400);
 
@@ -374,25 +358,24 @@ async function suiteStapleQuantities(browser) {
     await page.waitForTimeout(700);
     const after = await readShopping(page);
     const updated = after.shoppingList.find(l => /kitchen roll/i.test(l.ingredientName));
-    ok('the edited quantity reaches the existing list',
-       updated && (updated.textQtyParts || []).indexOf('5 rolls') !== -1, updated && updated.textQtyParts);
-    ok('and the old quantity is gone', updated && (updated.textQtyParts || []).indexOf('2 rolls') === -1,
-       updated && updated.textQtyParts);
+    ok('the edited amount reaches the existing list', updated && updated.totalQty === 5, updated);
     ok('ticks survive the staple edit',
        after.shoppingList.filter(l => l.checked).length === tickedBefore,
        { before: tickedBefore, after: after.shoppingList.filter(l => l.checked).length });
 
-    // A staple a recipe also needs shows BOTH amounts, rather than one replacing the other.
+    // A staple on an ingredient a recipe also needs must ADD to the recipe amount,
+    // producing one figure rather than two sitting side by side.
     const target = await page.evaluate(() => {
       const sd = JSON.parse(localStorage.getItem('fma_shopping_v4'));
-      const l = sd.shoppingList.find(x => x.hasNumeric && x.sources && x.sources.length);
-      return l ? l.ingredientName : null;
+      const l = sd.shoppingList.find(x => x.hasNumeric && x.sources && x.sources.length && !x.fromStaples);
+      return l ? { name: l.ingredientName, total: l.totalQty } : null;
     });
+    ok('a recipe-derived line was available to test against', !!target, target);
     if (target) {
       await page.click('#mainNav button[data-tab="settings"]');
       await page.waitForTimeout(500);
-      await page.fill('input[placeholder="ingredient name…"]', target);
-      await page.fill('input[placeholder="qty"]', '1 extra');
+      await page.fill('input[placeholder="ingredient name…"]', target.name);
+      await page.fill('input[placeholder="qty"]', '100');
       await page.click('button:has-text("Add staple")');
       await page.waitForTimeout(500);
       await page.click('#mainNav button[data-tab="review"]');
@@ -400,10 +383,13 @@ async function suiteStapleQuantities(browser) {
       const merged = await page.evaluate(n => {
         const sd = JSON.parse(localStorage.getItem('fma_shopping_v4'));
         return sd.shoppingList.find(x => x.ingredientName === n) || null;
-      }, target);
-      ok('a recipe amount and a staple amount are both kept',
-         merged && merged.hasNumeric && (merged.textQtyParts || []).indexOf('1 extra') !== -1, merged);
+      }, target.name);
+      ok('the staple amount is added to the recipe amount',
+         merged && Math.abs(merged.totalQty - (target.total + 100)) < 0.001,
+         { was: target.total, now: merged && merged.totalQty });
+      ok('and it stays a single figure', merged && (merged.textQtyParts || []).length === 0, merged);
     }
+
     ok('no console errors', errs.length === 0, errs);
   } finally { await ctx.close(); await srv.close(); }
 }
