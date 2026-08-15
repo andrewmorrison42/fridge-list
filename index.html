@@ -21,6 +21,51 @@
     l.rel = 'manifest'; l.href = 'manifest.webmanifest';
     document.head.appendChild(l);
   }
+
+  /* v21.2 offline support. The app is used in a supermarket, where signal is often
+     the worst it gets all week — before this, a bad connection meant the shopping
+     list would not open at all, because every launch had to pull the whole page.
+     sw.js is network-first for the page, so being cached can never hold a device
+     back on an old build; see the comments there. Registration is deliberately
+     best-effort: if it throws (file://, private mode, unsupported), the app carries
+     on exactly as it did before. */
+  if('serviceWorker' in navigator && location.protocol.indexOf('http') === 0){
+    window.addEventListener('load', function(){
+      navigator.serviceWorker.register('sw.js').then(function(reg){
+        // A worker sitting in "waiting" means a new build is downloaded but the old
+        // one is still in charge. Tell it to take over, then reload once so the user
+        // is running the new code rather than being silently a version behind.
+        function promote(w){
+          if(!w) return;
+          w.postMessage('skip-waiting');
+        }
+        if(reg.waiting) promote(reg.waiting);
+        reg.addEventListener('updatefound', function(){
+          var nw = reg.installing;
+          if(!nw) return;
+          nw.addEventListener('statechange', function(){
+            if(nw.state === 'installed' && navigator.serviceWorker.controller) promote(nw);
+          });
+        });
+        // Check for a new build when the app is opened or brought back to the front.
+        document.addEventListener('visibilitychange', function(){
+          if(!document.hidden) reg.update().catch(function(){});
+        });
+      }).catch(function(e){ console.warn('Service worker registration failed', e); });
+
+      var reloading = false;
+      navigator.serviceWorker.addEventListener('controllerchange', function(){
+        if(reloading) return;
+        reloading = true;
+        // Guarded by the same rule as the other automatic reloads: never yank the page
+        // out from under someone mid-shop or mid-edit. safeToReload() is defined in the
+        // main script; if it hasn't loaded yet, the update simply lands on next launch.
+        if(typeof window.__fridgeListSafeToReload === 'function'
+           && !window.__fridgeListSafeToReload()){ return; }
+        location.reload();
+      });
+    });
+  }
 })();
 </script>
 <link rel="icon" type="image/png" href="data:image/png;base64,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">
@@ -283,7 +328,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v21.1';
+const APP_VERSION = 'v21.2';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -292,6 +337,38 @@ const APP_VERSION = 'v21.1';
    an untick; outside it, a deliberate untick still works normally. */
 const LS_DEVICE_ID = 'fma_device_id_v1';
 const TICK_TIE_WINDOW_MS = 10000;
+
+/* ---- v21.2 shopping-session UI state ----
+   Which tab you were on, and the two trolley toggles, now survive a reload. A phone
+   screen locks constantly in a shop, and the tab-refocus reload below would drop the
+   shopper back on All Recipes with their scroll position, "Hide ticked" and
+   "Keep screen on" all reset — which reads as "the app forgot everything", even
+   though the ticks themselves were safe in localStorage the whole time. */
+const LS_UI_STATE = 'fma_ui_state_v1';
+const VALID_TABS = ['recipes','start','review','needed','menu','settings'];
+
+function saveUiState(){
+  try{
+    localStorage.setItem(LS_UI_STATE, JSON.stringify({
+      tab: currentTab, hideTicked: hideTickedItems, keepAwake: shopKeepAwake
+    }));
+  }catch(e){ /* non-essential: losing this only costs a scroll position */ }
+}
+
+function loadUiState(){
+  try{
+    const s = JSON.parse(localStorage.getItem(LS_UI_STATE) || '{}');
+    if(VALID_TABS.indexOf(s.tab) !== -1) currentTab = s.tab;
+    hideTickedItems = !!s.hideTicked;
+    shopKeepAwake = !!s.keepAwake;
+  }catch(e){ /* fall back to the defaults already set */ }
+}
+
+// True while there is a shopping trip actually underway on this device.
+function shoppingInProgress(){
+  return !!(shoppingData && shoppingData.shoppingList
+            && shoppingData.shoppingList.some(l=> l.checked && !l.removed));
+}
 
 function deviceId(){
   let id = localStorage.getItem(LS_DEVICE_ID);
@@ -326,6 +403,9 @@ let msalInstance = null;
 let msalAccount = null;
 let oneDriveFolderRef = null; // {driveId, itemId} for the resolved "FridgeList" folder
 let oneDrivePollTimer = null;
+// One gate for every path that merges remote state in. Both pollers and the folder
+// reload share it so two merges can never interleave on shoppingData.
+let syncInFlight = false;
 let oneDriveLastModified = {}; // { 'recipes-data.json': isoString, 'shopping-list.json': isoString }
 let currentTab = 'recipes';
 let editingRecipeId = null; // null = not editing, 'new' = creating
@@ -447,6 +527,7 @@ function init(){
   shoppingData = lsS ? JSON.parse(lsS) : defaultShoppingData();
   saveRecipesLocal();
   if(!lsS){ saveShoppingLocal(); }
+  loadUiState(); // restore the tab/toggles before the first render
   bindNav();
   bindHeaderButtons();
   // If OneDrive sync is active, it is the ONLY sync source. Running the old desktop
@@ -474,12 +555,16 @@ function saveShoppingLocal(){
   catch(e){ storageBlockedReason = 'Could not save locally (' + ((e && e.message) || e) + ').'; setStatus(storageBlockedReason, 'warn'); }
 }
 
+/* `which` is 'recipes', 'shopping', or omitted for both. v21.2 threads it all the way
+   through to the remote writers. Until now every save pushed BOTH files, so each tick
+   in the trolley re-uploaded the entire ~1MB recipe database over mobile data — slow,
+   expensive, and it widened every sync race by keeping a long write in flight. */
 function persist(which){
   if(which !== 'shopping') saveRecipesLocal();
   if(which !== 'recipes') saveShoppingLocal();
-  if(localStorage.getItem(LS_ONEDRIVE_FLAG) !== '1') autoSaveToFolder();
+  if(localStorage.getItem(LS_ONEDRIVE_FLAG) !== '1') autoSaveToFolder(which);
   if(localStorage.getItem(LS_ONEDRIVE_FLAG) === '1') markSyncPending();
-  autoSaveToOneDrive();
+  autoSaveToOneDrive(which);
 }
 
 function setStatus(msg, cls){
@@ -502,6 +587,8 @@ function writeErrorMessage(status, name){
                       'Open Sync options and sign in again.'];
     case 404: return ['The FridgeList folder or ' + (name||'a data file') + ' could not be found.',
                       'It may have been moved or renamed in OneDrive. Check Sync options.'];
+    case 412: return ['Another device changed ' + (name||'this file') + ' at the same time.',
+                      'Nothing was overwritten. Your copy is safe on this device — reopen the app once the other device has finished, or make the change there instead.'];
     case 429:
     case 503:
     case 509: return ['OneDrive is busy and refused the save.',
@@ -604,7 +691,11 @@ async function loadFromFolderOrSeed(){
     }
     else { await writeFileToFolder('recipes-data.json', JSON.stringify(recipesData)); }
     const sFile = await getFileText(dirHandle, 'shopping-list.json');
-    if(sFile){ shoppingData = JSON.parse(sFile); saveShoppingLocal(); }
+    // v21.2: merge, don't replace. This path used to assign the folder's copy straight
+    // over shoppingData — the same tick-destroying bug v21.0 fixed on the OneDrive side,
+    // left live here. Going through applyMergedShopping also repaints, so the rendered
+    // rows can't be left pointing at the discarded object graph.
+    if(sFile){ applyMergedShopping(mergeShoppingData(shoppingData, JSON.parse(sFile))); }
     else { await writeFileToFolder('shopping-list.json', JSON.stringify(shoppingData)); }
     render();
   }catch(e){
@@ -632,12 +723,19 @@ async function writeFileToFolder(name, text){
 }
 
 let saveTimer = null;
-function autoSaveToFolder(){
+let folderDirtyRecipes = false, folderDirtyShopping = false;
+function autoSaveToFolder(which){
+  if(which !== 'shopping') folderDirtyRecipes = true;
+  if(which !== 'recipes') folderDirtyShopping = true;
   if(!dirHandle) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async ()=>{
-    await writeFileToFolder('recipes-data.json', JSON.stringify(recipesData));
-    await writeFileToFolder('shopping-list.json', JSON.stringify(shoppingData));
+    // Same reason as the OneDrive path: don't rewrite the ~1MB recipe file because
+    // somebody ticked a tomato off the list.
+    const doR = folderDirtyRecipes, doS = folderDirtyShopping;
+    folderDirtyRecipes = false; folderDirtyShopping = false;
+    if(doR) await writeFileToFolder('recipes-data.json', JSON.stringify(recipesData));
+    if(doS) await writeFileToFolder('shopping-list.json', JSON.stringify(shoppingData));
     setStatus('Saved to shared folder — ' + new Date().toLocaleTimeString(), 'ok');
   }, 600);
 }
@@ -871,8 +969,65 @@ async function loadFromOneDriveOrSeed(){
   }
 }
 
+/* v21.2: recipes used to be PUT with no concurrency guard at all, so a device holding
+   a stale copy would overwrite good data — and because every shopping tick pushed the
+   file too (see persist), that could happen repeatedly without anyone editing a recipe.
+   Recipes have no per-item merge, so the honest behaviour on a genuine conflict is to
+   refuse to clobber and say so, rather than silently picking a winner.
+   One retry first: a benign race (our own earlier write, a stale ETag) clears on the
+   second attempt without troubling anyone. */
+let recipesETag = null;
+
+async function fetchRecipesMeta(token){
+  if(!oneDriveFolderRef) return null;
+  const { driveId, itemId } = oneDriveFolderRef;
+  const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/recipes-data.json', token);
+  if(res.status !== 200) return null; // 404 = not created yet
+  const meta = await res.json();
+  return { etag: meta.eTag };
+}
+
+async function writeRecipesGuarded(token){
+  const { driveId, itemId } = oneDriveFolderRef;
+  const body = JSON.stringify(recipesData);
+  for(let attempt = 0; attempt < 2; attempt++){
+    if(!recipesETag){
+      const meta = await fetchRecipesMeta(token);
+      recipesETag = meta && meta.etag;   // still null if the file doesn't exist yet
+    }
+    const headers = { 'Content-Type': 'application/json' };
+    if(recipesETag) headers['If-Match'] = recipesETag;
+    const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/recipes-data.json:/content', token, {
+      method: 'PUT', headers, body
+    });
+    if(res.status === 200 || res.status === 201){
+      try{
+        const wrote = await res.json();
+        recipesETag = (wrote && wrote.eTag) || null;
+      }catch(e){ recipesETag = null; }
+      return true;
+    }
+    if(res.status === 412){ recipesETag = null; continue; } // refetch and retry once
+    console.warn('recipes write failed', res.status);
+    lastWriteError = { status: res.status, name: 'recipes-data.json' };
+    return false;
+  }
+  // Still conflicting: another device really is editing recipes right now. Leave both
+  // copies alone — the local edit stays saved on this device and owed to OneDrive.
+  console.warn('recipes write conflicted twice; not overwriting');
+  lastWriteError = { status: 412, name: 'recipes-data.json' };
+  return false;
+}
+
 let oneDriveSaveTimer = null;
-function autoSaveToOneDrive(){
+// Which files a debounced save still owes. Accumulated across calls, because several
+// persist()s can coalesce into one timer and each may have dirtied a different file.
+let pendingSaveRecipes = false;
+let pendingSaveShopping = false;
+
+function autoSaveToOneDrive(which){
+  if(which !== 'shopping') pendingSaveRecipes = true;
+  if(which !== 'recipes') pendingSaveShopping = true;
   if(!msalAccount || localStorage.getItem(LS_ONEDRIVE_FLAG) !== '1') return;
   clearTimeout(oneDriveSaveTimer);
   oneDriveSaveTimer = setTimeout(async ()=>{
@@ -885,17 +1040,30 @@ function autoSaveToOneDrive(){
       oneDriveFolderRef = await resolveFridgeListFolder(token);
       if(!oneDriveFolderRef) return;
     }
-    const { driveId, itemId } = oneDriveFolderRef;
+    // Claim the pending work up front: anything dirtied while these writes are in
+    // flight re-sets the flags and schedules another pass rather than being lost.
+    const doRecipes = pendingSaveRecipes, doShopping = pendingSaveShopping;
+    pendingSaveRecipes = false; pendingSaveShopping = false;
+    if(!doRecipes && !doShopping) return;
     lastWriteError = null;
-    const okR = await writeOneDriveFile(driveId, itemId, 'recipes-data.json', JSON.stringify(recipesData));
-    const tokenS = await getGraphToken();
-    if(!tokenS) lastWriteError = { status: 401, name: 'shopping-list.json' };
-    const okS = tokenS ? await writeShoppingMerged(tokenS) : false;
+    let okR = true, okS = true;
+    if(doRecipes){
+      const tokenR = await getGraphToken();
+      if(!tokenR){ lastWriteError = { status: 401, name: 'recipes-data.json' }; okR = false; }
+      else okR = await writeRecipesGuarded(tokenR);
+      if(!okR) pendingSaveRecipes = true;   // keep it owed so a later save retries
+    }
+    if(doShopping){
+      const tokenS = await getGraphToken();
+      if(!tokenS){ lastWriteError = { status: 401, name: 'shopping-list.json' }; okS = false; }
+      else okS = await writeShoppingMerged(tokenS);
+      if(!okS) pendingSaveShopping = true;
+    }
     if(okR && okS){
       markSyncOk();
       setStatus('Saved to OneDrive — ' + new Date().toLocaleTimeString(), 'ok');
     } else {
-      const err = lastWriteError || { status: 0, name: 'shopping-list.json' };
+      const err = lastWriteError || { status: 0, name: doShopping ? 'shopping-list.json' : 'recipes-data.json' };
       markSyncFailed(err.status, err.name);
       setStatus(writeErrorMessage(err.status, err.name)[0], 'warn');
     }
@@ -946,9 +1114,14 @@ async function pollOneDriveForChanges(){
   const ae = document.activeElement;
   if(ae && (ae.tagName==='INPUT' || ae.tagName==='TEXTAREA' || ae.tagName==='SELECT')) return; // never interrupt typing
   if(!oneDriveFolderRef || !msalAccount) return;
-  const token = await getGraphToken();
-  if(!token) return;
+  // Shared with the 5s shopping poll — both merge into shoppingData, and interleaving
+  // them let the slower one write a result computed from state the faster one had
+  // already moved on from, dropping a merge.
+  if(syncInFlight) return;
+  syncInFlight = true;
   try{
+    const token = await getGraphToken();
+    if(!token) return;
     const { driveId, itemId } = oneDriveFolderRef;
     const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + '/children?$select=name,lastModifiedDateTime', token);
     if(res.status !== 200) return;
@@ -966,6 +1139,7 @@ async function pollOneDriveForChanges(){
       setStatus('Updated from OneDrive — ' + new Date().toLocaleTimeString(), 'ok');
     }
   }catch(e){ console.warn('OneDrive poll failed', e); }
+  finally{ syncInFlight = false; }
 }
 
 /* ---------------- concurrent-shopping merge (v15) ----------------
@@ -1062,11 +1236,17 @@ function mergeShoppingData(a, b){
   const out = Object.assign({}, secondary, primary);
   out.weekPlan = Object.assign({}, secondary.weekPlan, primary.weekPlan);
 
+  /* Which side the week's recipe picks are read from. In a same-trip merge that's
+     simply the newer file; across trips it has to be the winning trip, or the merged
+     selections would describe a different week from the merged line set. */
+  let selSource = primary, selOther = secondary;
+
   if(!sameTrip){
     // Different trips: the one generated later is authoritative, wholesale.
     const winner = aGen === bGen ? primary : (aGen > bGen ? a : b);
     out.shoppingList = (winner.shoppingList || []).map(l=> Object.assign({}, l));
     out.weekPlan = Object.assign({}, winner.weekPlan);
+    selSource = winner; selOther = (winner === a ? b : a);
   } else {
     const byKey = new Map();
     const order = [];
@@ -1093,8 +1273,8 @@ function mergeShoppingData(a, b){
 
   // menu-tab cooked flags: merge per selection by recipeId, same latest-wins rule
   const secSel = {};
-  ((secondary.weekPlan && secondary.weekPlan.selections) || []).forEach(s => { secSel[s.recipeId] = s; });
-  out.weekPlan.selections = ((primary.weekPlan && primary.weekPlan.selections) || []).map(s=>{
+  ((selOther.weekPlan && selOther.weekPlan.selections) || []).forEach(s => { secSel[s.recipeId] = s; });
+  out.weekPlan.selections = ((selSource.weekPlan && selSource.weekPlan.selections) || []).map(s=>{
     const o = secSel[s.recipeId];
     if(!o) return Object.assign({}, s);
     const st = tsOf(s.cookedChangedAt), ot = tsOf(o.cookedChangedAt);
@@ -1175,7 +1355,12 @@ async function fetchRemoteShopping(token){
 // between our read and our write) refetch, re-merge, retry.
 async function writeShoppingMerged(token){
   const { driveId, itemId } = oneDriveFolderRef;
-  for(let attempt = 0; attempt < 3; attempt++){
+  // v21.2: five attempts, and no unguarded fallback write at the end. This used to
+  // give up after three conflicts and PUT without an If-Match, which silently threw
+  // away whatever the other shopper had just saved — the one place the sync was
+  // otherwise careful. Every attempt re-merges the remote copy first, so retrying is
+  // always safe; exhausting them is reported as pending instead of resolved.
+  for(let attempt = 0; attempt < 5; attempt++){
     const remote = await fetchRemoteShopping(token);
     if(remote && remote.data){
       // Must go through applyMergedShopping: this runs on every tick, and when the
@@ -1205,7 +1390,9 @@ async function writeShoppingMerged(token){
     }
     // 412 → loop: someone saved between our fetch and our write; merge their copy in and retry
   }
-  return writeOneDriveFile(driveId, itemId, 'shopping-list.json', JSON.stringify(shoppingData));
+  console.warn('shopping write conflicted 5 times; leaving it pending rather than overwriting');
+  lastWriteError = { status: 412, name: 'shopping-list.json' };
+  return false;
 }
 
 // Near-live tick sharing: while the Review Shopping List tab is open, check just the
@@ -1215,17 +1402,15 @@ const SHOPPING_FAST_POLL_MS = 5000;
 let shoppingFastPollTimer = null;
 let shoppingFastPollStamp = null;
 
-let shoppingPollInFlight = false;
-
 async function pollShoppingNow(){
   if(currentTab !== 'review') return;
   if(document.hidden) return;
   if(document.getElementById('modalRoot').innerHTML !== '') return;
   if(!msalAccount || !oneDriveFolderRef || localStorage.getItem(LS_ONEDRIVE_FLAG) !== '1') return;
-  // A poll can now be triggered by the timer AND by waking the screen; overlapping
-  // runs would merge the same remote copy twice and repaint mid-tap.
-  if(shoppingPollInFlight) return;
-  shoppingPollInFlight = true;
+  // A poll can be triggered by the timer, by waking the screen, or by the 20s folder
+  // poll; overlapping runs would merge the same remote copy twice and repaint mid-tap.
+  if(syncInFlight) return;
+  syncInFlight = true;
   try{
     const token = await getGraphToken();
     if(!token) return;
@@ -1245,7 +1430,7 @@ async function pollShoppingNow(){
       }
     }
   }catch(e){ console.warn('fast poll failed', e); }
-  finally{ shoppingPollInFlight = false; }
+  finally{ syncInFlight = false; }
 }
 
 function startShoppingFastPoll(){
@@ -1743,6 +1928,7 @@ function bindNav(){
     const btn = e.target.closest('button[data-tab]');
     if(!btn) return;
     currentTab = btn.dataset.tab;
+    saveUiState();
     document.querySelectorAll('#mainNav button').forEach(b=>b.classList.toggle('active', b===btn));
     render();
   });
@@ -1754,6 +1940,10 @@ function bindHeaderButtons(){
 
 function render(){
   const app = document.getElementById('app');
+  // Keep the nav in step with currentTab — it can now be restored from a previous
+  // session, so the markup's default "active" button is not necessarily right.
+  document.querySelectorAll('#mainNav button').forEach(b=>
+    b.classList.toggle('active', b.dataset.tab === currentTab));
   app.innerHTML = '';
   if(currentTab==='recipes') app.appendChild(renderRecipesTab());
   else if(currentTab==='start') app.appendChild(renderStartTab());
@@ -2330,7 +2520,7 @@ function renderReviewTab(){
     const hideWrap = el('label',{class:'toggle'});
     const hideCb = el('input',{type:'checkbox'});
     hideCb.checked = hideTickedItems;
-    hideCb.addEventListener('change', ()=>{ hideTickedItems = hideCb.checked; rerenderPreservingScroll(); });
+    hideCb.addEventListener('change', ()=>{ hideTickedItems = hideCb.checked; saveUiState(); rerenderPreservingScroll(); });
     hideWrap.appendChild(hideCb);
     hideWrap.appendChild(document.createTextNode('Hide ticked'));
     opts.appendChild(hideWrap);
@@ -2350,6 +2540,7 @@ function renderReviewTab(){
         } else {
           releaseWakeLock();
         }
+        saveUiState();
       });
       wakeWrap.appendChild(wakeCb);
       wakeWrap.appendChild(document.createTextNode('Keep screen on'));
@@ -2736,9 +2927,14 @@ function renderMenuTab(){
     const row = el('div',{class:'checkbox-row' + (sel.cooked?' removed':'')});
     const cb = el('input',{type:'checkbox'});
     cb.checked = !!sel.cooked;
+    // Resolve by recipeId at tap time — a merge replaces the selection objects, and
+    // mutating the one this row was drawn from would write into a discarded graph.
+    const selId = sel.recipeId;
     cb.addEventListener('change', ()=>{
-      sel.cooked = cb.checked;
-      sel.cookedChangedAt = new Date().toISOString();
+      const live = (shoppingData.weekPlan.selections || []).find(s=> s.recipeId === selId);
+      if(!live){ render(); return; }
+      live.cooked = cb.checked;
+      live.cookedChangedAt = new Date().toISOString();
       persist('shopping');
       row.classList.toggle('removed', cb.checked);
     });
@@ -3708,15 +3904,29 @@ document.addEventListener('DOMContentLoaded', function(){
   }
 });
 
+/* Shared guard for both automatic reloads below. Never interrupt an edit in progress —
+   and never reload mid-shop: a phone screen locks constantly in a supermarket, so the
+   refocus reload fired all the time, and a reload throws away scroll position and any
+   in-flight save for no benefit (the 5s poll already keeps the list current). */
+function safeToReload(){
+  if(document.getElementById('modalRoot').innerHTML !== '') return false;
+  const ae = document.activeElement;
+  if(ae && (ae.tagName==='INPUT' || ae.tagName==='TEXTAREA' || ae.tagName==='SELECT')) return false;
+  if(isPrinting()) return false;
+  if(currentTab === 'review' && shoppingInProgress()) return false;
+  if(pendingSaveRecipes || pendingSaveShopping) return false;
+  return true;
+}
+// The service-worker registration lives in a separate <script> in <head> (it has to run
+// before this IIFE), so it needs a way to ask whether reloading now would be rude.
+window.__fridgeListSafeToReload = safeToReload;
+
 /* ---- daily auto-reload: picks up changes other family members saved to the shared folder ---- */
 const AUTO_RELOAD_MS = 24*60*60*1000; // 1 day
 const pageLoadedAt = Date.now();
 setInterval(()=>{
   if(Date.now() - pageLoadedAt < AUTO_RELOAD_MS) return;
-  // never reload mid-edit: skip if a modal is open or the user is typing in a field
-  if(document.getElementById('modalRoot').innerHTML !== '') return;
-  const ae = document.activeElement;
-  if(ae && (ae.tagName==='INPUT' || ae.tagName==='TEXTAREA' || ae.tagName==='SELECT')) return;
+  if(!safeToReload()) return;
   location.reload();
 }, 10*60*1000); // checked every 10 minutes
 
@@ -3727,10 +3937,7 @@ document.addEventListener('visibilitychange', ()=>{
   if(document.visibilityState === 'hidden'){ hiddenAt = Date.now(); return; }
   if(hiddenAt === null || Date.now() - hiddenAt < REFOCUS_MIN_HIDDEN_MS) return;
   hiddenAt = null;
-  // same guards as the daily reload: never interrupt an edit in progress
-  if(document.getElementById('modalRoot').innerHTML !== '') return;
-  const ae = document.activeElement;
-  if(ae && (ae.tagName==='INPUT' || ae.tagName==='TEXTAREA' || ae.tagName==='SELECT')) return;
+  if(!safeToReload()) return;
   location.reload();
 });
 })();
