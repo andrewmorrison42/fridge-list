@@ -14,6 +14,10 @@ your own OneDrive.
 - Print the shopping list, or a weekly menu for the fridge door.
 - Works offline once it has loaded, which matters when the signal in the shop is poor.
 
+Comes with a few hundred family recipes to start from. You can cook from them, add
+your own, or [clear them out](docs/SETUP-use-the-app.md#deleting-a-lot-of-recipes-at-once)
+and keep only what you want.
+
 ---
 
 ## Setting it up for your family
@@ -56,6 +60,14 @@ The one thing to understand before you start is what you are agreeing to when yo
 sign in. Both guides explain it in the same place, in plain language — see
 **"What you are agreeing to when you sign in"** in
 [Guide 1](docs/SETUP-use-the-app.md#what-you-are-agreeing-to-when-you-sign-in).
+
+## Can I undo a mistake?
+
+Yes, three ways: an in-app **Put back** button straight after a bulk delete, an
+automatic **snapshot file** written before anything is deleted, and **OneDrive's own
+version history**, which covers every change the app has ever saved — not only
+deletions. See
+[Getting things back when something goes wrong](docs/SETUP-use-the-app.md#getting-things-back-when-something-goes-wrong).
 
 ---
 

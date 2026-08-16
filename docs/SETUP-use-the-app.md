@@ -206,6 +206,88 @@ shop, keep ticking anyway — it catches up when the signal returns.
 
 ---
 
+---
+
+## Getting things back when something goes wrong
+
+Worth reading once now, so you know it exists before you need it.
+
+There are **three** ways to recover, from quickest to most thorough.
+
+### 1. "Put back", straight after a bulk delete
+
+If you have just deleted a batch of recipes and immediately regretted it, go to
+**Settings** and look under *Delete several recipes at once* — there is a **Put back**
+button. One tap and they are all restored.
+
+This only lasts while the app stays open. Close it or reload, and the button is gone —
+use one of the two below instead.
+
+### 2. The snapshot file
+
+Every bulk delete writes a complete copy of your recipes into your FridgeList folder
+first, named like `recipes-backup-2026-08-16-1432.json`. **If that snapshot cannot be
+saved, the deletion does not happen at all** — the app tells you and stops.
+
+To restore from one:
+
+1. In the app, open **Sync options** → **Import data**.
+2. Choose the backup file.
+3. It replaces your recipes with the contents of that snapshot.
+
+You can also just open **onedrive.com**, go to the **FridgeList** folder, and see the
+snapshots sitting there. Tidy up old ones whenever you like — the app does not need
+them.
+
+### 3. OneDrive's own version history
+
+This is the strongest one, and it covers **everything**, not just bulk deletes — a
+recipe edited wrongly, an ingredient renamed by mistake, a shopping list that went
+strange. OneDrive quietly keeps a copy of every version of every file.
+
+1. Open **onedrive.com** and sign in as the person whose OneDrive holds the data.
+2. Go into the **FridgeList** folder.
+3. Right-click **`recipes-data.json`** (or tap the ⋯ menu) → **Version history**.
+4. You will see a list of dated versions. Click one to look at it, or choose
+   **Restore** to put it back.
+5. Reopen the app on each device. It will pick the restored copy up within a few
+   seconds.
+
+> Restoring affects everyone, since it is the shared file. Tell the household before
+> you do it, or you will confuse whoever is mid-shop.
+
+`shopping-list.json` has its own version history in the same way, though that one
+matters less — it is rebuilt every week anyway.
+
+---
+
+## Deleting a lot of recipes at once
+
+**Settings → Delete several recipes at once.**
+
+Deleting one at a time from the recipe editor is still the right tool for one or two.
+This is for clearing out a batch, or for keeping only a handful.
+
+1. Tap **Choose recipes**.
+2. Search or filter by category, and tick the ones you mean.
+3. Then either:
+   - **Delete the ticked ones** — normal pruning.
+   - **Keep ONLY the ticked ones** — for when you want a dozen out of hundreds. Tick
+     the keepers, not the hundreds you are removing.
+4. A confirmation appears listing the first ten recipes about to go and how many in
+   total. **Type the number shown** to enable the button — this is deliberate, so a
+   large delete cannot happen on a mis-tap.
+5. The app saves a snapshot first. **If the snapshot fails, nothing is deleted.**
+
+Two things to know:
+
+- **It applies to everyone.** Recipes are shared, so a bulk delete reaches every
+  device in the household within a few seconds.
+- **It waits for saves to finish.** If a save is still going out, the app asks you to
+  try again in a moment, rather than risk losing someone else's edit.
+
+---
+
 ## Troubleshooting
 
 **"It offers to create a new FridgeList folder, but one already exists"**

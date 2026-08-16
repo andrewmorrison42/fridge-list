@@ -328,7 +328,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v21.5';
+const APP_VERSION = 'v21.6';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -1599,6 +1599,136 @@ document.addEventListener('visibilitychange', ()=>{
 });
 
 /* ---------------- manual export / import (works in every browser) ---------------- */
+
+/* ---- v21.6: bulk recipe delete, and the safety net under it ----
+   Deleting recipes one at a time is fine for pruning a few, and hopeless for the
+   "I forked this and want my own twelve" case. But a bulk delete here is not a local
+   action: recipes are last-save-wins and sync within seconds, so it reaches everyone's
+   phone before anyone can object.
+   A confirmation dialog does not make that safe — v19.0 removed the bulk ingredient
+   delete for exactly that reason. What makes it safe is being able to undo it, so the
+   work is in the recovery paths, not the warning text. There are three:
+     1. an in-session Undo, for the immediate "oh no";
+     2. a timestamped snapshot file written BEFORE anything is deleted, which the delete
+        is conditional on — if the snapshot cannot be written, nothing is deleted;
+     3. OneDrive's own version history on recipes-data.json, which has been there all
+        along and is now documented in the setup guides.  */
+
+let undoRecipes = null;     // deep copy of recipesData from before the last bulk delete
+
+function snapshotName(){
+  const d = new Date(), p = n => String(n).padStart(2,'0');
+  return 'recipes-backup-' + d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate())
+       + '-' + p(d.getHours()) + p(d.getMinutes()) + '.json';
+}
+
+/* Write a snapshot wherever this device syncs, and report honestly what happened.
+   Returns { ok, where, name }. ok:false means the caller must not delete anything. */
+async function writeRecipesSnapshot(){
+  const name = snapshotName();
+  const body = JSON.stringify(recipesData);
+  if(msalAccount && localStorage.getItem(LS_ONEDRIVE_FLAG) === '1'){
+    const token = await getGraphToken();
+    if(!token) return { ok:false, where:'OneDrive', name, why:'not signed in' };
+    if(!oneDriveFolderRef) oneDriveFolderRef = await resolveFridgeListFolder(token);
+    if(!oneDriveFolderRef) return { ok:false, where:'OneDrive', name, why:'FridgeList folder not found' };
+    const ok = await writeOneDriveFile(oneDriveFolderRef.driveId, oneDriveFolderRef.itemId, name, body);
+    return ok ? { ok:true, where:'OneDrive', name }
+              : { ok:false, where:'OneDrive', name, why:'the write was refused (is the drive full?)' };
+  }
+  if(dirHandle){
+    try{
+      const fh = await dirHandle.getFileHandle(name, {create:true});
+      const w = await fh.createWritable();
+      await w.write(body); await w.close();
+      return { ok:true, where:'the shared folder', name };
+    }catch(e){ return { ok:false, where:'the shared folder', name, why:(e && e.message) || 'write failed' }; }
+  }
+  // No sync configured: the best available snapshot is a file on this device. It cannot
+  // be verified, so the dialog says plainly that this is the only copy.
+  downloadFile(name, body);
+  return { ok:true, where:'this device’s downloads', name, unverified:true };
+}
+
+function undoBulkDelete(){
+  if(!undoRecipes) return;
+  recipesData = undoRecipes;
+  undoRecipes = null;
+  persist('recipes');
+  render();
+  setStatus('Put back. Nothing was deleted.', 'ok');
+}
+
+/* The confirmation step. Shows what is actually going (names, not just a number),
+   and asks for the count to be typed — a number specific to this action proves it was
+   read, where typing DELETE becomes muscle memory after the second time. */
+function confirmBulkDelete(doomed, keeping){
+  const body = el('div',{});
+  body.appendChild(el('h3',{style:'margin-top:0;'},['Delete ' + doomed.length + ' recipe' + (doomed.length===1?'':'s') + '?']));
+  body.appendChild(el('p',{},[
+    'This removes them for everyone in the household, on every device, within a few seconds. '
+    + keeping.length + ' recipe' + (keeping.length===1?'':'s') + ' will be kept.'
+  ]));
+
+  const sample = doomed.slice(0, 10).map(r=> r.name);
+  body.appendChild(el('p',{class:'muted', style:'margin-bottom:4px;'},['About to be deleted:']));
+  const ul = el('ul',{style:'margin:0 0 12px 18px;'});
+  sample.forEach(n=> ul.appendChild(el('li',{},[n])));
+  if(doomed.length > sample.length){
+    ul.appendChild(el('li',{class:'muted'},['…and ' + (doomed.length - sample.length) + ' more']));
+  }
+  body.appendChild(ul);
+
+  body.appendChild(el('p',{},[
+    'A snapshot of every recipe is saved first. If that snapshot cannot be written, nothing is deleted.'
+  ]));
+
+  body.appendChild(el('label',{style:'display:block;margin-bottom:6px;'},
+    ['To confirm, type ' + doomed.length + ' below.']));
+  const typed = el('input',{type:'text', inputmode:'numeric', autocomplete:'off',
+                            'aria-label':'Type ' + doomed.length + ' to confirm',
+                            style:'width:120px;text-align:center;'});
+  body.appendChild(typed);
+
+  const note = el('p',{class:'muted', style:'margin-top:10px;'},['']);
+  body.appendChild(note);
+
+  const row = el('div',{class:'row', style:'margin-top:16px;'});
+  const go = el('button',{class:'btn danger'},['Save a snapshot, then delete']);
+  go.disabled = true;
+  typed.addEventListener('input', ()=>{ go.disabled = typed.value.trim() !== String(doomed.length); });
+
+  go.addEventListener('click', async ()=>{
+    go.disabled = true;
+    note.textContent = 'Saving the snapshot…';
+    const snap = await writeRecipesSnapshot();
+    if(!snap.ok){
+      // Guard 1, the one that matters: the delete is conditional on the backup.
+      note.className = 'muted';
+      note.textContent = 'Nothing has been deleted. The snapshot could not be saved to '
+        + snap.where + (snap.why ? ' — ' + snap.why : '') + '. Fix that and try again.';
+      go.disabled = false;
+      return;
+    }
+    undoRecipes = JSON.parse(JSON.stringify(recipesData));
+    const keepIds = {};
+    keeping.forEach(r=> { keepIds[r.id] = true; });
+    recipesData.recipes = recipesData.recipes.filter(r=> keepIds[r.id]);
+    persist('recipes');
+    closeModal();
+    currentTab = 'recipes';
+    render();
+    setStatus('Deleted ' + doomed.length + ' recipe(s). Snapshot saved to ' + snap.where
+      + ' as ' + snap.name + (snap.unverified ? ' — that download is the only copy, keep it somewhere safe.' : '.')
+      + ' Use "Put back" in Settings to undo while this tab stays open.', 'ok');
+  });
+
+  const cancel = el('button',{class:'btn secondary'},['Cancel']);
+  cancel.addEventListener('click', closeModal);
+  row.appendChild(go); row.appendChild(cancel);
+  body.appendChild(row);
+  openModal(body);
+}
 
 function exportData(){
   downloadFile('recipes-data.json', JSON.stringify(recipesData, null, 0));
@@ -3755,6 +3885,128 @@ function renderSettingsTab(){
   bmCard.appendChild(bmRow);
   bmCard.appendChild(el('p',{class:'muted', style:'margin-bottom:0;'},['Can\'t drag (tablet, or a fussy browser)? Use "Copy button code": create any bookmark, edit it, name it Grab Recipe and paste the code as the URL. The button only reads the recipe on the page you\'re viewing and copies it to your clipboard \u2014 it sends nothing anywhere. If a site has no structured recipe data, the button tells you; select the whole page, copy, and paste that into the import box instead.']));
   container.appendChild(bmCard);
+
+  /* -------- Bulk recipe management -------- */
+  container.appendChild(el('h3',{},['Delete several recipes at once']));
+  const bulkCard = el('div',{class:'card'});
+  bulkCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
+    'For clearing out recipes you will never cook, or for keeping only a handful after copying this app. '
+    + 'Deleting one at a time from the recipe editor is still there and is the right tool for one or two.'
+  ]));
+  bulkCard.appendChild(el('p',{class:'muted'},[
+    'Whatever you delete here goes for the whole household, on every device. Before anything is removed a '
+    + 'complete snapshot is saved alongside your data, and if that snapshot cannot be written nothing is '
+    + 'deleted. You can also put it straight back with the button below while this tab stays open, and '
+    + 'OneDrive keeps its own history of every save — see the setup guide.'
+  ]));
+
+  if(undoRecipes){
+    const undoRow = el('div',{style:'margin-bottom:12px;'});
+    const undoBtn = el('button',{class:'btn'},['Put back the ' + undoRecipes.recipes.length + ' recipes from before the last bulk delete']);
+    undoBtn.addEventListener('click', undoBulkDelete);
+    undoRow.appendChild(undoBtn);
+    bulkCard.appendChild(undoRow);
+  }
+
+  const bulkWrap = el('div',{});
+  bulkWrap.style.display = 'none';
+  const bulkToggle = el('button',{class:'btn secondary', type:'button'},['Choose recipes (' + recipesData.recipes.length + ')']);
+  bulkToggle.addEventListener('click', ()=>{
+    const open = bulkWrap.style.display !== 'none';
+    bulkWrap.style.display = open ? 'none' : '';
+    bulkToggle.textContent = open ? 'Choose recipes (' + recipesData.recipes.length + ')' : 'Hide the list';
+  });
+  bulkCard.appendChild(bulkToggle);
+
+  (function(){
+    const picked = {};                       // recipe id -> true
+    const bar = el('div',{class:'searchbar'});
+    const search = el('input',{type:'search', placeholder:'Search recipes…'});
+    const catSel = el('select',{});
+    catSel.appendChild(el('option',{value:''},['All categories']));
+    Array.from(new Set(recipesData.recipes.map(r=>r.category).filter(Boolean))).sort()
+      .forEach(c=> catSel.appendChild(el('option',{value:c},[c])));
+    bar.appendChild(search); bar.appendChild(catSel);
+    bulkWrap.appendChild(bar);
+
+    const count = el('p',{class:'muted'},['']);
+    bulkWrap.appendChild(count);
+    const listWrap = el('div',{style:'max-height:340px;overflow:auto;'});
+    bulkWrap.appendChild(listWrap);
+
+    const actions = el('div',{class:'row', style:'margin-top:12px;'});
+    const delBtn  = el('button',{class:'btn danger'},['Delete the ticked ones']);
+    const keepBtn = el('button',{class:'btn danger'},['Keep ONLY the ticked ones']);
+    actions.appendChild(delBtn); actions.appendChild(keepBtn);
+    bulkWrap.appendChild(actions);
+
+    function selectedIds(){ return Object.keys(picked).filter(id=> picked[id]); }
+
+    function refreshCount(){
+      const n = selectedIds().length;
+      count.textContent = n + ' ticked of ' + recipesData.recipes.length + ' recipes.';
+      // Guard 6: neither action means anything with nothing ticked, and "keep only
+      // nothing" would wipe the lot on an empty selection.
+      delBtn.disabled = n === 0;
+      keepBtn.disabled = n === 0;
+      delBtn.textContent  = n ? 'Delete the ' + n + ' ticked' : 'Delete the ticked ones';
+      keepBtn.textContent = n ? 'Keep ONLY these ' + n + ' (delete ' + (recipesData.recipes.length - n) + ')'
+                              : 'Keep ONLY the ticked ones';
+    }
+
+    function draw(){
+      listWrap.innerHTML = '';
+      const q = search.value.trim().toLowerCase();
+      const cat = catSel.value;
+      const list = recipesData.recipes.filter(r=>
+        (!cat || r.category === cat) && (!q || (r.name||'').toLowerCase().includes(q))
+      ).sort((a,b)=> a.name.localeCompare(b.name));
+      if(!list.length) listWrap.appendChild(el('p',{class:'muted'},['Nothing matches.']));
+      list.forEach(r=>{
+        const row = el('div',{class:'checkbox-row'});
+        const cb = el('input',{type:'checkbox'});
+        cb.checked = !!picked[r.id];
+        cb.addEventListener('change', ()=>{ picked[r.id] = cb.checked; refreshCount(); });
+        row.appendChild(cb);
+        row.appendChild(el('label',{},[r.name + (r.category ? '  (' + r.category + ')' : '')]));
+        listWrap.appendChild(row);
+      });
+    }
+    search.addEventListener('input', draw);
+    catSel.addEventListener('change', draw);
+
+    // Guard 4: a bulk delete racing an in-flight save is how one device's deletion
+    // swallows another's unsynced additions. Make it wait the few hundred ms instead.
+    function blockedBySave(){
+      if(pendingSaveRecipes || pendingSaveShopping){
+        alert('A save is still going out to OneDrive. Give it a few seconds and try again — '
+            + 'deleting while a save is in flight risks losing someone else’s changes.');
+        return true;
+      }
+      return false;
+    }
+
+    delBtn.addEventListener('click', ()=>{
+      if(blockedBySave()) return;
+      const ids = selectedIds();
+      const doomed  = recipesData.recipes.filter(r=> ids.indexOf(r.id) !== -1);
+      const keeping = recipesData.recipes.filter(r=> ids.indexOf(r.id) === -1);
+      if(doomed.length) confirmBulkDelete(doomed, keeping);
+    });
+    keepBtn.addEventListener('click', ()=>{
+      if(blockedBySave()) return;
+      const ids = selectedIds();
+      const keeping = recipesData.recipes.filter(r=> ids.indexOf(r.id) !== -1);
+      const doomed  = recipesData.recipes.filter(r=> ids.indexOf(r.id) === -1);
+      if(doomed.length) confirmBulkDelete(doomed, keeping);
+    });
+
+    refreshCount();
+    draw();
+  })();
+
+  bulkCard.appendChild(bulkWrap);
+  container.appendChild(bulkCard);
 
   /* -------- Ingredient list (master) -------- */
   container.appendChild(el('h3',{},['Ingredient list']));
