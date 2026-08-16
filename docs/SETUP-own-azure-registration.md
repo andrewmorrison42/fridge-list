@@ -51,9 +51,17 @@ can change it freely; the original is untouched.
 
 You now have `https://github.com/YOUR-USERNAME/fridge-list`.
 
-> The recipes that come with it are the original author's family recipes. Keep them,
-> or delete them from within the app once you are running — Settings has an ingredient
-> list, and recipes can be removed on the All Recipes tab.
+> **About the recipes that come with it.** Your fork includes the original author's
+> family recipe collection — several hundred of them. Keep them and cook from them, or
+> clear them out once you are up and running:
+>
+> **Settings → Delete several recipes at once → Choose recipes**, tick the handful you
+> want to keep, then **Keep ONLY the ticked ones**. It saves a full snapshot before
+> deleting anything, and there is a *Put back* button if you change your mind. See
+> [Deleting a lot of recipes at once](SETUP-use-the-app.md#deleting-a-lot-of-recipes-at-once).
+>
+> Do this *after* Part 5, once your own OneDrive folder exists — otherwise you are
+> only editing the copy held on the device you happen to be using.
 
 ---
 

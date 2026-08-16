@@ -456,6 +456,110 @@ async function suiteTypingIsNotInterrupted(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+async function suiteBulkDelete(browser) {
+  group('bulk delete, and the safety net under it');
+  // Deleting recipes in bulk syncs to every device within seconds, so the guard that
+  // matters is not the dialog — it is that the delete cannot happen unless a snapshot
+  // was written first, and that it can be put straight back.
+  const file = instrument('bulk-hook.html',
+    'window.__t = { breakSnapshot: () => { writeRecipesSnapshot = async () =>' +
+    ' ({ ok:false, where:"OneDrive", name:"x.json", why:"forced by test" }); },' +
+    ' recipeCount: () => recipesData.recipes.length };');
+  const srv = await serve(8178, file);
+  const ctx = await browser.newContext({ acceptDownloads: true });
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  const openPicker = async () => {
+    await page.click('#mainNav button[data-tab="settings"]');
+    await page.waitForTimeout(600);
+    await page.click('button:has-text("Choose recipes")');
+    await page.waitForTimeout(400);
+  };
+  const goButton = () => page.evaluate(() =>
+    [...document.querySelectorAll('#modalRoot button')].find(b => /snapshot/i.test(b.textContent)).disabled);
+  try {
+    await page.goto('http://localhost:8178/', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1800);
+    const total = await page.evaluate(() => window.__t.recipeCount());
+    ok('the seed has recipes to work with', total > 100, total);
+
+    await openPicker();
+    ok('both actions are disabled with nothing ticked',
+       await page.evaluate(() => [...document.querySelectorAll('button')]
+         .filter(b => /ticked/i.test(b.textContent)).every(b => b.disabled)));
+
+    await page.fill('#app input[type=search]', 'chicken');
+    await page.waitForTimeout(300);
+    const boxes = await page.$$('#app .checkbox-row input[type=checkbox]');
+    for (let i = 0; i < 3; i++) await boxes[i].check();
+    await page.waitForTimeout(200);
+
+    // Guard 1, the one that matters: a failed snapshot must stop the delete dead.
+    await page.evaluate(() => window.__t.breakSnapshot());
+    await page.click('button:has-text("Delete the 3 ticked")');
+    await page.waitForTimeout(300);
+    await page.fill('#modalRoot input[type=text]', '3');
+    await page.waitForTimeout(120);
+    await page.click('#modalRoot button:has-text("snapshot")');
+    await page.waitForTimeout(600);
+    ok('a failed snapshot deletes nothing',
+       await page.evaluate(() => window.__t.recipeCount()) === total,
+       await page.evaluate(() => window.__t.recipeCount()));
+    ok('and says so rather than failing silently',
+       /nothing has been deleted/i.test(await page.evaluate(() =>
+         document.querySelector('#modalRoot').innerText)));
+    await page.click('#modalRoot .close-x');
+    await page.waitForTimeout(300);
+
+    // Now the real path, on a fresh load so the snapshot function is restored.
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1800);
+    await openPicker();
+    await page.fill('#app input[type=search]', 'chicken');
+    await page.waitForTimeout(300);
+    const boxes2 = await page.$$('#app .checkbox-row input[type=checkbox]');
+    for (let i = 0; i < 3; i++) await boxes2[i].check();
+    await page.waitForTimeout(200);
+    await page.click('button:has-text("Delete the 3 ticked")');
+    await page.waitForTimeout(300);
+
+    const dialog = await page.evaluate(() => {
+      const m = document.querySelector('#modalRoot .modal');
+      return { names: [...m.querySelectorAll('li')].map(l => l.textContent) };
+    });
+    ok('the dialog names what is going, not just a count', dialog.names.length === 3, dialog.names);
+    ok('the delete button starts disabled', await goButton() === true);
+    await page.fill('#modalRoot input[type=text]', '2');
+    await page.waitForTimeout(120);
+    ok('the wrong number leaves it disabled', await goButton() === true);
+    await page.fill('#modalRoot input[type=text]', '3');
+    await page.waitForTimeout(120);
+    ok('the right number enables it', await goButton() === false);
+
+    const pending = page.waitForEvent('download').catch(() => null);
+    await page.click('#modalRoot button:has-text("snapshot")');
+    const download = await Promise.race([pending, new Promise(r => setTimeout(() => r(null), 5000))]);
+    await page.waitForTimeout(900);
+    ok('a timestamped snapshot is produced',
+       !!download && /^recipes-backup-\d{4}-\d{2}-\d{2}-\d{4}\.json$/.test(download.suggestedFilename()),
+       download && download.suggestedFilename());
+    ok('exactly the ticked recipes are gone',
+       await page.evaluate(() => window.__t.recipeCount()) === total - 3);
+
+    await page.click('#mainNav button[data-tab="settings"]');
+    await page.waitForTimeout(600);
+    const undo = await page.$('button:has-text("Put back")');
+    ok('an undo button appears afterwards', !!undo);
+    if (undo) {
+      await undo.click();
+      await page.waitForTimeout(600);
+      ok('undo restores every recipe',
+         await page.evaluate(() => window.__t.recipeCount()) === total);
+    }
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 async function suitePrinting(browser) {
   group('printing survives Safari capturing the page late');
   const srv = await serve(8174);
@@ -582,6 +686,7 @@ async function suiteOfflineAndSession(browser) {
     // remaining suites still have something useful to say about the build.
     for (const suite of [suiteTicksSurviveRebuild, suiteRemoteMergeKeepsTicks,
                          suiteWriteSplitting, suiteStapleQuantities, suiteTypingIsNotInterrupted,
+                         suiteBulkDelete,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
       catch (e) {
