@@ -394,6 +394,68 @@ async function suiteStapleQuantities(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+async function suiteTypingIsNotInterrupted(browser) {
+  group('a background sync never interrupts typing');
+  // Regression: the OneDrive load that runs on every open finished with an
+  // unconditional render(), landing a couple of seconds in — exactly when someone has
+  // opened the app, tapped a field and started typing. The field was rebuilt empty.
+  const file = instrument('repaint-hook.html',
+    'window.__t = { repaintWhenSafe, applyMergedShopping, mergeShoppingData,' +
+    ' sd: () => shoppingData, owed: () => deferredRepaint };');
+  const srv = await serve(8177, file);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  try {
+    await page.goto('http://localhost:8177/', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1800);
+
+    for (const [tab, sel, label] of [['needed', '#app input[type=text]', 'wait list box'],
+                                     ['recipes', '#app input[type=search]', 'recipe search']]) {
+      await page.click(`#mainNav button[data-tab="${tab}"]`);
+      await page.waitForTimeout(400);
+      const field = await page.$(sel);
+      await field.click();
+      await page.keyboard.type('half typed');
+
+      const repainted = await page.evaluate(() => window.__t.repaintWhenSafe());
+      await page.waitForTimeout(120);
+      const state = await page.evaluate(s => {
+        const e = document.querySelector(s);
+        return { value: e.value, focused: document.activeElement === e };
+      }, sel);
+      ok(label + ': the repaint is held back', repainted === false);
+      ok(label + ': the text survives', state.value === 'half typed', state);
+      ok(label + ': focus is kept', state.focused === true, state);
+      ok(label + ': the repaint is owed, not dropped',
+         await page.evaluate(() => window.__t.owed()) === true);
+
+      // Leaving the field is when it becomes safe to run.
+      await page.evaluate(() => document.activeElement.blur());
+      await page.waitForTimeout(200);
+      ok(label + ': it runs once the field is left',
+         await page.evaluate(() => window.__t.owed()) === false);
+    }
+
+    // Most opens change nothing; those must not repaint at all.
+    await page.click('#mainNav button[data-tab="needed"]');
+    await page.waitForTimeout(400);
+    const field = await page.$('#app input[type=text]');
+    await field.click();
+    await page.keyboard.type('still here');
+    const noop = await page.evaluate(() => {
+      const identical = JSON.parse(JSON.stringify(window.__t.sd()));
+      return { changed: window.__t.applyMergedShopping(window.__t.mergeShoppingData(window.__t.sd(), identical)),
+               owed: window.__t.owed() };
+    });
+    ok('a sync returning identical data reports no change', noop.changed === false, noop);
+    ok('and does not even owe a repaint', noop.owed === false, noop);
+    ok('so the text is untouched',
+       await page.evaluate(() => document.querySelector('#app input[type=text]').value) === 'still here');
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 async function suitePrinting(browser) {
   group('printing survives Safari capturing the page late');
   const srv = await serve(8174);
@@ -519,7 +581,7 @@ async function suiteOfflineAndSession(browser) {
     // A suite that throws is a failed suite, not a reason to abandon the run — the
     // remaining suites still have something useful to say about the build.
     for (const suite of [suiteTicksSurviveRebuild, suiteRemoteMergeKeepsTicks,
-                         suiteWriteSplitting, suiteStapleQuantities,
+                         suiteWriteSplitting, suiteStapleQuantities, suiteTypingIsNotInterrupted,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
       catch (e) {

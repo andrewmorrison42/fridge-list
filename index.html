@@ -328,7 +328,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v21.4';
+const APP_VERSION = 'v21.5';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -777,11 +777,16 @@ async function tryReconnectFolder(){
 async function loadFromFolderOrSeed(){
   if(!dirHandle) return;
   try{
+    let recipesChanged = false;
     const rFile = await getFileText(dirHandle, 'recipes-data.json');
     if(rFile){
-      recipesData = JSON.parse(rFile);
-      recipesData = migrateIngredientsIfStale(recipesData, window.__fmaSeedRecipes);
-      saveRecipesLocal();
+      const before = JSON.stringify(recipesData);
+      const incoming = migrateIngredientsIfStale(JSON.parse(rFile), window.__fmaSeedRecipes);
+      if(JSON.stringify(incoming) !== before){
+        recipesData = incoming;
+        saveRecipesLocal();
+        recipesChanged = true;
+      }
       await writeFileToFolder('recipes-data.json', JSON.stringify(recipesData));
     }
     else { await writeFileToFolder('recipes-data.json', JSON.stringify(recipesData)); }
@@ -792,7 +797,7 @@ async function loadFromFolderOrSeed(){
     // rows can't be left pointing at the discarded object graph.
     if(sFile){ applyMergedShopping(mergeShoppingData(shoppingData, JSON.parse(sFile))); }
     else { await writeFileToFolder('shopping-list.json', JSON.stringify(shoppingData)); }
-    render();
+    if(recipesChanged) repaintWhenSafe();
   }catch(e){
     console.error(e);
     setStatus('Could not read the shared folder: ' + e.message, 'warn');
@@ -1041,23 +1046,32 @@ async function loadFromOneDriveOrSeed(){
       return;
     }
     const { driveId, itemId } = oneDriveFolderRef;
+    // v21.5: only repaint if something actually came back different. Most opens change
+    // nothing at all, and every one of those repaints used to be pure interruption.
+    let changed = false;
     const rText = await getOneDriveFileText(driveId, itemId, 'recipes-data.json', token);
     if(rText){
-      recipesData = JSON.parse(rText);
-      recipesData = migrateIngredientsIfStale(recipesData, window.__fmaSeedRecipes);
-      saveRecipesLocal();
+      const before = JSON.stringify(recipesData);
+      const incoming = migrateIngredientsIfStale(JSON.parse(rText), window.__fmaSeedRecipes);
+      if(JSON.stringify(incoming) !== before){
+        recipesData = incoming;
+        saveRecipesLocal();
+        changed = true;
+      }
     } else {
       await writeOneDriveFile(driveId, itemId, 'recipes-data.json', JSON.stringify(recipesData));
     }
     const sText = await getOneDriveFileText(driveId, itemId, 'shopping-list.json', token);
     if(sText){
       // Merge rather than replace, so ticks made on this device while offline/only-local
-      // survive reconnection instead of being wiped by the remote copy.
+      // survive reconnection instead of being wiped by the remote copy. applyMergedShopping
+      // repaints by itself when the shopping data moved, so only a recipes change is
+      // still owed one here.
       applyMergedShopping(mergeShoppingData(shoppingData, JSON.parse(sText)));
     } else {
       await writeOneDriveFile(driveId, itemId, 'shopping-list.json', JSON.stringify(shoppingData));
     }
-    render();
+    if(changed) repaintWhenSafe();
   }catch(e){
     console.error(e);
     setStatus('Could not sync with OneDrive: ' + e.message, 'warn');
@@ -1403,16 +1417,59 @@ function mergeShoppingData(a, b){
    line: the tick appeared to register, the row struck through, and then persist()
    serialised the NEW state where the tick had never happened. That is what made ticks
    "come back" only after a refresh. State swaps and repaints now happen together. */
+/* ---- v21.5: no background repaint may interrupt what someone is doing ----
+   render() tears the tab down and rebuilds it, so a field being typed into is destroyed
+   and comes back empty. The OneDrive load that runs on every open finished with an
+   unconditional render(), landing a few seconds in — right when you have opened the app,
+   tapped a box and started typing. The 20s poll had guarded against exactly this since
+   v20; the startup path never did.
+   Everything that repaints in the background now goes through here. A repaint that
+   would be rude is remembered, not dropped, and runs as soon as the moment passes. */
+let deferredRepaint = false;
+
+function safeToRepaint(){
+  if(document.getElementById('modalRoot').innerHTML !== '') return false;
+  const ae = document.activeElement;
+  if(ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT')) return false;
+  // Safari captures the page well after window.print() returns; repainting inside that
+  // window redraws the page out from under the printer.
+  if(isPrinting()) return false;
+  return true;
+}
+
+// Repaint now if it is not disruptive, otherwise owe one. Returns whether it happened.
+function repaintWhenSafe(){
+  if(!safeToRepaint()){ deferredRepaint = true; return false; }
+  deferredRepaint = false;
+  rerenderPreservingScroll();
+  return true;
+}
+
+function flushDeferredRepaint(){
+  if(!deferredRepaint || !safeToRepaint()) return;
+  deferredRepaint = false;
+  rerenderPreservingScroll();
+}
+
+/* Leaving a field is the moment a held-back repaint becomes safe. focusout fires before
+   focus lands anywhere else, so let it settle first — otherwise moving between two boxes
+   looks momentarily like "nothing is focused" and repaints mid-edit after all. */
+document.addEventListener('focusout', ()=> setTimeout(flushDeferredRepaint, 0));
+
+/* Returns whether anything actually changed. Callers use that to decide whether the
+   change is worth telling the user about. */
 function applyMergedShopping(merged){
+  // Identical content: keep the object already in hand. Swapping in an equivalent copy
+  // would detach every rendered row's event handler for no gain — the v21.0 bug — and
+  // repainting over it would be pure disruption.
+  if(JSON.stringify(merged) === JSON.stringify(shoppingData)) return false;
   shoppingData = merged;
   try{ localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData)); }
   catch(e){ storageBlockedReason = 'Could not save locally (' + ((e && e.message) || e) + ').'; }
-  if(currentTab !== 'review' && currentTab !== 'needed' && currentTab !== 'menu') return;
-  // Never rebuild the DOM while the browser is capturing it for print — Safari's
-  // capture happens well after window.print() returns, so a poll landing in that
-  // window would otherwise redraw the page out from under the printer.
-  if(isPrinting()){ printRenderPending = true; return; }
-  rerenderPreservingScroll();
+  // 'start' shows the week's recipe picks, which live in shoppingData too.
+  if(currentTab === 'review' || currentTab === 'needed'
+     || currentTab === 'menu' || currentTab === 'start') repaintWhenSafe();
+  return true;
 }
 
 // Look a line up by its merge key at the moment of the tap, rather than trusting the
@@ -1517,10 +1574,8 @@ async function pollShoppingNow(){
     shoppingFastPollStamp = meta.lastModifiedDateTime;
     const remote = await fetchRemoteShopping(token);
     if(remote && remote.data){
-      const before = JSON.stringify(shoppingData);
-      const merged = mergeShoppingData(shoppingData, remote.data);
-      if(JSON.stringify(merged) !== before){
-        applyMergedShopping(merged);
+      // applyMergedShopping does the comparison and reports whether anything moved.
+      if(applyMergedShopping(mergeShoppingData(shoppingData, remote.data))){
         setStatus('Shopping list updated from the other shopper — ' + new Date().toLocaleTimeString(), 'ok');
       }
     }
@@ -2989,8 +3044,6 @@ function renderNeededTab(){
    own after-print signal rather than on a guess. The printing-* classes are referenced
    only inside @media print blocks, so if neither signal ever fires they have no effect
    on screen and the next printSection() call clears them anyway. */
-let printRenderPending = false;
-
 function isPrinting(){
   return document.body.classList.contains('printing-shopping')
       || document.body.classList.contains('printing-menu');
@@ -2999,9 +3052,9 @@ function isPrinting(){
 function clearPrintMode(){
   if(!isPrinting()) return;
   document.body.classList.remove('printing-shopping','printing-menu');
-  // A sync that landed while the print dialog was open had its repaint deferred so it
-  // couldn't rebuild the page mid-capture; run it now.
-  if(printRenderPending){ printRenderPending = false; render(); }
+  // A sync that landed while the print dialog was open had its repaint held back by
+  // safeToRepaint so it couldn't rebuild the page mid-capture; run it now.
+  flushDeferredRepaint();
 }
 
 function printSection(which){
@@ -3140,7 +3193,8 @@ function openModal(bodyEl, wide){
   root.innerHTML = '';
   root.appendChild(backdrop);
 }
-function closeModal(){ document.getElementById('modalRoot').innerHTML=''; releaseWakeLock(); }
+// Closing a modal is the other moment a held-back repaint becomes safe to run.
+function closeModal(){ document.getElementById('modalRoot').innerHTML=''; releaseWakeLock(); flushDeferredRepaint(); }
 
 /* ---- keep the screen on while cooking (Wake Lock API) ----
    Available on Android Chrome and iOS Safari 16.4+ over HTTPS. The lock is
