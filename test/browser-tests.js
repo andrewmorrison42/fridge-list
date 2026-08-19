@@ -676,6 +676,116 @@ async function suiteOfflineAndSession(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+async function suiteShareOneRecipe(browser) {
+  group('sharing one recipe out of the book');
+  // The point of the feature is that ONE recipe leaves, laid out properly. Both
+  // halves are browser work the logic tests cannot see: what actually lands on the
+  // clipboard (two flavours of it), and the one-recipe file for another copy of
+  // the app.
+  const srv = await serve(8179);
+  const ctx = await browser.newContext({ acceptDownloads: true });
+  await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'http://localhost:8179' });
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  try {
+    // No OS share sheet in headless Chromium anyway; removed explicitly so the
+    // file route is deterministically the download one.
+    await page.addInitScript(() => {
+      try { delete Navigator.prototype.share; } catch (e) {}
+      try { delete Navigator.prototype.canShare; } catch (e) {}
+    });
+    await page.goto('http://localhost:8179/', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1800);
+
+    await page.click('#mainNav button[data-tab="recipes"]');
+    await page.waitForTimeout(400);
+    await page.fill('#app input[type=search]', 'Mushroom Risotto');
+    await page.waitForTimeout(300);
+    await page.click('#app .recipe-card');
+    await page.waitForTimeout(300);
+
+    const shareBtn = await page.$('#modalRoot button:has-text("Share")');
+    ok('every recipe has a Share button at the bottom', !!shareBtn);
+    ok('the share options stay out of the way until asked for',
+       await page.evaluate(() => !!document.querySelector('#modalRoot .card[hidden]')));
+
+    await shareBtn.click();
+    await page.waitForTimeout(200);
+    const labels = await page.evaluate(() =>
+      [...document.querySelectorAll('#modalRoot .card button')].map(b => b.textContent));
+    ok('opening it offers both ways of sending', labels.join('|') === 'Copy recipe|Send as a recipe file',
+       labels);
+
+    /* --- the clipboard, which is the whole point --- */
+    await page.click('#modalRoot button:has-text("Copy recipe")');
+    await page.waitForTimeout(500);
+    const clip = await page.evaluate(async () => {
+      const items = await navigator.clipboard.read();
+      const out = { types: [], html: '', text: '' };
+      for (const item of items) {
+        for (const type of item.types) {
+          out.types.push(type);
+          const body = await (await item.getType(type)).text();
+          if (type === 'text/html') out.html = body;
+          if (type === 'text/plain') out.text = body;
+        }
+      }
+      return out;
+    });
+    ok('both a formatted and a plain version are on the clipboard',
+       clip.types.indexOf('text/html') !== -1 && clip.types.indexOf('text/plain') !== -1, clip.types);
+    ok('the formatted one has the name as a heading', /<h2>Mushroom Risotto<\/h2>/.test(clip.html),
+       clip.html.slice(0, 120));
+    ok('the ingredients paste as a bulleted list', /<ul>[\s\S]*<li>/.test(clip.html));
+    ok('the method pastes as a numbered list', /<ol>[\s\S]*<li>/.test(clip.html));
+    ok('the plain version is readable on its own', /^Mushroom Risotto\n/.test(clip.text));
+    ok('the plain version numbers the steps', /\n1\. /.test(clip.text));
+    ok('no other recipe travels with it',
+       clip.html.indexOf('Apple Crumble') === -1 && clip.text.indexOf('Apple Crumble') === -1);
+    ok('the status bar says where it went',
+       /paste it into an email or a document/i.test(await page.evaluate(() =>
+         document.getElementById('statusBar').textContent)));
+
+    // Pasting it back into a real document: the browser's own parser is the judge
+    // of whether the markup is sound.
+    const pasted = await page.evaluate(html => {
+      const d = document.createElement('div');
+      d.innerHTML = html;
+      return { h2: d.querySelectorAll('h2').length, uls: d.querySelectorAll('ul').length,
+               ols: d.querySelectorAll('ol').length, lis: d.querySelectorAll('li').length,
+               text: d.innerText || d.textContent };
+    }, clip.html);
+    ok('it parses back into a real heading and real lists',
+       pasted.h2 === 1 && pasted.uls >= 1 && pasted.ols >= 1 && pasted.lis > 3, pasted);
+    ok('and reads as the same recipe', /Mushroom Risotto/.test(pasted.text));
+
+    /* --- the recipe file, for another copy of the app --- */
+    const pending = page.waitForEvent('download').catch(() => null);
+    await page.click('#modalRoot button:has-text("Send as a recipe file")');
+    const download = await Promise.race([pending, new Promise(r => setTimeout(() => r(null), 5000))]);
+    ok('a one-recipe file is produced',
+       !!download && download.suggestedFilename() === 'fridge-list-mushroom-risotto.json',
+       download && download.suggestedFilename());
+    const bundle = download ? JSON.parse(fs.readFileSync(await download.path(), 'utf8')) : null;
+    ok('it is a share file, not a backup', !!bundle && bundle.fridgeListRecipeShare === 1);
+    ok('it holds exactly the one recipe',
+       !!bundle && bundle.recipes.length === 1 && bundle.recipes[0].name === 'Mushroom Risotto',
+       bundle && bundle.recipes.length);
+    ok('it carries the ingredients that recipe needs',
+       !!bundle && bundle.ingredients.length > 0 && bundle.ingredients.length < 30,
+       bundle && bundle.ingredients.length);
+    ok('and none of the rest of the book',
+       !!bundle && !('shoppingList' in bundle) && !('settings' in bundle));
+
+    // Closing the panel again leaves the reading screen as it was.
+    await page.click('#modalRoot button:has-text("Hide share options")');
+    await page.waitForTimeout(150);
+    ok('it can be put away again',
+       await page.evaluate(() => !!document.querySelector('#modalRoot .card[hidden]')));
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 /* ---------- run ---------- */
 
 (async () => {
@@ -686,7 +796,7 @@ async function suiteOfflineAndSession(browser) {
     // remaining suites still have something useful to say about the build.
     for (const suite of [suiteTicksSurviveRebuild, suiteRemoteMergeKeepsTicks,
                          suiteWriteSplitting, suiteStapleQuantities, suiteTypingIsNotInterrupted,
-                         suiteBulkDelete,
+                         suiteBulkDelete, suiteShareOneRecipe,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
       catch (e) {

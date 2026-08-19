@@ -12,6 +12,9 @@ your own OneDrive.
 - Add regular items ("staples") that go on every list automatically.
 - A Wait List anyone can add to the moment they notice you're low on something.
 - Print the shopping list, or a weekly menu for the fridge door.
+- Copy one recipe to the clipboard, laid out and ready to paste into an email or a
+  document — or send it as a file another copy of the app can import. One recipe,
+  not the whole book.
 - Works offline once it has loaded, which matters when the signal in the shop is poor.
 
 Comes with a few hundred family recipes to start from. You can cook from them, add

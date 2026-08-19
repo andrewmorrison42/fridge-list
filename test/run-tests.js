@@ -67,7 +67,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'mergeFlag', 'flagStamp', 'mergeShoppingLine'
                'mergeShoppingData', 'lineMergeKey', 'selectionsSignature',
                'recipeSelectionsSignature', 'shoppingListIsStale',
                'featureOn', 'stapleQtyFor', 'stapleQtyToShopping', 'parseQty', 'fmtQty',
-               'displayUnit', 'lineQtyText', 'findIngredientMeta', 'rollUpQty', 'fmtExactQty'];
+               'displayUnit', 'lineQtyText', 'findIngredientMeta', 'rollUpQty', 'fmtExactQty',
+               'ingredientLineText', 'recipeToPlainText', 'recipeToHtml', 'buildShareBundle'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -78,15 +79,19 @@ vm.runInContext(
   extractConst('COUNT_UNITS') + '\n' +
   extractConst('MEASURE_ML') + '\n' +
   extractConst('UNIT_ROLLUP') + '\n' +
+  extractConst('SHARE_MARKER') + '\n' +
+  extractConst('APP_VERSION') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
+  '             ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
 );
 const { mergeShoppingData, selectionsSignature, shoppingListIsStale,
         parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,
+        ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -438,6 +443,114 @@ group('kilos and litres above a thousand');
   ok('free-text parts still follow',
      lineQtyText({ hasNumeric: true, totalQty: 1500, unit: 'g', textQtyParts: ['a splash'] })
        === '1.5 kg + a splash');
+}
+
+/* ---------- sharing one recipe on its own ----------
+   The promise the share panel makes is that one recipe goes and nothing else
+   does, and that what the recipient reads is what the cook sees on screen. */
+
+group('sharing a single recipe');
+{
+  const pie = {
+    id: 'apple-pie', name: 'Apple Pie', category: 'Dessert', servings: 6,
+    lastCooked: '2026-08-01T00:00:00.000Z',
+    ingredients: [
+      { ingredientName: 'Apple', quantity: 6 },
+      { ingredientName: 'Butter', quantity: 100, descriptor: 'cold, cubed' },
+      { ingredientName: 'Milk', quantity: 250, displayQty: '1', displayUnit: 'cup', section: 'Pastry' },
+      { ingredientName: 'Flour', quantity: 200, section: 'Pastry' }
+    ],
+    method: ['Peel the apples.', 'Bake for 40 minutes.', '\u2014 Topping', 'Rub in the butter.'],
+    sourceUrl: 'https://example.com/apple-pie'
+  };
+  const stew = { id: 'stew', name: 'Stew', category: 'Meat', servings: 4,
+                 ingredients: [{ ingredientName: 'Beef', quantity: 500 }], method: [] };
+  setRecipesData({
+    recipes: [pie, stew],
+    ingredients: [
+      { name: 'Apple', shoppingUnit: 'qty', aisle: 'Fruit' },
+      { name: 'Butter', shoppingUnit: 'g', aisle: 'Dairy' },
+      { name: 'Milk', shoppingUnit: 'mL', aisle: 'Dairy' },
+      { name: 'Flour', shoppingUnit: 'g', aisle: 'Baking' },
+      { name: 'Beef', shoppingUnit: 'g', aisle: 'Meat' }
+    ],
+    settings: { features: {}, staples: [], stapleQty: {} }
+  });
+
+  // --- the ingredient line, shared with the recipe screen ---
+  ok('a counted ingredient drops the "qty" unit',
+     ingredientLineText(pie.ingredients[0]) === '6 Apple', ingredientLineText(pie.ingredients[0]));
+  ok('an ingredient takes its unit from the master list',
+     ingredientLineText(pie.ingredients[1]) === '100g Butter, cold, cubed', ingredientLineText(pie.ingredients[1]));
+  ok('a kitchen measure is shown as it was typed',
+     ingredientLineText(pie.ingredients[2]) === '1 cup Milk', ingredientLineText(pie.ingredients[2]));
+  ok('no quantity means just the name',
+     ingredientLineText({ ingredientName: 'Salt' }) === 'Salt');
+
+  // --- the plain text a non-user receives ---
+  const text = recipeToPlainText(pie);
+  const lines = text.split('\n');
+  ok('it starts with the recipe name', lines[0] === 'Apple Pie');
+  ok('the second line summarises it', lines[1] === 'Dessert \u00b7 serves 6', lines[1]);
+  ok('ingredients are listed', text.indexOf('100g Butter, cold, cubed') !== -1);
+  ok('a section heading appears once, above its lines',
+     lines.indexOf('Pastry') !== -1 && lines.indexOf('Pastry') < lines.indexOf('1 cup Milk'));
+  ok('the heading is not repeated for every line in the section',
+     lines.filter(l => l === 'Pastry').length === 1);
+  ok('the first step is numbered 1', text.indexOf('1. Peel the apples.') !== -1);
+  ok('the second step is numbered 2', text.indexOf('2. Bake for 40 minutes.') !== -1);
+  ok('a method heading loses its dash',
+     lines.indexOf('Topping') !== -1 && text.indexOf('\u2014 Topping') === -1);
+  ok('numbering restarts after a method heading', text.indexOf('1. Rub in the butter.') !== -1);
+  ok('the source website comes along', text.indexOf('From: https://example.com/apple-pie') !== -1);
+  ok('slow cooker is only mentioned when it applies', text.indexOf('slow cooker') === -1);
+  ok('slow cooker is mentioned when it applies',
+     recipeToPlainText(Object.assign({}, pie, { slowCooker: true })).split('\n')[1]
+       === 'Dessert \u00b7 serves 6 \u00b7 slow cooker');
+  ok('a recipe with no method says so, rather than ending mid-air',
+     recipeToPlainText(stew).indexOf('(no method written down yet)') !== -1);
+  ok('a recipe with no ingredients says so',
+     recipeToPlainText({ name: 'Toast', ingredients: [], method: ['Toast it.'] })
+       .indexOf('(none listed)') !== -1);
+
+  // --- the formatted version, for pasting into an email or a document ---
+  const htm = recipeToHtml(pie);
+  ok('the name is a heading', htm.indexOf('<h2>Apple Pie</h2>') !== -1);
+  ok('ingredients are a bulleted list',
+     htm.indexOf('<ul>') !== -1 && htm.indexOf('<li>100g Butter, cold, cubed</li>') !== -1);
+  ok('the method is a numbered list',
+     htm.indexOf('<ol>') !== -1 && htm.indexOf('<li>Peel the apples.</li>') !== -1);
+  ok('an ingredient section becomes a sub-heading', htm.indexOf('<strong>Pastry</strong>') !== -1);
+  ok('a method heading breaks the numbering into a second list',
+     htm.indexOf('<strong>Topping</strong>') !== -1 && htm.split('<ol>').length === 3, htm.split('<ol>').length);
+  ok('every list it opens, it closes',
+     htm.split('<ul>').length === htm.split('</ul>').length
+       && htm.split('<ol>').length === htm.split('</ol>').length);
+  ok('the source website is a link', htm.indexOf('<a href="https://example.com/apple-pie">') !== -1);
+  ok('it carries no styling of its own, so it takes the document\'s',
+     htm.indexOf('style=') === -1 && htm.indexOf('font') === -1);
+  ok('markup in a recipe is escaped, not pasted as markup',
+     recipeToHtml({ name: 'Fish & <b>Chips</b>', ingredients: [], method: [] })
+       .indexOf('<h2>Fish &amp; &lt;b&gt;Chips&lt;/b&gt;</h2>') !== -1,
+     recipeToHtml({ name: 'Fish & <b>Chips</b>', ingredients: [], method: [] }).slice(0, 80));
+
+  // --- the recipe file a fellow user receives ---
+  const bundle = buildShareBundle(['apple-pie']);
+  ok('the file is marked as a share file', bundle[SHARE_MARKER] === 1);
+  ok('only the chosen recipe travels',
+     bundle.recipes.length === 1 && bundle.recipes[0].id === 'apple-pie');
+  ok('only the ingredients that recipe uses travel',
+     bundle.ingredients.map(i => i.name).sort().join(',') === 'Apple,Butter,Flour,Milk',
+     bundle.ingredients.map(i => i.name));
+  ok('nothing else from the book is in the file',
+     JSON.stringify(bundle).indexOf('Stew') === -1 && JSON.stringify(bundle).indexOf('Beef') === -1);
+  ok('no shopping list, week plan or settings ride along',
+     Object.keys(bundle).sort().join(',') === 'appVersion,exportedAt,fridgeListRecipeShare,ingredients,recipes',
+     Object.keys(bundle).sort());
+  bundle.recipes[0].name = 'Tampered';
+  ok('the file is a copy — editing it cannot touch the book', pie.name === 'Apple Pie');
+
+  noStaples();
 }
 
 /* ---------- result ---------- */

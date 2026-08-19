@@ -206,6 +206,28 @@ shop, keep ticking anyway — it catches up when the signal returns.
 
 ---
 
+## Sending one recipe to someone
+
+Open the recipe and tap **Share** at the bottom of it. Two choices:
+
+- **Copy recipe** — puts the recipe on the clipboard, laid out: the name as a heading,
+  the ingredients as a bulleted list, the method numbered. Paste it into an email, a
+  Word document or a message and it arrives looking like a recipe. Anywhere that
+  cannot take formatting — a text message, say — gets the same recipe as plain text
+  instead, automatically. Whoever you send it to needs nothing: no app, no account.
+- **Send as a recipe file** — a small `.json` file for someone who also uses The
+  Fridge List. They open **All Recipes → Import shared file** and pick it, and the
+  recipe joins their book. If they already have one with the same name, the app asks
+  what to call the new one rather than overwriting anything.
+
+Either way only that one recipe leaves: not your other recipes, not your shopping list,
+not your settings, and not your cooking history. Nobody gets access to your OneDrive
+folder — you are sending them a copy of one recipe, and nothing about it stays
+connected to yours afterwards.
+
+To send several at once, use **Share recipes** at the top of the All Recipes tab
+instead: tick the ones you want and export them as a single file.
+
 ---
 
 ## Getting things back when something goes wrong
