@@ -328,7 +328,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v21.6';
+const APP_VERSION = 'v21.7';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -1802,6 +1802,238 @@ function exportSelectedRecipes(ids){
   setStatus('Exported ' + ids.length + ' recipe(s) to a share file — send that one file on.', 'ok');
 }
 
+/* ---------------- sharing one recipe on its own ----------------
+
+   The batch export above is for handing over a slice of the book. This is the
+   "can you send me that pie?" case: one recipe, from the screen you are already
+   reading it on. Two ways out, because the person on the other end either has
+   The Fridge List or — far more often — has never heard of it:
+
+     • copied to the clipboard, formatted — headings, a bulleted ingredient
+       list and numbered steps, so pasting into an email or a document arrives
+       looking like a recipe rather than a wall of text. Plain text goes on the
+       clipboard alongside it, so anywhere that cannot take formatting (a text
+       message, a code editor) still gets something readable;
+     • as a recipe file — the same one-file format "Import shared file" reads.
+
+   Both carry that one recipe and nothing else: no other recipes, no shopping
+   list, no settings, no cooking history. */
+
+// The ingredient line exactly as the recipe screen shows it. Shared by the
+// viewer and the share text so the two can never drift apart.
+function ingredientLineText(i){
+  const descSuffix = i.descriptor ? ', ' + i.descriptor : '';
+  if(i.displayUnit && i.displayQty !== undefined && i.displayQty !== ''){
+    return String(i.displayQty) + ' ' + i.displayUnit + ' ' + i.ingredientName + descSuffix;
+  }
+  const meta = findIngredientMeta(i.ingredientName);
+  const unit = ((i.unit || (meta && meta.shoppingUnit) || '') + '').trim();
+  let txt;
+  if(i.quantity === null || i.quantity === undefined || i.quantity === ''){ txt = i.ingredientName; }
+  else if(unit && unit.toLowerCase() !== 'qty'){ txt = String(i.quantity) + unit + ' ' + i.ingredientName; }
+  else { txt = String(i.quantity) + ' ' + i.ingredientName; }
+  return txt + descSuffix;
+}
+
+// One recipe as plain text — no markup, nothing to install at the other end.
+// Section headings and the per-section numbering match what is on screen.
+function recipeToPlainText(r){
+  const lines = [r.name];
+  const bits = [r.category || 'Uncategorised', 'serves ' + (r.servings || '?')];
+  if(r.slowCooker) bits.push('slow cooker');
+  lines.push(bits.join(' \u00b7 '));
+
+  lines.push('', 'INGREDIENTS');
+  let prevSec = '', written = 0;
+  (r.ingredients||[]).forEach(i=>{
+    const sec = i.section || '';
+    if(sec && sec !== prevSec){
+      if(written) lines.push('');
+      lines.push(sec);
+    }
+    prevSec = sec;
+    lines.push(ingredientLineText(i));
+    written++;
+  });
+  if(!written) lines.push('(none listed)');
+
+  lines.push('', 'METHOD');
+  let n = 0, steps = 0;
+  (r.method||[]).forEach(m=>{
+    const h = String(m).match(/^\u2014\s*(.+)$/);
+    if(h){ lines.push('', h[1]); n = 0; return; }   // a heading restarts the numbering, as on screen
+    lines.push((++n) + '. ' + m);
+    steps++;
+  });
+  if(!steps) lines.push('(no method written down yet)');
+
+  if(r.sourceUrl) lines.push('', 'From: ' + r.sourceUrl);
+  return lines.join('\n');
+}
+
+// The same recipe as HTML, for the formatted half of the clipboard. Deliberately
+// plain markup — headings, a list, an ordered list — with no colours or fonts of
+// its own, so it takes on the styling of whatever it is pasted into.
+function recipeToHtml(r){
+  const esc = t => String(t)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const out = ['<div>'];
+  out.push('<h2>' + esc(r.name) + '</h2>');
+  const bits = [r.category || 'Uncategorised', 'serves ' + (r.servings || '?')];
+  if(r.slowCooker) bits.push('slow cooker');
+  out.push('<p><em>' + esc(bits.join(' \u00b7 ')) + '</em></p>');
+
+  out.push('<h3>Ingredients</h3>');
+  let ul = null, written = 0, prevSec = '';
+  (r.ingredients||[]).forEach(i=>{
+    const sec = i.section || '';
+    if(sec && sec !== prevSec){
+      if(ul){ out.push('</ul>'); ul = null; }
+      out.push('<p><strong>' + esc(sec) + '</strong></p>');
+    }
+    prevSec = sec;
+    if(!ul){ out.push('<ul>'); ul = true; }
+    out.push('<li>' + esc(ingredientLineText(i)) + '</li>');
+    written++;
+  });
+  if(ul) out.push('</ul>');
+  if(!written) out.push('<p><em>(none listed)</em></p>');
+
+  out.push('<h3>Method</h3>');
+  let ol = null, steps = 0;
+  (r.method||[]).forEach(m=>{
+    const h = String(m).match(/^\u2014\s*(.+)$/);
+    if(h){                                   // a heading closes the list, so the
+      if(ol){ out.push('</ol>'); ol = null; } // numbering restarts under it
+      out.push('<p><strong>' + esc(h[1]) + '</strong></p>');
+      return;
+    }
+    if(!ol){ out.push('<ol>'); ol = true; }
+    out.push('<li>' + esc(m) + '</li>');
+    steps++;
+  });
+  if(ol) out.push('</ol>');
+  if(!steps) out.push('<p><em>(no method written down yet)</em></p>');
+
+  if(r.sourceUrl) out.push('<p>From: <a href="' + esc(r.sourceUrl) + '">' + esc(r.sourceUrl) + '</a></p>');
+  out.push('</div>');
+  return out.join('');
+}
+
+// Formatted and plain go onto the clipboard together: the paste target picks the
+// one it can use. Word, Outlook, Google Docs and Gmail take the HTML; a text
+// message or a terminal takes the plain text.
+function copyRecipeToClipboard(r){
+  const text = recipeToPlainText(r);
+  const html = recipeToHtml(r);
+  const done = ()=> setStatus('\u201c' + r.name + '\u201d copied \u2014 paste it into an email or a document.', 'ok');
+  if(navigator.clipboard && navigator.clipboard.write && typeof ClipboardItem === 'function'){
+    let item = null;
+    try{
+      item = new ClipboardItem({
+        'text/html': new Blob([html], {type:'text/html'}),
+        'text/plain': new Blob([text], {type:'text/plain'})
+      });
+    }catch(e){ item = null; }
+    if(item){
+      navigator.clipboard.write([item]).then(done, ()=> copyRecipeFallback(r, html, text, done));
+      return;
+    }
+  }
+  copyRecipeFallback(r, html, text, done);
+}
+
+// Browsers without the async clipboard write (older Safari, Firefox with it turned
+// off) can still copy formatting the old way: select a rendered copy of the recipe
+// and let execCommand take it. Plain text only if even that is refused.
+function copyRecipeFallback(r, html, text, done){
+  if(copyHtmlBySelection(html)){ done(); return; }
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done, ()=> showRecipeTextToCopy(r, text));
+    return;
+  }
+  showRecipeTextToCopy(r, text);
+}
+
+function copyHtmlBySelection(html){
+  const holder = el('div',{html: html, style:'position:fixed;left:-9999px;top:0;'});
+  holder.setAttribute('contenteditable','true');
+  document.body.appendChild(holder);
+  let ok = false;
+  try{
+    const range = document.createRange();
+    range.selectNodeContents(holder);
+    const sel = window.getSelection();
+    sel.removeAllRanges(); sel.addRange(range);
+    ok = document.execCommand('copy');
+    sel.removeAllRanges();
+  }catch(e){ ok = false; }
+  holder.remove();
+  return ok;
+}
+
+// Last resort: clipboard access refused (an insecure origin, or a browser that
+// wants a different gesture). Put the text on screen so it can be copied by hand
+// rather than leaving the button looking broken.
+function showRecipeTextToCopy(r, text){
+  const body = el('div',{});
+  body.appendChild(el('h2',{},['Share \u201c' + r.name + '\u201d']));
+  body.appendChild(el('p',{class:'muted'},['This browser would not let the app reach the clipboard. Select all of the text below and copy it yourself \u2014 it will paste as plain text.']));
+  const ta = el('textarea',{rows:'16', readonly:'readonly'});
+  ta.value = text;
+  body.appendChild(ta);
+  const row = el('div',{class:'row', style:'margin-top:12px;'});
+  const closeBtn = el('button',{class:'btn secondary'},['Close']);
+  closeBtn.addEventListener('click', closeModal);
+  row.appendChild(closeBtn);
+  body.appendChild(row);
+  openModal(body);
+  ta.focus(); ta.select();
+}
+
+function shareRecipeAsFile(r){
+  const json = JSON.stringify(buildShareBundle([r.id]), null, 0);
+  const filename = 'fridge-list-' + (r.id || 'recipe') + '.json';
+  const saveIt = ()=>{
+    downloadFile(filename, json);
+    setStatus('Saved ' + filename + ' \u2014 send that one file on. The other person opens it with "Import shared file".', 'ok');
+  };
+  // A phone can hand the file straight to a messaging app; a desktop browser
+  // saves it and the sender attaches it themselves.
+  try{
+    if(navigator.canShare && typeof File === 'function'){
+      const file = new File([json], filename, {type:'application/json'});
+      if(navigator.canShare({files:[file]})){
+        navigator.share({files:[file], title: r.name}).then(
+          ()=> setStatus('Sent "' + r.name + '" as a recipe file.', 'ok'),
+          err=>{ if(!err || err.name !== 'AbortError') saveIt(); }
+        );
+        return;
+      }
+    }
+  }catch(e){ /* no file sharing here — save it instead */ }
+  saveIt();
+}
+
+// The panel the Share button on a recipe opens. Hidden until asked for, so the
+// reading screen stays a reading screen.
+function buildRecipeSharePanel(r){
+  const panel = el('div',{class:'card', style:'margin-top:12px;'});
+  panel.hidden = true;
+  panel.appendChild(el('p',{style:'margin-top:0;'},['Send this one recipe on its own. Nothing else goes with it \u2014 not your other recipes, not the shopping list, not your settings.']));
+  const row = el('div',{class:'row'});
+  const copyBtn = el('button',{class:'btn'},['Copy recipe']);
+  copyBtn.addEventListener('click', ()=> copyRecipeToClipboard(r));
+  const fileBtn = el('button',{class:'btn secondary'},['Send as a recipe file']);
+  fileBtn.addEventListener('click', ()=> shareRecipeAsFile(r));
+  row.appendChild(copyBtn); row.appendChild(fileBtn);
+  panel.appendChild(row);
+  panel.appendChild(el('p',{class:'muted', style:'margin-bottom:0;font-size:.85em;'},[
+    'Copy puts the recipe on the clipboard laid out properly \u2014 paste it straight into an email, a message or a document. The recipe file is for someone else with The Fridge List \u2014 they add it with "Import shared file" on the All Recipes tab.'
+  ]));
+  return panel;
+}
+
 // Collision handling: prompt for a new name. Cancelling skips that one recipe
 // and leaves the existing copy alone — an import never overwrites silently.
 function resolveImportName(name){
@@ -2459,18 +2691,7 @@ function openRecipeViewer(id){
   r.ingredients.forEach(i=>{
     const sec = i.section || '';
     if(sec !== prevSec){ if(sec) ul.appendChild(el('div',{class:'ing-section-head'},[sec])); prevSec = sec; }
-    const descSuffix = i.descriptor ? ', ' + i.descriptor : '';
-    if(i.displayUnit && i.displayQty !== undefined && i.displayQty !== ''){
-      ul.appendChild(el('div',{class:'ing-line'},[String(i.displayQty)+' '+i.displayUnit+' '+i.ingredientName+descSuffix]));
-      return;
-    }
-    const meta = findIngredientMeta(i.ingredientName);
-    const unit = ((i.unit || (meta && meta.shoppingUnit) || '') + '').trim();
-    let txt;
-    if(i.quantity === null || i.quantity === undefined || i.quantity === ''){ txt = i.ingredientName; }
-    else if(unit && unit.toLowerCase() !== 'qty'){ txt = String(i.quantity) + unit + ' ' + i.ingredientName; }
-    else { txt = String(i.quantity) + ' ' + i.ingredientName; }
-    ul.appendChild(el('div',{class:'ing-line'},[txt + descSuffix]));
+    ul.appendChild(el('div',{class:'ing-line'},[ingredientLineText(i)]));
   });
   ingCol.appendChild(ul);
   const methodCol = el('div',{});
@@ -2494,7 +2715,15 @@ function openRecipeViewer(id){
   // No Delete here by design: destroying a recipe should take a deliberate detour
   // through Edit, not sit one mis-tap away on the reading screen.
   btnRow.appendChild(editBtn);
+  const sharePanel = buildRecipeSharePanel(r);
+  const shareBtn = el('button',{class:'btn secondary'},['Share']);
+  shareBtn.addEventListener('click', ()=>{
+    sharePanel.hidden = !sharePanel.hidden;
+    shareBtn.textContent = sharePanel.hidden ? 'Share' : 'Hide share options';
+  });
+  btnRow.appendChild(shareBtn);
   body.appendChild(btnRow);
+  body.appendChild(sharePanel);
   openModal(body, true);
 }
 

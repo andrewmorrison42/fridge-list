@@ -9,8 +9,8 @@ noticed mid-shop. They are worth reading before changing sync, rendering or stor
 ## Commands
 
 ```
-npm test                # 85 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 71 browser assertions — needs playwright-core + Chromium
+npm test                # 118 logic assertions — no dependencies, no browser, ~1s
+npm run test:browser    # 91 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -20,7 +20,7 @@ the service worker.
 
 ## Working in a 1.3 MB file
 
-`index.html` holds the whole application *and* the bundled recipe seed. About 81% of
+`index.html` holds the whole application *and* the bundled recipe seed. About 80% of
 the file is a single `<script type="application/json">` block roughly a million
 characters long, on one line.
 
@@ -76,6 +76,12 @@ same time, and the service worker means a phone can sit on an old one for a whil
 alongside; do not restructure. Staple quantities live in a separate `settings.stapleQty`
 map for exactly this reason — turning entries of the `staples` array into objects would
 have broken every device still on the previous build. *(v21.3)*
+
+**Sharing exports the chosen recipes and nothing else.** `buildShareBundle` takes
+recipe ids and emits only those recipes plus the ingredient-master entries they
+reference — never the shopping list, the Wait List, settings, staples or cooking
+history. A share is a copy that stays unconnected to the sender's data; keep it that
+way when extending it. *(v21.7)*
 
 **Destructive actions must be recoverable, not merely confirmed.** A dialog is not a
 safety mechanism — v19.0 removed a bulk ingredient delete that had one. Bulk recipe

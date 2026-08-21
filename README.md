@@ -11,6 +11,9 @@ your own OneDrive.
   within a few seconds.
 - A Wait List anyone can add to the moment they notice you're low on something.
 - Print the shopping list, or a weekly menu for the fridge door.
+- Copy one recipe to the clipboard, laid out and ready to paste into an email or a
+  document — or send it as a file another copy of the app can import. One recipe,
+  not the whole book.
 - Delete recipes in bulk when you want a clear-out, with a snapshot taken first and an
   undo button afterwards.
 - Works offline once it has loaded, which matters when the signal in the shop is poor.
@@ -117,9 +120,9 @@ changing anything — several of them exist because breaking them caused real bu
 
 ### One surprise worth knowing up front
 
-`index.html` is about 1.3 MB, and **roughly 81% of that is the recipe seed** — 992 KB
+`index.html` is about 1.2 MB, and **roughly 80% of that is the recipe seed** — 992 KB
 of JSON inside a `<script type="application/json">` block. The application itself is
-around 240 KB.
+around 250 KB.
 
 That matters when you search the file. The seed sits on a **single line of about a
 million characters**, so any pattern that also appears in the recipe data dumps the
