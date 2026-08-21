@@ -9,13 +9,22 @@ your own OneDrive.
 - Pick recipes for the week, and it builds the shopping list for you, grouped by aisle.
 - Two people can shop at once and tick items off — each phone sees the other's ticks
   within a few seconds.
-- Add regular items ("staples") that go on every list automatically.
 - A Wait List anyone can add to the moment they notice you're low on something.
 - Print the shopping list, or a weekly menu for the fridge door.
 - Copy one recipe to the clipboard, laid out and ready to paste into an email or a
   document — or send it as a file another copy of the app can import. One recipe,
   not the whole book.
+- Delete recipes in bulk when you want a clear-out, with a snapshot taken first and an
+  undo button afterwards.
 - Works offline once it has loaded, which matters when the signal in the shop is poor.
+
+Some capabilities ship switched **off**, so the app stays simple until you want them.
+Turn them on under **Settings → Features**:
+
+- **Staples** — regular items (milk, bread) added to every generated list, with the
+  quantity you normally buy.
+- **Pantry items start as "at home"** — flour, oil and spices begin in an "already
+  have this" group rather than on the buy list.
 
 Comes with a few hundred family recipes to start from. You can cook from them, add
 your own, or [clear them out](docs/SETUP-use-the-app.md#deleting-a-lot-of-recipes-at-once)
@@ -72,20 +81,69 @@ version history**, which covers every change the app has ever saved — not only
 deletions. See
 [Getting things back when something goes wrong](docs/SETUP-use-the-app.md#getting-things-back-when-something-goes-wrong).
 
+## Which version am I on?
+
+The build number shows at the top of the **Settings** tab, and in the startup message
+under the menu. When two phones behave differently, this is the first thing to compare
+— close the app fully and reopen it to pick up the newest build.
+
 ---
 
 ## For developers
 
-The whole app is a single `index.html` — HTML, CSS, JavaScript and the seed recipe
-data, with no build step and no dependencies at runtime beyond the Microsoft sign-in
-library loaded from a CDN.
+The whole app is a single `index.html` — markup, styles, JavaScript and the seed
+recipe data — with no build step, no framework, and no runtime dependency beyond the
+Microsoft sign-in library loaded from a CDN. Deployment is GitHub Pages: merging to
+`main` publishes it.
 
 ```
 npm install                # once, only needed for the browser tests
-npm test                   # logic tests: no dependencies, no browser
+npm test                   # logic tests: no dependencies, no browser, ~1s
 npm run test:browser       # browser tests: needs Chromium
 npm run test:all
 ```
 
 See [`test/README.md`](test/README.md) for what each suite covers and why they are
-split.
+split, and [`CLAUDE.md`](CLAUDE.md) for the architectural rules worth knowing before
+changing anything — several of them exist because breaking them caused real bugs.
+
+### What's in the repo
+
+| | |
+|---|---|
+| `index.html` | The entire application, plus the bundled recipe data |
+| `sw.js` | Service worker. Network-first for the page, so a cached copy can never pin a device on an old build |
+| `manifest.webmanifest` | Lets the app install to a phone's home screen |
+| `.nojekyll` | Stops GitHub Pages running the site through Jekyll, which breaks it |
+| `docs/` | The two setup guides |
+| `test/` | Both test suites and their own README |
+
+### One surprise worth knowing up front
+
+`index.html` is about 1.2 MB, and **roughly 80% of that is the recipe seed** — 992 KB
+of JSON inside a `<script type="application/json">` block. The application itself is
+around 250 KB.
+
+That matters when you search the file. The seed sits on a **single line of about a
+million characters**, so any pattern that also appears in the recipe data dumps the
+whole megabyte into your terminal — `quantity`, for instance, matches 5,550 times on
+24 lines. To search only the application code:
+
+```
+awk 'length($0)<600 {print NR": "$0}' index.html | grep 'yourPattern'
+```
+
+The same line length is why `git diff` on `index.html` can be unwieldy, and why edits
+are best kept surgical rather than reformatting.
+
+### Known limitations
+
+- **Wait List membership is last-writer-wins.** If an addition has not yet reached
+  OneDrive and someone else adds something in the meantime, the unsynced one can be
+  lost. Rare in practice — the Wait List is filled in during the week, usually by one
+  person at a time — and deliberately left alone; see `CLAUDE.md` for the reasoning and
+  the cheaper fix if it ever becomes a nuisance.
+- **Recipes are last-save-wins**, with no per-item merge. Concurrent edits to *different*
+  recipes on two devices can lose one side. An ETag guard stops a stale copy silently
+  overwriting a newer one, and reports the clash instead.
+- **Every open downloads the full recipe file**, whether or not anything changed.
