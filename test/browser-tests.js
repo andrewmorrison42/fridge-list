@@ -136,7 +136,10 @@ function watchErrors(page, sink) {
 // Pick two recipes and land on the shopping list.
 async function buildAList(page) {
   await page.click('#mainNav button[data-tab="start"]');
-  await page.waitForTimeout(300);
+  // Wait for the grid rather than guessing at it: 635 recipe cards do not always
+  // render inside a fixed 300ms on a loaded machine, and this helper is shared by
+  // most of the suites below — a miss here failed a suite that was working fine.
+  await page.waitForSelector('#app input[type=checkbox]', { timeout: 15000 });
   const boxes = await page.$$('input[type=checkbox]');
   await boxes[0].check();
   await boxes[1].check();
@@ -786,6 +789,105 @@ async function suiteShareOneRecipe(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+async function suiteLiveListNotWiped(browser) {
+  group('a list someone is shopping from is not thrown away');
+  // The incident this exists for: a trolley half ticked, and a refresh — local or
+  // arriving from another phone — replacing the list underneath it. The merge rules
+  // are unit-tested; what needs a browser is whether the app actually WIRES them:
+  // that opening the tab no longer regenerates over a live list, and that when a trip
+  // is replaced anyway the previous one can be put back.
+  const file = instrument('live-list-hook.html',
+    'window.__t = { trip: () => tripIdOf(shoppingData), data: () => JSON.parse(JSON.stringify(shoppingData)),' +
+    '               mergeRemote: d => mergeRemoteShopping(d) };');
+  const srv = await serve(8180, file);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  page.on('dialog', d => d.accept());
+  const ticks = () => page.evaluate(() => window.__t.data().shoppingList.filter(l => l.checked).length);
+  const trip = () => page.evaluate(() => window.__t.trip());
+  try {
+    await page.goto('http://localhost:8180/', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1800);
+    await buildAList(page);
+
+    const rows = await page.$$('.shop-row');
+    for (let i = 0; i < 3; i++) { await rows[i].$eval('input[type=checkbox]', c => c.click()); await page.waitForTimeout(120); }
+    const liveTrip = await trip();
+    ok('three items are in the trolley', await ticks() === 3, await ticks());
+
+    /* --- someone changes the week's picks while that is going on --- */
+    await page.click('#mainNav button[data-tab="start"]');
+    await page.waitForTimeout(400);
+    const boxes = await page.$$('#app input[type=checkbox]');
+    await boxes[2].check();
+    await page.waitForTimeout(400);
+    await page.click('#mainNav button[data-tab="review"]');
+    await page.waitForTimeout(600);
+
+    ok('opening the tab no longer rebuilds the list out from under the shopper',
+       await trip() === liveTrip, { was: liveTrip, now: await trip() });
+    ok('the ticks are all still there', await ticks() === 3, await ticks());
+    const banner = await page.evaluate(() => {
+      const c = [...document.querySelectorAll('#app .notice-card')]
+        .find(n => /recipes have changed/i.test(n.innerText));
+      return c ? c.innerText : null;
+    });
+    ok('and it says why it has not refreshed', !!banner && /shopping from it/i.test(banner), banner);
+    ok('naming what a refresh would cost', !!banner && /3 item\(s\) ticked/.test(banner), banner);
+
+    /* --- doing it deliberately still works, and is recoverable --- */
+    await page.click('#app .notice-card button:has-text("Make a new list anyway")');
+    await page.waitForTimeout(600);
+    const newTrip = await trip();
+    ok('a deliberate refresh does start a new trip', newTrip !== liveTrip, newTrip);
+    ok('which is what clears the ticks', await ticks() === 0, await ticks());
+    ok('the new trip records the one it replaced',
+       await page.evaluate(() => window.__t.data().weekPlan.supersedes) === liveTrip);
+
+    const undo = await page.evaluate(() => {
+      const c = [...document.querySelectorAll('#app .notice-card')]
+        .find(n => /had your ticks on it was replaced/i.test(n.innerText));
+      return c ? c.innerText : null;
+    });
+    ok('and the replaced list is offered back', !!undo && /3 item\(s\) ticked/.test(undo), undo);
+
+    await page.click('#app .notice-card button:has-text("Put back the list that was replaced")');
+    await page.waitForTimeout(600);
+    ok('putting it back brings the ticks with it', await ticks() === 3, await ticks());
+    const backTrip = await trip();
+    ok('as a trip that deliberately replaces the one that displaced it',
+       await page.evaluate(() => window.__t.data().weekPlan.supersedes) === newTrip);
+    ok('under a new id, so the discarded list cannot merge back in', backTrip !== newTrip && backTrip !== liveTrip);
+    ok('the undo offer is gone once it has been taken',
+       await page.evaluate(() => ![...document.querySelectorAll('#app .notice-card')]
+         .some(n => /had your ticks on it was replaced/i.test(n.innerText))));
+
+    /* --- and the same protection against a copy arriving from another phone --- */
+    const survived = await page.evaluate(() => {
+      const mine = window.__t.data();
+      // A phone that has not caught up: newer trip, newer clock, nothing ticked, and
+      // no idea the live trip exists.
+      const stale = JSON.parse(JSON.stringify(mine));
+      stale.weekPlan.tripId = 'trip:stale-phone';
+      stale.weekPlan.generatedAt = new Date(Date.now() + 1000).toISOString();
+      stale.weekPlan.supersedes = 'trip:from-last-week';
+      stale.weekPlan.basedOn = new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString();
+      stale.lastUpdated = new Date(Date.now() + 1000).toISOString();
+      stale.shoppingList = stale.shoppingList.map(l => Object.assign({}, l, {
+        checked: false, checkedAt: undefined
+      }));
+      window.__t.mergeRemote(stale);
+      return { trip: window.__t.trip(), ticks: window.__t.data().shoppingList.filter(l => l.checked).length };
+    });
+    await page.waitForTimeout(300);
+    ok('a stale copy from another phone does not take the trip over',
+       survived.trip === backTrip, survived.trip);
+    ok('and the trolley is untouched by it', survived.ticks === 3, survived.ticks);
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 /* ---------- run ---------- */
 
 (async () => {
@@ -796,7 +898,7 @@ async function suiteShareOneRecipe(browser) {
     // remaining suites still have something useful to say about the build.
     for (const suite of [suiteTicksSurviveRebuild, suiteRemoteMergeKeepsTicks,
                          suiteWriteSplitting, suiteStapleQuantities, suiteTypingIsNotInterrupted,
-                         suiteBulkDelete, suiteShareOneRecipe,
+                         suiteBulkDelete, suiteShareOneRecipe, suiteLiveListNotWiped,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
       catch (e) {
