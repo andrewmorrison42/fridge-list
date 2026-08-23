@@ -133,6 +133,31 @@ function watchErrors(page, sink) {
   });
 }
 
+/* Wait until the app is up AND is going to stay up.
+
+   Two things make a fixed wait after goto() a gamble, and three suites flaked on
+   1800ms during one session:
+
+     - startup begins at DOMContentLoaded, which waits on the MSAL script from a CDN
+       that sandboxes and CI machines block, so how long that request takes to FAIL
+       decides how long startup takes;
+     - on a fresh context the service worker takes control a moment after the first
+       paint, and `controllerchange` reloads the page once. A click landing in that
+       gap talks to a document that is about to be thrown away — which is what the
+       flakes actually were.
+
+   So: wait for the worker to be in control (it cannot reload for that reason again),
+   then for the app to have painted. If no worker ever takes control, fall through and
+   just wait for paint. */
+async function waitForApp(page) {
+  await page.waitForFunction(
+    () => !('serviceWorker' in navigator) || !!navigator.serviceWorker.controller,
+    null, { timeout: 15000 }).catch(() => {});
+  await page.waitForFunction(
+    () => { const a = document.getElementById('app'); return !!a && a.children.length > 0; },
+    null, { timeout: 30000 });
+}
+
 // Pick two recipes and land on the shopping list.
 async function buildAList(page) {
   await page.click('#mainNav button[data-tab="start"]');
@@ -160,7 +185,7 @@ async function suiteTicksSurviveRebuild(browser) {
   const errs = []; watchErrors(page, errs);
   try {
     await page.goto('http://localhost:8171/', { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(1800);
+    await waitForApp(page);
     await buildAList(page);
 
     const rows = await page.$$('.shop-row');
@@ -212,7 +237,7 @@ async function suiteRemoteMergeKeepsTicks(browser) {
   const errs = []; watchErrors(page, errs);
   try {
     await page.goto('http://localhost:8172/', { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(1800);
+    await waitForApp(page);
     await buildAList(page);
 
     const rows = await page.$$('.shop-row');
@@ -261,7 +286,7 @@ async function suiteWriteSplitting(browser) {
   const errs = []; watchErrors(page, errs);
   try {
     await page.goto('http://localhost:8173/', { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(1800);
+    await waitForApp(page);
     await buildAList(page);
 
     await page.evaluate(() => window.__t.reset());
@@ -290,7 +315,7 @@ async function suiteStapleQuantities(browser) {
   const errs = []; watchErrors(page, errs);
   try {
     await page.goto('http://localhost:8176/', { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(1800);
+    await waitForApp(page);
 
     // The staples list is feature-gated. Ensure it ends up ON rather than blindly
     // toggling — it already ships enabled in the seed data, so a click would turn it off.
@@ -411,7 +436,7 @@ async function suiteTypingIsNotInterrupted(browser) {
   const errs = []; watchErrors(page, errs);
   try {
     await page.goto('http://localhost:8177/', { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(1800);
+    await waitForApp(page);
 
     for (const [tab, sel, label] of [['needed', '#app input[type=text]', 'wait list box'],
                                      ['recipes', '#app input[type=search]', 'recipe search']]) {
@@ -482,7 +507,7 @@ async function suiteBulkDelete(browser) {
     [...document.querySelectorAll('#modalRoot button')].find(b => /snapshot/i.test(b.textContent)).disabled);
   try {
     await page.goto('http://localhost:8178/', { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(1800);
+    await waitForApp(page);
     const total = await page.evaluate(() => window.__t.recipeCount());
     ok('the seed has recipes to work with', total > 100, total);
 
@@ -516,7 +541,7 @@ async function suiteBulkDelete(browser) {
 
     // Now the real path, on a fresh load so the snapshot function is restored.
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(1800);
+    await waitForApp(page);
     await openPicker();
     await page.fill('#app input[type=search]', 'chicken');
     await page.waitForTimeout(300);
@@ -578,7 +603,7 @@ async function suitePrinting(browser) {
       window.print = function () { window.__printCalls.push(document.body.className); };
     });
     await page.goto('http://localhost:8174/', { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(1800);
+    await waitForApp(page);
     await buildAList(page);
 
     for (const [tab, label, section] of [
@@ -698,7 +723,7 @@ async function suiteShareOneRecipe(browser) {
       try { delete Navigator.prototype.canShare; } catch (e) {}
     });
     await page.goto('http://localhost:8179/', { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(1800);
+    await waitForApp(page);
 
     await page.click('#mainNav button[data-tab="recipes"]');
     await page.waitForTimeout(400);
@@ -790,12 +815,12 @@ async function suiteShareOneRecipe(browser) {
 }
 
 async function suiteLiveListNotWiped(browser) {
-  group('a list someone is shopping from is not thrown away');
-  // The incident this exists for: a trolley half ticked, and a refresh — local or
-  // arriving from another phone — replacing the list underneath it. The merge rules
-  // are unit-tested; what needs a browser is whether the app actually WIRES them:
-  // that opening the tab no longer regenerates over a live list, and that when a trip
-  // is replaced anyway the previous one can be put back.
+  group('the week\'s recipes are fixed while a shop is under way');
+  // v21.9 replaced a negotiation with a rule. Changing the week's picks mid-shop was
+  // the only ordinary way to end up with two lists, so the picks are simply frozen
+  // until the shop is finished; the Wait List remains the way to add something. What
+  // needs a browser is that the freeze is real, that the Wait List still gets through
+  // with the ticks intact, and that finishing the shop lifts it.
   const file = instrument('live-list-hook.html',
     'window.__t = { trip: () => tripIdOf(shoppingData), data: () => JSON.parse(JSON.stringify(shoppingData)),' +
     '               mergeRemote: d => mergeRemoteShopping(d) };');
@@ -806,89 +831,116 @@ async function suiteLiveListNotWiped(browser) {
   page.on('dialog', d => d.accept());
   const ticks = () => page.evaluate(() => window.__t.data().shoppingList.filter(l => l.checked).length);
   const trip = () => page.evaluate(() => window.__t.trip());
+  const startTabState = async () => {
+    await page.click('#mainNav button[data-tab="start"]');
+    await page.waitForSelector('#app input[type=checkbox]', { timeout: 15000 });
+    return page.evaluate(() => ({
+      notice: (([...document.querySelectorAll('#app .notice-card')]
+        .find(n => /shop is under way/i.test(n.innerText)) || {}).innerText) || null,
+      pickDisabled: [...document.querySelectorAll('#app .recipe-card input[type=checkbox]')].every(c => c.disabled),
+      clearDisabled: !![...document.querySelectorAll('#app button')]
+        .find(b => /Clear all selections/.test(b.textContent) && b.disabled)
+    }));
+  };
   try {
     await page.goto('http://localhost:8180/', { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(1800);
+    await waitForApp(page);
     await buildAList(page);
-
     const rows = await page.$$('.shop-row');
     for (let i = 0; i < 3; i++) { await rows[i].$eval('input[type=checkbox]', c => c.click()); await page.waitForTimeout(120); }
     const liveTrip = await trip();
     ok('three items are in the trolley', await ticks() === 3, await ticks());
 
-    /* --- someone changes the week's picks while that is going on --- */
-    await page.click('#mainNav button[data-tab="start"]');
-    await page.waitForTimeout(400);
-    const boxes = await page.$$('#app input[type=checkbox]');
-    await boxes[2].check();
+    /* --- the picks are frozen, and the tab says why --- */
+    const locked = await startTabState();
+    ok('the week\'s recipes cannot be changed mid-shop', locked.pickDisabled === true);
+    ok('nor cleared', locked.clearDisabled === true);
+    ok('and the tab explains it rather than just refusing', !!locked.notice, locked.notice);
+    ok('naming what is in the trolley', !!locked.notice && /3 item\(s\)/.test(locked.notice), locked.notice);
+    ok('and pointing at the Wait List instead',
+       !!locked.notice && /Wait List/i.test(locked.notice), locked.notice);
+    ok('with the way out named too',
+       !!locked.notice && /Shopping is done/i.test(locked.notice), locked.notice);
+
+    /* --- the Wait List is still the way to add something --- */
+    await page.click('#mainNav button[data-tab="needed"]');
+    await page.waitForTimeout(300);
+    await page.fill('#app input[type=text]', 'kitchen roll');
+    await page.click('#app >> text="Add to wait list"');
     await page.waitForTimeout(400);
     await page.click('#mainNav button[data-tab="review"]');
-    await page.waitForTimeout(600);
+    await page.waitForTimeout(700);
+    ok('a Wait List item still reaches the list mid-shop',
+       await page.evaluate(() => window.__t.data().shoppingList.some(l => /kitchen roll/i.test(l.ingredientName))));
+    ok('without ending the trip', await trip() === liveTrip, { was: liveTrip, now: await trip() });
+    ok('and without costing a single tick', await ticks() === 3, await ticks());
 
-    ok('opening the tab no longer rebuilds the list out from under the shopper',
-       await trip() === liveTrip, { was: liveTrip, now: await trip() });
-    ok('the ticks are all still there', await ticks() === 3, await ticks());
-    const banner = await page.evaluate(() => {
-      const c = [...document.querySelectorAll('#app .notice-card')]
-        .find(n => /recipes have changed/i.test(n.innerText));
-      return c ? c.innerText : null;
+    /* --- a phone that never saw this list still cannot take it over --- */
+    const afterStale = await page.evaluate(() => {
+      const stale = window.__t.data();
+      stale.weekPlan.tripId = 'trip:stale-phone';
+      stale.weekPlan.generatedAt = new Date(Date.now() + 1000).toISOString();
+      stale.weekPlan.supersedes = 'trip:from-last-week';
+      stale.weekPlan.basedOn = new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString();
+      stale.lastUpdated = new Date(Date.now() + 1000).toISOString();
+      stale.shoppingList = stale.shoppingList.map(l => Object.assign({}, l, { checked: false, checkedAt: undefined }));
+      window.__t.mergeRemote(stale);
+      return { trip: window.__t.trip(), ticks: window.__t.data().shoppingList.filter(l => l.checked).length };
     });
-    ok('and it says why it has not refreshed', !!banner && /shopping from it/i.test(banner), banner);
-    ok('naming what a refresh would cost', !!banner && /3 item\(s\) ticked/.test(banner), banner);
+    ok('a stale copy from another phone does not take the trip over', afterStale.trip === liveTrip, afterStale.trip);
+    ok('and the trolley is untouched by it', afterStale.ticks === 3, afterStale.ticks);
 
-    /* --- doing it deliberately still works, and is recoverable --- */
-    await page.click('#app .notice-card button:has-text("Make a new list anyway")');
-    await page.waitForTimeout(600);
-    const newTrip = await trip();
-    ok('a deliberate refresh does start a new trip', newTrip !== liveTrip, newTrip);
+    /* --- one that deliberately replaces it does, and can be put back --- */
+    await page.evaluate(() => {
+      const other = window.__t.data();
+      other.weekPlan.tripId = 'trip:replacement';
+      other.weekPlan.supersedes = window.__t.trip();     // a device that could see ours
+      other.weekPlan.generatedAt = new Date().toISOString();
+      other.weekPlan.basedOn = new Date().toISOString();
+      other.lastUpdated = new Date(Date.now() + 1000).toISOString();
+      other.shoppingList = other.shoppingList.map(l => Object.assign({}, l, { checked: false, checkedAt: undefined }));
+      window.__t.mergeRemote(other);
+    });
+    await page.waitForTimeout(500);
+    ok('a deliberate replacement from another phone is taken', await trip() === 'trip:replacement', await trip());
     ok('which is what clears the ticks', await ticks() === 0, await ticks());
-    ok('the new trip records the one it replaced',
-       await page.evaluate(() => window.__t.data().weekPlan.supersedes) === liveTrip);
-
     const undo = await page.evaluate(() => {
       const c = [...document.querySelectorAll('#app .notice-card')]
         .find(n => /had your ticks on it was replaced/i.test(n.innerText));
       return c ? c.innerText : null;
     });
     ok('and the replaced list is offered back', !!undo && /3 item\(s\) ticked/.test(undo), undo);
+    ok('with no offer anywhere to build yet another list',
+       await page.evaluate(() => ![...document.querySelectorAll('#app button')]
+         .some(b => /make a new list/i.test(b.textContent))));
 
     await page.click('#app .notice-card button:has-text("Put back the list that was replaced")');
     await page.waitForTimeout(600);
     ok('putting it back brings the ticks with it', await ticks() === 3, await ticks());
-    const backTrip = await trip();
     ok('as a trip that deliberately replaces the one that displaced it',
-       await page.evaluate(() => window.__t.data().weekPlan.supersedes) === newTrip);
-    ok('under a new id, so the discarded list cannot merge back in', backTrip !== newTrip && backTrip !== liveTrip);
-    ok('the undo offer is gone once it has been taken',
-       await page.evaluate(() => ![...document.querySelectorAll('#app .notice-card')]
-         .some(n => /had your ticks on it was replaced/i.test(n.innerText))));
+       await page.evaluate(() => window.__t.data().weekPlan.supersedes) === 'trip:replacement');
 
-    /* --- and the same protection against a copy arriving from another phone --- */
-    const survived = await page.evaluate(() => {
-      const mine = window.__t.data();
-      // A phone that has not caught up: newer trip, newer clock, nothing ticked, and
-      // no idea the live trip exists.
-      const stale = JSON.parse(JSON.stringify(mine));
-      stale.weekPlan.tripId = 'trip:stale-phone';
-      stale.weekPlan.generatedAt = new Date(Date.now() + 1000).toISOString();
-      stale.weekPlan.supersedes = 'trip:from-last-week';
-      stale.weekPlan.basedOn = new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString();
-      stale.lastUpdated = new Date(Date.now() + 1000).toISOString();
-      stale.shoppingList = stale.shoppingList.map(l => Object.assign({}, l, {
-        checked: false, checkedAt: undefined
-      }));
-      window.__t.mergeRemote(stale);
-      return { trip: window.__t.trip(), ticks: window.__t.data().shoppingList.filter(l => l.checked).length };
-    });
-    await page.waitForTimeout(300);
-    ok('a stale copy from another phone does not take the trip over',
-       survived.trip === backTrip, survived.trip);
-    ok('and the trolley is untouched by it', survived.ticks === 3, survived.ticks);
+    /* --- finishing the shop is what frees the recipes again --- */
+    await page.click('#app button:has-text("Shopping is done")');
+    await page.waitForTimeout(700);
+    const unlocked = await startTabState();
+    ok('finishing the shop unfreezes the week\'s recipes', unlocked.pickDisabled === false);
+    ok('and the notice goes with it', unlocked.notice === null, unlocked.notice);
+    ok('Clear all selections works again', unlocked.clearDisabled === false);
+
+    const boxes = await page.$$('#app .recipe-card input[type=checkbox]');
+    await boxes[2].check();
+    await page.waitForTimeout(400);
+    await page.click('#mainNav button[data-tab="review"]');
+    await page.waitForTimeout(700);
+    ok('and the next list is generated from the new picks',
+       await page.evaluate(() => window.__t.data().shoppingList.length) > 0);
+    ok('on a trip of its own', await trip() !== 'trip:replacement');
     ok('no console errors', errs.length === 0, errs);
   } finally { await ctx.close(); await srv.close(); }
 }
 
-/* ---------- run ---------- */
+/* ---------- run ---------- *//* ---------- run ---------- */
 
 (async () => {
   console.log('Chromium: ' + EXECUTABLE);

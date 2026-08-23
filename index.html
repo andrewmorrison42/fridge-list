@@ -212,6 +212,11 @@ footer.actions{position:sticky;bottom:0;background:var(--bg);border-top:1px soli
 .sync-alert .hint{opacity:.9;font-size:.82rem;}
 /* A card that is telling you something has happened, or is about to. */
 .notice-card{border-left:4px solid var(--warn);}
+/* Anything switched off has to LOOK switched off, or the app just seems broken —
+   which is the whole complaint the frozen picks were meant to answer. */
+.btn:disabled,.btn:disabled:hover{opacity:.45;cursor:not-allowed;background:var(--border);
+  color:var(--muted);border-color:var(--border);}
+input:disabled,select:disabled{opacity:.55;cursor:not-allowed;background:#f2f0ea;}
 
 /* --- trolley screen (v20) ---
    Touch targets sized to the 44px/48dp platform minimum, and the item NAME is the
@@ -330,7 +335,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v21.8';
+const APP_VERSION = 'v21.9';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -367,9 +372,13 @@ function loadUiState(){
 }
 
 // True while there is a shopping trip actually underway on this device.
+/* Is a shop under way right now? One definition, used by everything that has to know:
+   the week's picks are frozen while it is true, the Review tab will not rebuild the
+   list, and the page will not auto-reload underneath it. It ends when somebody taps
+   "Shopping is done", and it lapses on its own six hours after the last tick so a trip
+   nobody closed cannot freeze next week. */
 function shoppingInProgress(){
-  return !!(shoppingData && shoppingData.shoppingList
-            && shoppingData.shoppingList.some(l=> l.checked && !l.removed));
+  return tripIsLive(shoppingData);
 }
 
 function deviceId(){
@@ -1295,7 +1304,7 @@ function tripProgress(sd){
   const lines = (sd && sd.shoppingList) || [];
   let ticks = 0, newestAt = 0;
   lines.forEach(l=>{
-    if(!l.checked) return;
+    if(!l.checked || l.removed) return;   // "in the trolley", same sense as the progress bar
     ticks++;
     const t = tsOf(l.checkedAt || l.changedAt);   // changedAt: ticks from pre-v21 builds
     if(t > newestAt) newestAt = t;
@@ -3014,21 +3023,39 @@ function slugify(name){
 /* ---- Start New Shopping List tab ---- */
 function renderStartTab(){
   const container = el('div',{});
+
+  /* v21.9: once a shop is under way the week's recipes are fixed, and this tab says so
+     rather than letting somebody change them and then negotiating about whose list
+     survives. Changing the picks mid-shop was the only ordinary way to end up with two
+     lists at once, and asking people to choose between them — which is what the
+     previous build did — confused everyone it was meant to protect. There is nothing
+     to choose now: add to the Wait List instead, which reaches the shopper in seconds
+     and keeps their ticks, and the picks are free again the moment the shop is
+     finished. */
+  const shopping = shoppingInProgress();
+  if(shopping){
+    const p = tripProgress(shoppingData);
+    const card = el('div',{class:'card notice-card'});
+    card.appendChild(el('p',{style:'margin-top:0;'},[
+      el('strong',{},['A shop is under way — ' + p.ticks + ' item(s) already in the trolley.'])
+    ]));
+    card.appendChild(el('p',{class:'muted', style:'margin-bottom:0;'},[
+      'This week’s recipes are fixed until it is finished, so nobody’s list changes while '
+      + 'they are walking round the shop. Something else needed? Put it on the '
+      + 'Wait List — it reaches the shopper straight away. When the shopping is done, tap '
+      + '“Shopping is done” on the Review tab and the recipes can be changed again.'
+    ]));
+    container.appendChild(card);
+  }
+
   container.appendChild(el('div',{class:'card'},[
     el('p',{},['Pick the recipes you want to cook this week. Starting a new list clears last week’s selections and the generated shopping list — your Wait List is untouched.']),
     (function(){
       const btn = el('button',{class:'btn secondary'},['Clear all selections']);
+      btn.disabled = shopping;
       btn.addEventListener('click', ()=>{
         if(shoppingData.weekPlan.selections.length===0 && shoppingData.shoppingList.length===0) return;
-        // Clearing while somebody is mid-shop is the same destructive act as replacing
-        // their list, so it gets the same warning naming what it costs.
-        const live = tripIsLive(shoppingData) ? tripProgress(shoppingData) : null;
-        const warning = live
-          ? 'Somebody is shopping from this list right now — ' + live.ticks + ' item(s) ticked.\n\n'
-            + 'Clearing it empties their list too. Clear it anyway?'
-          : 'Clear this week’s selected recipes and shopping list? Your Wait List will not be affected.';
-        if(!confirm(warning)) return;
-        if(live) stashReplacedTrip(shoppingData);
+        if(!confirm('Clear this week’s selected recipes and shopping list? Your Wait List will not be affected.')) return;
         shoppingData.weekPlan = { selections: [], generatedAt: null };
         shoppingData.shoppingList = [];
         persist('shopping');
@@ -3077,6 +3104,7 @@ function renderStartTab(){
       if(r && r.category) nm.appendChild(el('span',{class:'muted'},[' · ' + r.category]));
       row.appendChild(nm);
       const serv = el('input',{type:'number', class:'qty-input', min:'1', value: sel.servings || 4});
+      serv.disabled = shopping;
       serv.addEventListener('change', ()=>{
         sel.servings = parseInt(serv.value,10) || (r && r.servings) || 4;
         persist('shopping');
@@ -3085,6 +3113,7 @@ function renderStartTab(){
       row.appendChild(el('span',{class:'muted'},['serves']));
       row.appendChild(serv);
       const drop = el('button',{class:'btn tap secondary', title:'Remove from this week'},['Remove']);
+      drop.disabled = shopping;
       drop.addEventListener('click', ()=>{
         shoppingData.weekPlan.selections = shoppingData.weekPlan.selections.filter(x=>x.recipeId!==sel.recipeId);
         persist('shopping');
@@ -3111,8 +3140,9 @@ function renderStartTab(){
       const sel = shoppingData.weekPlan.selections.find(s=>s.recipeId===r.id);
       const cb = el('input',{type:'checkbox'});
       cb.checked = selected;
+      cb.disabled = shopping;
       const servInput = el('input',{type:'number', class:'qty-input', min:'1', value: (sel?sel.servings:defaultShoppingServings(r))||4, style:'width:60px;margin-left:8px;'});
-      servInput.disabled = !selected;
+      servInput.disabled = shopping || !selected;
       cb.addEventListener('change', ()=>{
         if(cb.checked){
           shoppingData.weekPlan.selections.push({recipeId:r.id, servings: parseInt(servInput.value,10)||defaultShoppingServings(r)});
@@ -3120,7 +3150,7 @@ function renderStartTab(){
           shoppingData.weekPlan.selections = shoppingData.weekPlan.selections.filter(s=>s.recipeId!==r.id);
         }
         persist('shopping');
-        servInput.disabled = !cb.checked;
+        servInput.disabled = shopping || !cb.checked;
         updateCountLabel();
         drawPicked();
       });
@@ -3241,37 +3271,27 @@ function renderReviewTab(){
      is progress to lose, the refresh waits for a deliberate tap. Same-trip refreshes (a
      Wait List addition, a staple amount) carry every tick across, so those still happen
      on their own — that is how "grab shampoo too" reaches someone already in the shop. */
-  let heldBackRefresh = null;
+  let heldBackRefresh = false;
   if(shoppingListIsStale()){
-    if(!sameTripRebuild() && tripIsLive(shoppingData)){
-      heldBackRefresh = tripProgress(shoppingData);
-    } else {
-      generateShoppingList();
-    }
+    if(!sameTripRebuild() && shoppingInProgress()) heldBackRefresh = true;
+    else generateShoppingList();
   }
 
+  /* The week's recipes are fixed on this build while a shop is under way, so reaching
+     here means they were changed somewhere this device cannot see — a phone on an older
+     build, or one that was offline when they were changed. The list stays as it is
+     either way. There is deliberately no button offering to rebuild it: that offer was
+     the confusing part, and "Shopping is done" is the honest way out. */
   if(heldBackRefresh){
     const card = el('div',{class:'card notice-card'});
     card.appendChild(el('p',{style:'margin-top:0;'},[
-      el('strong',{},['The week’s recipes have changed since this list was made.'])
+      el('strong',{},['The week’s recipes were changed somewhere else.'])
     ]));
-    const when = heldBackRefresh.newestAt ? new Date(heldBackRefresh.newestAt).toLocaleTimeString() : null;
-    card.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
-      'This list has not been refreshed, because somebody is shopping from it: '
-      + heldBackRefresh.ticks + ' item(s) ticked'
-      + (when ? ', the last at ' + when : '') + '. '
-      + 'Making a new list would throw those ticks away, on their phone as well as this one.'
+    card.appendChild(el('p',{class:'muted', style:'margin-bottom:0;'},[
+      'This list is left exactly as it is while you are shopping from it. Tap '
+      + '“Shopping is done” when you have finished, and the new recipes will be used '
+      + 'for the next list.'
     ]));
-    const newBtn = el('button',{class:'btn'},['Make a new list anyway']);
-    newBtn.addEventListener('click', ()=>{
-      if(!confirm('Make a new shopping list?\n\nThe list being shopped right now — '
-                  + heldBackRefresh.ticks + ' item(s) already ticked — is replaced, on every phone.'
-                  + '\n\nIf that turns out to be a mistake, "Put back the list that was replaced" appears here afterwards.')) return;
-      generateShoppingList();
-      render();
-      setStatus('New shopping list made — the previous one can still be put back.', 'ok');
-    });
-    card.appendChild(newBtn);
     container.appendChild(card);
   }
 

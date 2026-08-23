@@ -211,10 +211,11 @@ shop, keep ticking anyway — it catches up when the signal returns.
 The list being shopped from is protected. Once anything on it has been ticked, the app
 treats it as a trolley somewhere in a supermarket:
 
-- **Opening Review no longer rebuilds it.** If somebody changes the week's recipes while
-  a shop is under way, the list stays as it is and a note appears saying why, with a
-  **Make a new list anyway** button. Nothing is lost by accident just because someone
-  opened a tab.
+- **The week's recipes are fixed.** Once anything is ticked, the Start New Shopping List
+  tab greys out the recipe picks and says why. Nobody can change the list somebody is
+  walking round a shop with — not by accident, and not on purpose.
+- **The Wait List is how you add something.** It reaches the shopper within seconds and
+  keeps every tick they have made. That is the answer to "can you get bin bags too".
 - **A phone that has not caught up cannot replace it.** This used to be the one that hurt
   — a phone waking up with last week's picks would generate its own list, and because
   that list was newer by the clock it won. It no longer does.
@@ -225,8 +226,10 @@ If a list does get replaced — deliberately, or by another phone — the Review
 **Put back the list that was replaced**, ticks and all. That offer lasts until you close
 the page, so take it while you are looking at it.
 
-When you finish, tap **Shopping is done**. That ends the trip properly and leaves the
-next list free to be made without any warnings.
+When you finish, tap **Shopping is done**. That ends the trip, frees the week's recipes
+to be changed again, and lets the next list be made. If everyone forgets, the app
+unfreezes on its own six hours after the last tick, so a shop nobody closed can never
+block next week.
 
 ---
 
