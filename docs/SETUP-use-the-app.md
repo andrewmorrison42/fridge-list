@@ -206,6 +206,30 @@ shop, keep ticking anyway — it catches up when the signal returns.
 
 ---
 
+## While someone is shopping
+
+The list being shopped from is protected. Once anything on it has been ticked, the app
+treats it as a trolley somewhere in a supermarket:
+
+- **Opening Review no longer rebuilds it.** If somebody changes the week's recipes while
+  a shop is under way, the list stays as it is and a note appears saying why, with a
+  **Make a new list anyway** button. Nothing is lost by accident just because someone
+  opened a tab.
+- **A phone that has not caught up cannot replace it.** This used to be the one that hurt
+  — a phone waking up with last week's picks would generate its own list, and because
+  that list was newer by the clock it won. It no longer does.
+- **Wait List additions still get through.** Adding something mid-shop updates the list
+  in place and keeps every tick, so "grab shampoo while you're there" still works.
+
+If a list does get replaced — deliberately, or by another phone — the Review tab offers
+**Put back the list that was replaced**, ticks and all. That offer lasts until you close
+the page, so take it while you are looking at it.
+
+When you finish, tap **Shopping is done**. That ends the trip properly and leaves the
+next list free to be made without any warnings.
+
+---
+
 ## Sending one recipe to someone
 
 Open the recipe and tap **Share** at the bottom of it. Two choices:

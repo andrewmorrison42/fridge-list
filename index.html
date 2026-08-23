@@ -210,6 +210,8 @@ footer.actions{position:sticky;bottom:0;background:var(--bg);border-top:1px soli
 .sync-alert.pending{background:#f0c98a;color:#4a3208;}
 .sync-alert strong{display:block;font-size:.95rem;margin-bottom:2px;}
 .sync-alert .hint{opacity:.9;font-size:.82rem;}
+/* A card that is telling you something has happened, or is about to. */
+.notice-card{border-left:4px solid var(--warn);}
 
 /* --- trolley screen (v20) ---
    Touch targets sized to the 44px/48dp platform minimum, and the item NAME is the
@@ -328,7 +330,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v21.7';
+const APP_VERSION = 'v21.8';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -407,6 +409,11 @@ let oneDrivePollTimer = null;
 // reload share it so two merges can never interleave on shoppingData.
 let syncInFlight = false;
 let oneDriveLastModified = {}; // { 'recipes-data.json': isoString, 'shopping-list.json': isoString }
+/* v21.8: the newest shared shopping state this device has actually read. Not the
+   same as shoppingData.lastUpdated, which our own local saves move forward — this
+   only advances when we have genuinely seen someone else's copy, which is what
+   makes it a usable measure of how caught-up this device was. */
+let shoppingSeenRemoteAt = null;
 let currentTab = 'recipes';
 let editingRecipeId = null; // null = not editing, 'new' = creating
 
@@ -795,7 +802,7 @@ async function loadFromFolderOrSeed(){
     // over shoppingData — the same tick-destroying bug v21.0 fixed on the OneDrive side,
     // left live here. Going through applyMergedShopping also repaints, so the rendered
     // rows can't be left pointing at the discarded object graph.
-    if(sFile){ applyMergedShopping(mergeShoppingData(shoppingData, JSON.parse(sFile))); }
+    if(sFile){ mergeRemoteShopping(JSON.parse(sFile)); }
     else { await writeFileToFolder('shopping-list.json', JSON.stringify(shoppingData)); }
     if(recipesChanged) repaintWhenSafe();
   }catch(e){
@@ -1067,7 +1074,7 @@ async function loadFromOneDriveOrSeed(){
       // survive reconnection instead of being wiped by the remote copy. applyMergedShopping
       // repaints by itself when the shopping data moved, so only a recipes change is
       // still owed one here.
-      applyMergedShopping(mergeShoppingData(shoppingData, JSON.parse(sText)));
+      mergeRemoteShopping(JSON.parse(sText));
     } else {
       await writeOneDriveFile(driveId, itemId, 'shopping-list.json', JSON.stringify(shoppingData));
     }
@@ -1275,6 +1282,83 @@ function tripIdOf(sd){
   return wp.tripId || (wp.generatedAt ? 'gen:' + wp.generatedAt : null);
 }
 
+/* ---- v21.8: is anyone actually shopping from this list? ----
+   Ticks are the only honest signal available. A list with recent ticks on it is a
+   trolley somewhere in a supermarket, and nothing generated elsewhere gets to replace
+   it. Recency counts as much as the count does: last week's list, ticked and never
+   marked done, must not block this week's new one for ever. All three read only what
+   is already in the file — no new fields — so they judge copies written by older
+   builds exactly as well as new ones. */
+const TRIP_LIVE_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+function tripProgress(sd){
+  const lines = (sd && sd.shoppingList) || [];
+  let ticks = 0, newestAt = 0;
+  lines.forEach(l=>{
+    if(!l.checked) return;
+    ticks++;
+    const t = tsOf(l.checkedAt || l.changedAt);   // changedAt: ticks from pre-v21 builds
+    if(t > newestAt) newestAt = t;
+  });
+  return { ticks: ticks, newestAt: newestAt };
+}
+
+function tripHasProgress(sd){
+  if(!sd || !sd.weekPlan || sd.weekPlan.shoppingDoneAt) return false;
+  return tripProgress(sd).ticks > 0;
+}
+
+// A trip nobody has ticked in six hours is not a trip anybody is still shopping.
+// Ticks with no stamp at all are treated as live: the cost of being wrong is one
+// visible "start a new list anyway" tap, and the cost the other way is a wiped trolley.
+function tripIsLive(sd, now){
+  if(!tripHasProgress(sd)) return false;
+  const p = tripProgress(sd);
+  if(!p.newestAt) return true;
+  return ((now || Date.now()) - p.newestAt) <= TRIP_LIVE_WINDOW_MS;
+}
+
+/* ---- v21.8: which of two DIFFERENT trips is the real one ----
+
+   Until now this was "whichever was generated later, wholesale", and that one line
+   cost a family a shopping trip: a phone that had not caught up regenerated from last
+   week's picks, its trip was newer by the clock, and a half-ticked trolley was thrown
+   away. "Later" cannot tell a deliberate replacement from a list built in ignorance,
+   so trips now carry enough to tell the difference:
+
+     weekPlan.supersedes — the trip this one was generated on top of. Present only when
+                           the generating device could actually see that trip.
+     weekPlan.basedOn    — how caught-up that device was, as the lastUpdated of the
+                           newest shared copy it had read.
+
+   Both are additive and optional: a copy from an older build simply has neither, and
+   is judged on progress alone, which is the safe side to be on. */
+function chooseTripWinner(a, b, aGen, bGen, primary, now){
+  const aTrip = tripIdOf(a), bTrip = tripIdOf(b);
+  const aWp = a.weekPlan || {}, bWp = b.weekPlan || {};
+
+  // 1. Deliberate replacement. One of them was generated by someone looking at the
+  //    other, which is a person deciding this list is finished with — and on this
+  //    build that decision came with a warning naming the ticks it would cost.
+  const aReplacesB = !!bTrip && aWp.supersedes === bTrip;
+  const bReplacesA = !!aTrip && bWp.supersedes === aTrip;
+  if(aReplacesB !== bReplacesA) return aReplacesB ? a : b;
+
+  // 2. Neither knew the other, so this is a fork rather than a replacement. A list
+  //    nobody has shopped from never replaces one somebody is shopping from.
+  const aLive = tripIsLive(a, now), bLive = tripIsLive(b, now);
+  if(aLive !== bLive) return aLive ? a : b;
+
+  // 3. Two forks, neither being shopped: the one generated from fresher shared data
+  //    wins. This is the stale device losing on the only ground that distinguishes it.
+  const aBased = tsOf(aWp.basedOn), bBased = tsOf(bWp.basedOn);
+  if(aBased !== bBased) return aBased > bBased ? a : b;
+
+  // 4. Nothing to tell them apart — both from builds that recorded none of this.
+  //    The old rule, which is still right when there is no better information.
+  return aGen === bGen ? primary : (aGen > bGen ? a : b);
+}
+
 /* Resolve one boolean across two copies of the same line.
    Each flag now carries its own stamp (checkedAt / removedAt / atHomeAt) instead of
    sharing one `changedAt`. Sharing a single stamp meant that one shopper marking an
@@ -1351,8 +1435,9 @@ function mergeShoppingData(a, b){
   let selSource = primary, selOther = secondary;
 
   if(!sameTrip){
-    // Different trips: the one generated later is authoritative, wholesale.
-    const winner = aGen === bGen ? primary : (aGen > bGen ? a : b);
+    // Different trips: one of them is authoritative, wholesale. Which one is no
+    // longer a matter of whose clock ran fastest — see chooseTripWinner.
+    const winner = chooseTripWinner(a, b, aGen, bGen, primary);
     out.shoppingList = (winner.shoppingList || []).map(l=> Object.assign({}, l));
     out.weekPlan = Object.assign({}, winner.weekPlan);
     selSource = winner; selOther = (winner === a ? b : a);
@@ -1456,6 +1541,34 @@ function flushDeferredRepaint(){
    looks momentarily like "nothing is focused" and repaints mid-edit after all. */
 document.addEventListener('focusout', ()=> setTimeout(flushDeferredRepaint, 0));
 
+/* Every remote copy of the shopping file comes in through here, so that "how caught-up
+   is this device" is recorded in exactly one place rather than at each merge site. */
+function mergeRemoteShopping(remote){
+  if(remote && remote.lastUpdated && tsOf(remote.lastUpdated) > tsOf(shoppingSeenRemoteAt)){
+    shoppingSeenRemoteAt = remote.lastUpdated;
+  }
+  return applyMergedShopping(mergeShoppingData(shoppingData, remote));
+}
+
+/* v21.8: the list someone was shopping from, kept aside when something replaced it.
+   A trip being superseded is a destructive act — it discards ticks that a person
+   walked round a shop to make — and this app's rule is that destructive acts are
+   recoverable rather than merely confirmed. In-session only, like the bulk-delete
+   undo: it covers the minutes in which anyone would notice, and it costs nothing in
+   the synced file. */
+let replacedTrip = null;
+
+function stashReplacedTrip(sd){
+  if(!tripHasProgress(sd)) return;
+  replacedTrip = {
+    weekPlan: JSON.parse(JSON.stringify(sd.weekPlan)),
+    shoppingList: JSON.parse(JSON.stringify(sd.shoppingList || [])),
+    tripId: tripIdOf(sd),
+    ticks: tripProgress(sd).ticks,
+    at: new Date().toISOString()
+  };
+}
+
 /* Returns whether anything actually changed. Callers use that to decide whether the
    change is worth telling the user about. */
 function applyMergedShopping(merged){
@@ -1463,6 +1576,10 @@ function applyMergedShopping(merged){
   // would detach every rendered row's event handler for no gain — the v21.0 bug — and
   // repainting over it would be pure disruption.
   if(JSON.stringify(merged) === JSON.stringify(shoppingData)) return false;
+  // Adopting a different trip from another device: keep what we were holding if
+  // anyone had shopped from it, so it can be put back with one tap.
+  const wasTrip = tripIdOf(shoppingData), nowTrip = tripIdOf(merged);
+  if(wasTrip && nowTrip && wasTrip !== nowTrip) stashReplacedTrip(shoppingData);
   shoppingData = merged;
   try{ localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData)); }
   catch(e){ storageBlockedReason = 'Could not save locally (' + ((e && e.message) || e) + ').'; }
@@ -1517,7 +1634,7 @@ async function writeShoppingMerged(token){
     if(remote && remote.data){
       // Must go through applyMergedShopping: this runs on every tick, and when the
       // other shopper has saved in the meantime the merge returns a fresh object.
-      applyMergedShopping(mergeShoppingData(shoppingData, remote.data));
+      mergeRemoteShopping(remote.data);
     }
     const headers = { 'Content-Type': 'application/json' };
     if(remote && remote.etag) headers['If-Match'] = remote.etag;
@@ -1575,7 +1692,7 @@ async function pollShoppingNow(){
     const remote = await fetchRemoteShopping(token);
     if(remote && remote.data){
       // applyMergedShopping does the comparison and reports whether anything moved.
-      if(applyMergedShopping(mergeShoppingData(shoppingData, remote.data))){
+      if(mergeRemoteShopping(remote.data)){
         setStatus('Shopping list updated from the other shopper — ' + new Date().toLocaleTimeString(), 'ok');
       }
     }
@@ -2255,6 +2372,17 @@ function selectionsSignature(){
   });
 }
 
+/* Would generating right now carry the current trip on, or start a new one? A
+   same-trip rebuild reconciles and keeps every tick; a new trip throws the current
+   list away. generateShoppingList and the Review tab both have to know which is about
+   to happen, and they must never disagree about it. */
+function sameTripRebuild(){
+  const prevTripId = tripIdOf(shoppingData);
+  return !!prevTripId
+    && !shoppingData.weekPlan.shoppingDoneAt
+    && shoppingData.weekPlan.lastGeneratedRecipeSignature === recipeSelectionsSignature();
+}
+
 function generateShoppingList(){
   const lines = {}; // key -> {ingredientName, unit, aisle, totalQty, textQtyParts:[], sources:[]}
   const generatedNow = new Date().toISOString();
@@ -2267,9 +2395,9 @@ function generateShoppingList(){
   const prevByKey = {};
   (shoppingData.shoppingList || []).forEach(l=>{ prevByKey[lineMergeKey(l)] = l; });
   const prevTripId = tripIdOf(shoppingData);
-  const sameTrip = !!prevTripId
-    && !shoppingData.weekPlan.shoppingDoneAt
-    && shoppingData.weekPlan.lastGeneratedRecipeSignature === recipeSelectionsSignature();
+  const sameTrip = sameTripRebuild();
+  // A new trip discards whatever the current one has had ticked. Keep it aside first.
+  if(!sameTrip) stashReplacedTrip(shoppingData);
   shoppingData.weekPlan.selections.forEach(sel=>{
     const recipe = recipesData.recipes.find(r=>r.id===sel.recipeId);
     if(!recipe) return;
@@ -2393,6 +2521,14 @@ function generateShoppingList(){
      apart from "a genuinely newer list". It must survive a same-trip rebuild, or
      each device would call its own rebuild a new trip and discard the other's work. */
   shoppingData.weekPlan.tripId = sameTrip ? prevTripId : ('trip:' + generatedNow + ':' + deviceId());
+  if(!sameTrip){
+    /* What this trip was built on top of, and how caught-up this device was when it
+       built it. Together they let the merge tell a deliberate replacement from a list
+       generated by a phone that had never seen the one it is about to overwrite —
+       see chooseTripWinner. */
+    shoppingData.weekPlan.supersedes = prevTripId || null;
+    shoppingData.weekPlan.basedOn = shoppingSeenRemoteAt || shoppingData.lastUpdated || null;
+  }
   shoppingData.weekPlan.shoppingDoneAt = null; // a fresh list is an unfinished list
   shoppingData.weekPlan.lastGeneratedRecipeSignature = recipeSelectionsSignature();
   shoppingData.weekPlan.lastGeneratedSignature = selectionsSignature();
@@ -2442,6 +2578,32 @@ function finishShopping(){
   persist('shopping');
   render();
   setStatus('Shopping marked as done — list cleared, menu kept.', 'ok');
+}
+
+/* Undo for a superseded trip. The restored list has to WIN once it goes back, or the
+   copy that displaced it simply arrives again on the next poll — so it goes back as a
+   deliberate replacement of that copy: a new trip id, superseding the one on screen,
+   carrying the old lines and their ticks. That is the same causal rule the merge uses
+   for any other deliberate replacement, rather than a special case bolted beside it. */
+function putBackReplacedList(){
+  if(!replacedTrip) return;
+  const msg = 'Put back the list that was replaced?\n\n'
+    + replacedTrip.ticks + ' ticked item(s) come back, along with the recipe picks that list was made from.'
+    + '\n\nThe list that replaced it goes — on every phone, within a few seconds.';
+  if(!confirm(msg)) return;
+  const now = new Date().toISOString();
+  shoppingData.weekPlan = Object.assign({}, replacedTrip.weekPlan, {
+    tripId: 'trip:' + now + ':' + deviceId(),
+    supersedes: tripIdOf(shoppingData),
+    basedOn: shoppingSeenRemoteAt || shoppingData.lastUpdated || null,
+    generatedAt: now,
+    shoppingDoneAt: null
+  });
+  shoppingData.shoppingList = replacedTrip.shoppingList.map(l=> Object.assign({}, l));
+  replacedTrip = null;
+  persist('shopping');
+  render();
+  setStatus('Put the previous list back, ticks and all.', 'ok');
 }
 
 function shoppingListIsStale(){
@@ -2858,7 +3020,15 @@ function renderStartTab(){
       const btn = el('button',{class:'btn secondary'},['Clear all selections']);
       btn.addEventListener('click', ()=>{
         if(shoppingData.weekPlan.selections.length===0 && shoppingData.shoppingList.length===0) return;
-        if(!confirm('Clear this week’s selected recipes and shopping list? Your Wait List will not be affected.')) return;
+        // Clearing while somebody is mid-shop is the same destructive act as replacing
+        // their list, so it gets the same warning naming what it costs.
+        const live = tripIsLive(shoppingData) ? tripProgress(shoppingData) : null;
+        const warning = live
+          ? 'Somebody is shopping from this list right now — ' + live.ticks + ' item(s) ticked.\n\n'
+            + 'Clearing it empties their list too. Clear it anyway?'
+          : 'Clear this week’s selected recipes and shopping list? Your Wait List will not be affected.';
+        if(!confirm(warning)) return;
+        if(live) stashReplacedTrip(shoppingData);
         shoppingData.weekPlan = { selections: [], generatedAt: null };
         shoppingData.shoppingList = [];
         persist('shopping');
@@ -3063,10 +3233,65 @@ function renderReviewTab(){
     container.appendChild(el('div',{class:'empty-state'},['No recipes picked yet. Go to "Start New Shopping List" first.']));
     return container;
   }
-  // Review Shopping List always reflects the current picks — generate/refresh it
-  // automatically on the way in, rather than making the user click a button first.
+  /* Review Shopping List reflects the current picks, refreshed on the way in rather
+     than behind a button nobody would think to press.
+     v21.8: with one exception. A refresh that starts a NEW trip throws away every tick
+     on the current one, and this line runs merely because somebody opened a tab — which
+     is exactly how a phone that had not caught up wiped a trolley mid-shop. When there
+     is progress to lose, the refresh waits for a deliberate tap. Same-trip refreshes (a
+     Wait List addition, a staple amount) carry every tick across, so those still happen
+     on their own — that is how "grab shampoo too" reaches someone already in the shop. */
+  let heldBackRefresh = null;
   if(shoppingListIsStale()){
-    generateShoppingList();
+    if(!sameTripRebuild() && tripIsLive(shoppingData)){
+      heldBackRefresh = tripProgress(shoppingData);
+    } else {
+      generateShoppingList();
+    }
+  }
+
+  if(heldBackRefresh){
+    const card = el('div',{class:'card notice-card'});
+    card.appendChild(el('p',{style:'margin-top:0;'},[
+      el('strong',{},['The week’s recipes have changed since this list was made.'])
+    ]));
+    const when = heldBackRefresh.newestAt ? new Date(heldBackRefresh.newestAt).toLocaleTimeString() : null;
+    card.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
+      'This list has not been refreshed, because somebody is shopping from it: '
+      + heldBackRefresh.ticks + ' item(s) ticked'
+      + (when ? ', the last at ' + when : '') + '. '
+      + 'Making a new list would throw those ticks away, on their phone as well as this one.'
+    ]));
+    const newBtn = el('button',{class:'btn'},['Make a new list anyway']);
+    newBtn.addEventListener('click', ()=>{
+      if(!confirm('Make a new shopping list?\n\nThe list being shopped right now — '
+                  + heldBackRefresh.ticks + ' item(s) already ticked — is replaced, on every phone.'
+                  + '\n\nIf that turns out to be a mistake, "Put back the list that was replaced" appears here afterwards.')) return;
+      generateShoppingList();
+      render();
+      setStatus('New shopping list made — the previous one can still be put back.', 'ok');
+    });
+    card.appendChild(newBtn);
+    container.appendChild(card);
+  }
+
+  /* The undo for a trip that was replaced — whether that happened here or arrived from
+     another phone mid-shop, which is the case nobody is watching for. */
+  if(replacedTrip && tripIdOf(shoppingData) !== replacedTrip.tripId){
+    const card = el('div',{class:'card notice-card'});
+    card.appendChild(el('p',{style:'margin-top:0;'},[
+      el('strong',{},['The list that had your ticks on it was replaced.'])
+    ]));
+    card.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
+      'It had ' + replacedTrip.ticks + ' item(s) ticked, and is kept until this page is closed \u2014 whether it was replaced here or from another phone.'
+    ]));
+    const backBtn = el('button',{class:'btn'},['Put back the list that was replaced']);
+    backBtn.addEventListener('click', putBackReplacedList);
+    card.appendChild(backBtn);
+    const dropBtn = el('button',{class:'btn secondary', style:'margin-left:8px;'},['Keep this one']);
+    dropBtn.addEventListener('click', ()=>{ replacedTrip = null; render(); });
+    card.appendChild(dropBtn);
+    container.appendChild(card);
   }
   // Print just the shopping list, straight from here. The printable layout is rendered
   // hidden alongside the screen list; printSection('shopping') reveals only it.

@@ -63,7 +63,8 @@ function extractConst(name){
 // Keep this in step with the constant in index.html; asserted below so it can't drift.
 const TICK_TIE_WINDOW_MS = 10000;
 
-const FUNCS = ['tsOf', 'tripIdOf', 'mergeFlag', 'flagStamp', 'mergeShoppingLine',
+const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripHasProgress', 'tripIsLive',
+               'chooseTripWinner', 'mergeFlag', 'flagStamp', 'mergeShoppingLine',
                'mergeShoppingData', 'lineMergeKey', 'selectionsSignature',
                'recipeSelectionsSignature', 'shoppingListIsStale',
                'featureOn', 'stapleQtyFor', 'stapleQtyToShopping', 'parseQty', 'fmtQty',
@@ -79,19 +80,22 @@ vm.runInContext(
   extractConst('COUNT_UNITS') + '\n' +
   extractConst('MEASURE_ML') + '\n' +
   extractConst('UNIT_ROLLUP') + '\n' +
+  extractConst('TRIP_LIVE_WINDOW_MS') + '\n' +
   extractConst('SHARE_MARKER') + '\n' +
   extractConst('APP_VERSION') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
   '             ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,' +
+  '             tripProgress, tripHasProgress, tripIsLive, chooseTripWinner, TRIP_LIVE_WINDOW_MS,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
 );
-const { mergeShoppingData, selectionsSignature, shoppingListIsStale,
+const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,
         ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,
+        tripProgress, tripHasProgress, tripIsLive, chooseTripWinner, TRIP_LIVE_WINDOW_MS,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -551,6 +555,159 @@ group('sharing a single recipe');
   ok('the file is a copy — editing it cannot touch the book', pie.name === 'Apple Pie');
 
   noStaples();
+}
+
+/* ---------- v21.8: a stale list must not dump on a live one ----------
+   The bug behind all of this: a phone that had not caught up regenerated from last
+   week's picks, its trip was newer by the clock, and the merge handed it the trip
+   wholesale — throwing away a half-ticked trolley in a supermarket. */
+
+const NOW = Date.now();
+const ago = ms => new Date(NOW - ms).toISOString();
+const MIN = 60 * 1000, HOUR = 60 * MIN;
+
+// A trip: its own id, when it was generated, what it knew when it was, and its lines.
+const trip = (id, o) => listFor((o && o.lines) || [], (o && o.lastUpdated) || ago(MIN), {
+  tripId: id,
+  generatedAt: (o && o.generatedAt) || ago(HOUR),
+  supersedes: (o && o.supersedes),
+  basedOn: (o && o.basedOn)
+});
+const ticked = (name, at) => line(name, { checked: true, checkedAt: at, changedAt: at });
+
+group('is anyone actually shopping from this list?');
+{
+  ok('a list nobody has ticked is not live',
+     tripIsLive(trip('t1', { lines: [line('milk'), line('bread')] }), NOW) === false);
+  ok('a list ticked minutes ago is live',
+     tripIsLive(trip('t1', { lines: [ticked('milk', ago(3 * MIN)), line('bread')] }), NOW) === true);
+  ok('a list last ticked seven hours ago is not',
+     tripIsLive(trip('t1', { lines: [ticked('milk', ago(7 * HOUR))] }), NOW) === false);
+  ok('the window is the one the app defines',
+     tripIsLive(trip('t1', { lines: [ticked('milk', ago(TRIP_LIVE_WINDOW_MS - MIN))] }), NOW) === true
+     && tripIsLive(trip('t1', { lines: [ticked('milk', ago(TRIP_LIVE_WINDOW_MS + MIN))] }), NOW) === false);
+  ok('a finished trip is never live, however recently it was ticked',
+     tripIsLive(listFor([ticked('milk', ago(MIN))], ago(MIN),
+                        { tripId: 't1', shoppingDoneAt: ago(30 * 1000) }), NOW) === false);
+  ok('a tick from a pre-v21 build, stamped only with changedAt, still counts',
+     tripIsLive(listFor([{ ingredientName: 'milk', checked: true, changedAt: ago(MIN) }], ago(MIN),
+                        { tripId: 't1' }), NOW) === true);
+  ok('an unstamped tick is treated as live rather than assumed abandoned',
+     tripIsLive(listFor([{ ingredientName: 'milk', checked: true }], ago(MIN), { tripId: 't1' }), NOW) === true);
+  ok('progress counts the ticks and finds the newest',
+     tripProgress(trip('t1', { lines: [ticked('milk', ago(9 * MIN)), ticked('bread', ago(2 * MIN)), line('jam')] })).ticks === 2);
+}
+
+group('a stale phone must not wipe a trolley');
+{
+  // The incident. Someone is shopping. A phone that never saw their list regenerates
+  // from its own out-of-date picks, so its trip is newer by the clock.
+  const live = trip('trip:live', {
+    lines: [ticked('milk', ago(4 * MIN)), ticked('bread', ago(2 * MIN)), line('jam')],
+    generatedAt: ago(40 * MIN), basedOn: ago(45 * MIN), lastUpdated: ago(2 * MIN)
+  });
+  const stale = trip('trip:stale', {
+    lines: [line('flour'), line('rice')],
+    generatedAt: ago(30 * 1000), basedOn: ago(3 * 24 * HOUR), lastUpdated: ago(20 * 1000)
+  });
+
+  const r = mergeShoppingData(live, stale);
+  ok('the trolley survives a newer list from a phone that never saw it',
+     tripIdOf(r) === 'trip:live', tripIdOf(r));
+  ok('and the ticks are still on it', r.shoppingList.filter(l => l.checked).length === 2);
+  ok('the stale list does not leak its lines in',
+     r.shoppingList.every(l => l.ingredientName !== 'flour'));
+  ok('which way round the two files merge makes no difference',
+     tripIdOf(mergeShoppingData(stale, live)) === 'trip:live');
+}
+
+group('a deliberate replacement still replaces');
+{
+  // Someone looked at the live list and chose to start a new one anyway — on this
+  // build that tap came with a dialog naming the ticks it would cost.
+  const live = trip('trip:live', { lines: [ticked('milk', ago(5 * MIN))], generatedAt: ago(30 * MIN) });
+  const chosen = trip('trip:new', {
+    lines: [line('flour')], generatedAt: ago(MIN), supersedes: 'trip:live', basedOn: ago(2 * MIN)
+  });
+  const r = mergeShoppingData(live, chosen);
+  ok('a trip that names the live one as the one it replaces wins',
+     tripIdOf(r) === 'trip:new', tripIdOf(r));
+  ok('and last trip\'s ticks do not leak into it',
+     r.shoppingList.every(l => !l.checked));
+  ok('order-independent', tripIdOf(mergeShoppingData(chosen, live)) === 'trip:new');
+}
+
+group('stale loses even before anyone has ticked anything');
+{
+  // 09:00 the right list is made. 09:05 a phone asleep since Tuesday makes its own from
+  // last week's picks. Neither has a tick on it, so progress cannot separate them.
+  const fresh = trip('trip:fresh', {
+    lines: [line('milk')], generatedAt: ago(20 * MIN), basedOn: ago(21 * MIN), lastUpdated: ago(20 * MIN)
+  });
+  const stale = trip('trip:stale', {
+    lines: [line('flour')], generatedAt: ago(MIN), basedOn: ago(4 * 24 * HOUR), lastUpdated: ago(MIN)
+  });
+  ok('the list built from fresher data wins, though it is the older of the two',
+     tripIdOf(mergeShoppingData(fresh, stale)) === 'trip:fresh',
+     tripIdOf(mergeShoppingData(fresh, stale)));
+  ok('order-independent', tripIdOf(mergeShoppingData(stale, fresh)) === 'trip:fresh');
+}
+
+group('a genuinely new week still takes over');
+{
+  const lastWeek = trip('trip:lastweek', {
+    lines: [ticked('milk', ago(4 * 24 * HOUR)), ticked('bread', ago(4 * 24 * HOUR))],
+    generatedAt: ago(5 * 24 * HOUR), basedOn: ago(5 * 24 * HOUR), lastUpdated: ago(4 * 24 * HOUR)
+  });
+  const thisWeek = trip('trip:new', {
+    lines: [line('flour')], generatedAt: ago(MIN), supersedes: 'trip:lastweek', basedOn: ago(2 * MIN)
+  });
+  const r = mergeShoppingData(lastWeek, thisWeek);
+  ok('last week\'s ticked-but-cold list does not block it', tripIdOf(r) === 'trip:new', tripIdOf(r));
+  ok('and none of last week\'s ticks come with it', r.shoppingList.every(l => !l.checked));
+
+  // Same thing for a trip that was properly marked done.
+  const finished = listFor([], ago(HOUR), { tripId: 'trip:done', generatedAt: ago(3 * HOUR),
+                                            shoppingDoneAt: ago(HOUR) });
+  const next = trip('trip:next', { lines: [line('rice')], generatedAt: ago(MIN), supersedes: 'trip:done' });
+  ok('a finished trip is replaced without argument',
+     tripIdOf(mergeShoppingData(finished, next)) === 'trip:next');
+}
+
+group('copies written by builds that know none of this');
+{
+  // No supersedes, no basedOn — the fields simply are not there.
+  const oldA = listFor([line('milk')], ago(2 * HOUR), { tripId: 'trip:a', generatedAt: ago(2 * HOUR) });
+  const oldB = listFor([line('flour')], ago(MIN), { tripId: 'trip:b', generatedAt: ago(MIN) });
+  ok('the old rule still decides between two old copies',
+     tripIdOf(mergeShoppingData(oldA, oldB)) === 'trip:b', tripIdOf(mergeShoppingData(oldA, oldB)));
+
+  // An old build cannot say "I meant to replace this", so progress protects the shopper.
+  const liveNew = trip('trip:live', { lines: [ticked('milk', ago(3 * MIN))], generatedAt: ago(HOUR) });
+  const oldNewer = listFor([line('flour')], ago(MIN), { tripId: 'trip:old', generatedAt: ago(MIN) });
+  ok('an old build\'s newer trip does not wipe a trolley',
+     tripIdOf(mergeShoppingData(liveNew, oldNewer)) === 'trip:live',
+     tripIdOf(mergeShoppingData(liveNew, oldNewer)));
+}
+
+group('two live trolleys, which should not happen but must still converge');
+{
+  const one = trip('trip:one', { lines: [ticked('milk', ago(2 * MIN))], generatedAt: ago(2 * HOUR) });
+  const two = trip('trip:two', { lines: [ticked('flour', ago(MIN))], generatedAt: ago(HOUR) });
+  const ab = mergeShoppingData(one, two), ba = mergeShoppingData(two, one);
+  ok('both devices land on the same trip', tripIdOf(ab) === tripIdOf(ba), [tripIdOf(ab), tripIdOf(ba)]);
+  ok('and it is the later-generated one, the old rule as last resort',
+     tripIdOf(ab) === 'trip:two', tripIdOf(ab));
+}
+
+group('the merge is still pure with the new rules in it');
+{
+  const live = trip('trip:live', { lines: [ticked('milk', ago(MIN))] });
+  const other = trip('trip:other', { lines: [line('flour')], generatedAt: ago(30 * 1000) });
+  const beforeA = JSON.stringify(live), beforeB = JSON.stringify(other);
+  mergeShoppingData(live, other);
+  ok('input a is untouched', JSON.stringify(live) === beforeA);
+  ok('input b is untouched', JSON.stringify(other) === beforeB);
 }
 
 /* ---------- result ---------- */
