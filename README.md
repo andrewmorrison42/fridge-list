@@ -8,8 +8,9 @@ your own OneDrive.
 
 - Pick recipes for the week, and it builds the shopping list for you, grouped by aisle.
 - Two people can shop at once and tick items off — each phone sees the other's ticks
-  within a few seconds. A list being shopped from is not replaced by one generated on a
-  phone that hadn't caught up, and if a list does get replaced you can put it back.
+  within a few seconds. Once a shop starts the week's recipes are fixed, so nobody's
+  list changes underneath them — anything extra goes on the Wait List and arrives in
+  seconds.
 - A Wait List anyone can add to the moment they notice you're low on something.
 - Print the shopping list, or a weekly menu for the fridge door.
 - Copy one recipe to the clipboard, laid out and ready to paste into an email or a
