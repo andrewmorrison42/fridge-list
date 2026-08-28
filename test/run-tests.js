@@ -72,7 +72,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripHasProgress', 'tripIsLiv
                'ingredientLineText', 'recipeToPlainText', 'recipeToHtml', 'buildShareBundle',
                'tripRecordFromShopping', 'mergeTripHistory', 'pruneTripHistory',
                'recipeHistoryLabel', 'recipeHistoryTime', 'daysSinceStamp', 'daysSinceCooked',
-               'daysSincePlanned', 'migrateCookedStamps'];
+               'daysSincePlanned', 'migrateCookedStamps',
+               'picksFromTrip', 'summarisePickNames'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -94,6 +95,7 @@ vm.runInContext(
   '             tripProgress, tripHasProgress, tripIsLive, chooseTripWinner, TRIP_LIVE_WINDOW_MS,' +
   '             tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,' +
   '             recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,' +
+  '             picksFromTrip, summarisePickNames,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -104,6 +106,7 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         tripProgress, tripHasProgress, tripIsLive, chooseTripWinner, TRIP_LIVE_WINDOW_MS,
         tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,
         recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,
+        picksFromTrip, summarisePickNames,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -837,6 +840,34 @@ group('old lastCooked stamps are moved to where they were true');
   data.recipes[0].lastCooked = T(5000);
   migrateCookedStamps(data);
   ok('and it never runs twice over a real cook', data.recipes[0].lastPlanned === T(0));
+}
+
+group('a past week can be picked again, allowing for a book that has moved on');
+{
+  const book = [ {id:'risotto', name:'Mushroom Risotto', servings:4},
+                 {id:'curry', name:'Chickpea Curry', servings:6} ];
+  const trip = { tripId:'t1', doneAt:T(0), lines:[], selections:[
+    {recipeId:'risotto', servings:8, cooked:true},
+    {recipeId:'curry'},
+    {recipeId:'deleted-since', servings:2}
+  ]};
+  const picks = picksFromTrip(trip, book);
+  ok('a recipe deleted since that shop is quietly left out', picks.length === 2);
+  ok('the servings that week actually used come back', picks[0].servings === 8);
+  ok("a pick with no servings falls back to the recipe's own", picks[1].servings === 6);
+  ok('names come from the book as it is now, not as it was',
+     picks[0].name === 'Mushroom Risotto');
+  ok('whether it got cooked is history, not part of a new plan',
+     picks[0].cooked === undefined);
+  ok('a trip whose recipes have all gone yields nothing',
+     picksFromTrip(trip, []).length === 0);
+  ok('and an empty trip is harmless', picksFromTrip(null, book).length === 0);
+
+  ok('a short week lists every name',
+     summarisePickNames(picks) === 'Mushroom Risotto, Chickpea Curry');
+  const many = [1,2,3,4,5,6,7].map(n=>({name:'R'+n}));
+  ok('a long week is summarised rather than filling the row',
+     summarisePickNames(many, 5) === 'R1, R2, R3, R4, R5 and 2 more');
 }
 
 /* ---------- result ---------- */

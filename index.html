@@ -1912,6 +1912,35 @@ async function fetchTripHistory(){
   }catch(e){ console.warn('could not read the trip history', e); }
 }
 
+/* Pure. What a past trip's picks would look like if you used them again: the recipes it
+   was built from, minus any since deleted from the book, with the servings that trip
+   actually used — so "the week we cooked for eight" comes back as it was. */
+function picksFromTrip(trip, recipes){
+  const byId = {};
+  (recipes || []).forEach(r=>{ if(r && r.id) byId[r.id] = r; });
+  return (((trip && trip.selections) || []))
+    .filter(s=> s && byId[s.recipeId])
+    .map(s=>({
+      recipeId: s.recipeId,
+      servings: s.servings || byId[s.recipeId].servings || 4,
+      name: byId[s.recipeId].name
+    }));
+}
+
+// Pure. Names for a row on a phone: a few, then a count, rather than a wall of text.
+function summarisePickNames(picks, max){
+  const cap = max || 5;
+  const names = (picks || []).map(p=> p.name);
+  if(names.length <= cap) return names.join(', ');
+  return names.slice(0, cap).join(', ') + ' and ' + (names.length - cap) + ' more';
+}
+
+function tripDateLabel(iso){
+  const d = iso ? new Date(iso) : null;
+  if(!d || isNaN(d.getTime())) return 'an earlier shop';
+  return d.toLocaleDateString(undefined, { day:'numeric', month:'short' });
+}
+
 /* ---------------- manual export / import (works in every browser) ---------------- */
 
 /* ---- v21.6: bulk recipe delete, and the safety net under it ----
@@ -3262,6 +3291,49 @@ function slugify(name){
   return slug;
 }
 
+/* v22.0: the week's picks were the one part of this app that started from nothing every
+   single time — with 635 recipes, "what did we have three weeks ago?" meant scrolling the
+   library until something looked familiar. The archive can simply answer it.
+   Deliberately the last few shops rather than a favourites list: what a family actually
+   ate is a better suggestion than what somebody once starred and forgot. */
+function buildPastWeeksCard(disabled, onChanged){
+  const trips = recentTrips(0)
+    .filter(t=> picksFromTrip(t, recipesData.recipes).length)
+    .slice(-8).reverse();
+  if(!trips.length) return null;
+  const card = el('div',{class:'card'});
+  card.appendChild(el('h3',{style:'margin:0 0 4px;'},['Weeks you have shopped before']));
+  card.appendChild(el('p',{class:'muted',style:'margin:0 0 10px;'},[
+    'Put a previous week back on the list without going through the whole book again.'
+  ]));
+  trips.forEach(t=>{
+    const picks = picksFromTrip(t, recipesData.recipes);
+    const row = el('div',{class:'picked-row'});
+    row.appendChild(el('div',{class:'picked-name'},[
+      el('strong',{},[tripDateLabel(t.doneAt)]),
+      el('span',{class:'muted'},[' · ' + picks.length + ' recipe(s): ' + summarisePickNames(picks)])
+    ]));
+    const btn = el('button',{class:'btn tap secondary'},['Use these again']);
+    btn.disabled = !!disabled;
+    btn.addEventListener('click', ()=>{
+      // Belt and braces over the disabled attribute: the v21.9 freeze is the rule, and a
+      // button drawn before a shop started must not be able to outlive it.
+      if(shoppingInProgress()) return;
+      if(!confirm('Pick these ' + picks.length + ' recipe(s) again?\n\n' + summarisePickNames(picks, 20)
+                  + '\n\nThis replaces the ' + shoppingData.weekPlan.selections.length
+                  + ' recipe(s) picked at the moment. Your Wait List is not touched.')) return;
+      // Only recipeId and servings: whether that week got cooked is history, not a plan.
+      shoppingData.weekPlan.selections = picks.map(p=>({ recipeId:p.recipeId, servings:p.servings }));
+      persist('shopping');
+      if(onChanged) onChanged();
+      setStatus('Picked the ' + picks.length + ' recipe(s) from ' + tripDateLabel(t.doneAt) + '.', 'ok');
+    });
+    row.appendChild(btn);
+    card.appendChild(row);
+  });
+  return card;
+}
+
 /* ---- Start New Shopping List tab ---- */
 function renderStartTab(){
   const container = el('div',{});
@@ -3313,6 +3385,9 @@ function renderStartTab(){
      This card is the answer, and it is where the servings get adjusted. */
   const pickedCard = el('div',{class:'card picked-card'});
   container.appendChild(pickedCard);
+
+  const pastCard = buildPastWeeksCard(shopping, ()=>{ drawPicked(); draw(); updateCountLabel(); });
+  if(pastCard) container.appendChild(pastCard);
 
   const searchbar = el('div',{class:'searchbar'});
   const searchInput = el('input',{type:'search', placeholder:'Search recipes to add…'});
