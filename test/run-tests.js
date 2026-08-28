@@ -69,7 +69,10 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripHasProgress', 'tripIsLiv
                'recipeSelectionsSignature', 'shoppingListIsStale',
                'featureOn', 'stapleQtyFor', 'stapleQtyToShopping', 'parseQty', 'fmtQty',
                'displayUnit', 'lineQtyText', 'findIngredientMeta', 'rollUpQty', 'fmtExactQty',
-               'ingredientLineText', 'recipeToPlainText', 'recipeToHtml', 'buildShareBundle'];
+               'ingredientLineText', 'recipeToPlainText', 'recipeToHtml', 'buildShareBundle',
+               'tripRecordFromShopping', 'mergeTripHistory', 'pruneTripHistory',
+               'recipeHistoryLabel', 'recipeHistoryTime', 'daysSinceStamp', 'daysSinceCooked',
+               'daysSincePlanned', 'migrateCookedStamps'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -83,11 +86,14 @@ vm.runInContext(
   extractConst('TRIP_LIVE_WINDOW_MS') + '\n' +
   extractConst('SHARE_MARKER') + '\n' +
   extractConst('APP_VERSION') + '\n' +
+  extractConst('TRIP_HISTORY_MAX') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
   '             ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,' +
   '             tripProgress, tripHasProgress, tripIsLive, chooseTripWinner, TRIP_LIVE_WINDOW_MS,' +
+  '             tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,' +
+  '             recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -96,6 +102,8 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,
         ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,
         tripProgress, tripHasProgress, tripIsLive, chooseTripWinner, TRIP_LIVE_WINDOW_MS,
+        tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,
+        recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -708,6 +716,127 @@ group('the merge is still pure with the new rules in it');
   mergeShoppingData(live, other);
   ok('input a is untouched', JSON.stringify(live) === beforeA);
   ok('input b is untouched', JSON.stringify(other) === beforeB);
+}
+
+/* ---------- v22.0: the trip archive ---------- */
+
+group('a finished trip is reduced to a record worth keeping');
+{
+  const sd = {
+    weekPlan: { tripId: 'trip:a', generatedAt: T(0), shoppingDoneAt: T(9000),
+                selections: [{recipeId:'risotto', servings:4, cooked:true},
+                             {recipeId:'curry', servings:2}] },
+    shoppingList: [
+      line('Milk', {aisle:'Dairy', shoppingCategory:'Cold', unit:'mL', totalQty:2000,
+                    hasNumeric:true, checked:true, checkedAt:T(100), source:'staple'}),
+      line('Salt', {aisle:'Spices', shoppingCategory:'Pantry', atHome:true}),
+      line('Rice', {aisle:'Dry goods', shoppingCategory:'Pantry',
+                    totalQty:500, hasNumeric:false})
+    ]
+  };
+  const rec = tripRecordFromShopping(sd, 'phone-1');
+  ok('carries the trip id', rec.tripId === 'trip:a');
+  ok('carries who finished it', rec.doneBy === 'phone-1');
+  ok('keeps the cooked flag on each pick',
+     rec.selections[0].cooked === true && rec.selections[1].cooked === false);
+  ok('keeps the tick and its stamp — the walking order lives here',
+     rec.lines[0].checked === true && rec.lines[0].checkedAt === T(100));
+  ok('keeps the at-home decision', rec.lines[1].atHome === true);
+  ok('keeps a real quantity', rec.lines[0].qty === 2000 && rec.lines[0].unit === 'mL');
+  ok('drops a quantity that was never numeric', rec.lines[2].qty === null);
+  ok('drops the bulk it does not need',
+     rec.lines[0].sources === undefined && rec.lines[0].textQtyParts === undefined);
+  ok('a trip with no id is not archivable',
+     tripRecordFromShopping({weekPlan:{selections:[]}, shoppingList:[]}, 'x') === null);
+}
+
+group('trip history merges as a union, because a trip is written once');
+{
+  const trip1 = { tripId:'t1', doneAt: T(1000), lines:[{name:'Milk'}], selections:[] };
+  const trip2 = { tripId:'t2', doneAt: T(2000), lines:[{name:'Rice'}], selections:[] };
+  const mine = { version:1, trips:[trip1] };
+  const theirs = { version:1, trips:[trip2] };
+
+  const m = mergeTripHistory(mine, theirs);
+  ok('both trips survive', m.trips.length === 2);
+  ok('oldest first', m.trips[0].tripId === 't1' && m.trips[1].tripId === 't2');
+  ok('order of arguments makes no difference',
+     JSON.stringify(mergeTripHistory(theirs, mine)) === JSON.stringify(m));
+  ok('merging with itself changes nothing',
+     JSON.stringify(mergeTripHistory(m, m)) === JSON.stringify(m));
+  ok('merging with nothing changes nothing',
+     JSON.stringify(mergeTripHistory(m, null)) === JSON.stringify(m));
+
+  const beforeA = JSON.stringify(mine), beforeB = JSON.stringify(theirs);
+  mergeTripHistory(mine, theirs);
+  ok('and the merge is pure', JSON.stringify(mine) === beforeA && JSON.stringify(theirs) === beforeB);
+
+  const short = { version:1, trips:[{tripId:'t1', doneAt:T(1000), lines:[], selections:[]}] };
+  const full  = { version:1, trips:[{tripId:'t1', doneAt:T(1000), lines:[{name:'Milk'},{name:'Eggs'}], selections:[]}] };
+  ok('the same trip from two files resolves to the fuller record',
+     mergeTripHistory(short, full).trips[0].lines.length === 2);
+  ok('and resolves the same way round the other way',
+     mergeTripHistory(full, short).trips[0].lines.length === 2);
+  ok('an entry with no trip id is dropped rather than archived',
+     mergeTripHistory({version:1, trips:[{doneAt:T(1)}]}, null).trips.length === 0);
+}
+
+group('the archive is capped, so it cannot grow without bound');
+{
+  const many = { version:1, trips: [] };
+  for(let i = 0; i < TRIP_HISTORY_MAX + 10; i++){
+    many.trips.push({ tripId:'t'+i, doneAt:T(i*1000), lines:[], selections:[] });
+  }
+  const pruned = pruneTripHistory(many, TRIP_HISTORY_MAX);
+  ok('kept at the cap', pruned.trips.length === TRIP_HISTORY_MAX);
+  ok('and it is the NEWEST that are kept',
+     pruned.trips[pruned.trips.length - 1].tripId === 't' + (TRIP_HISTORY_MAX + 9));
+  ok('the merge applies the cap too', mergeTripHistory(many, null).trips.length === TRIP_HISTORY_MAX);
+  ok('an empty history prunes to an empty history', pruneTripHistory(null, 5).trips.length === 0);
+}
+
+/* ---------- v22.0: cooked means cooked ---------- */
+
+group('a recipe history badge does not call a plan a meal');
+{
+  setRecipesData({ recipes: [], ingredients: [], settings: { notCookedRecentlyDays: 60, features: {} } });
+  const daysAgo = n => new Date(Date.now() - n*24*60*60*1000).toISOString();
+
+  ok('nothing known reads as never cooked',
+     recipeHistoryLabel({}).text === 'Never cooked');
+  ok('a cook is reported as a cook',
+     recipeHistoryLabel({lastCooked: daysAgo(3)}).text === 'Cooked 3 days ago');
+  ok('a plan with no cook is reported as a plan, not a cook',
+     recipeHistoryLabel({lastPlanned: daysAgo(3)}).text === 'Planned 3 days ago');
+  ok('a cook outranks a plan',
+     recipeHistoryLabel({lastCooked: daysAgo(2), lastPlanned: daysAgo(9)}).text === 'Cooked 2 days ago');
+  ok('an old plan still counts as stale',
+     recipeHistoryLabel({lastPlanned: daysAgo(90)}).stale === true);
+  ok('a recent plan is not stale',
+     recipeHistoryLabel({lastPlanned: daysAgo(2)}).stale === false);
+
+  ok('the sort reads whichever stamp is fresher',
+     recipeHistoryTime({lastCooked: daysAgo(9), lastPlanned: daysAgo(1)}) ===
+     recipeHistoryTime({lastPlanned: daysAgo(1)}));
+  ok('and a recipe with neither sorts first',
+     recipeHistoryTime({}) === 0);
+}
+
+group('old lastCooked stamps are moved to where they were true');
+{
+  const data = { recipes: [ {id:'a', lastCooked: T(0)}, {id:'b'} ], meta: {} };
+  migrateCookedStamps(data);
+  ok('the old stamp is copied to lastPlanned, which is what it recorded',
+     data.recipes[0].lastPlanned === T(0));
+  ok('and lastCooked is left alone, so nothing on screen changes on update day',
+     data.recipes[0].lastCooked === T(0));
+  ok('a recipe with no history gains none', data.recipes[1].lastPlanned === undefined);
+  ok('the migration marks itself done', data.meta.cookedStampsSplit === true);
+
+  // Second run must not overwrite a genuine cook recorded since the first.
+  data.recipes[0].lastCooked = T(5000);
+  migrateCookedStamps(data);
+  ok('and it never runs twice over a real cook', data.recipes[0].lastPlanned === T(0));
 }
 
 /* ---------- result ---------- */

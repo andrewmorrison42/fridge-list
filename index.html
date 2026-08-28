@@ -831,6 +831,7 @@ async function loadFromFolderOrSeed(){
     if(sFile){ mergeRemoteShopping(JSON.parse(sFile)); }
     else { await writeFileToFolder('shopping-list.json', JSON.stringify(shoppingData)); }
     if(recipesChanged) repaintWhenSafe();
+    fetchTripHistory();
   }catch(e){
     console.error(e);
     setStatus('Could not read the shared folder: ' + e.message, 'warn');
@@ -1105,6 +1106,9 @@ async function loadFromOneDriveOrSeed(){
       await writeOneDriveFile(driveId, itemId, 'shopping-list.json', JSON.stringify(shoppingData));
     }
     if(changed) repaintWhenSafe();
+    // Deliberately last, and not awaited by anything the user is waiting on: the trip
+    // archive is never on the critical path to seeing this week's list.
+    fetchTripHistory();
   }catch(e){
     console.error(e);
     setStatus('Could not sync with OneDrive: ' + e.message, 'warn');
@@ -1740,6 +1744,173 @@ function stopShoppingFastPoll(){
 document.addEventListener('visibilitychange', ()=>{
   if(!document.hidden) pollShoppingNow();
 });
+
+/* ================= trip history: what the app remembers =================
+
+   Until v22.0 The Fridge List had no memory beyond the current week. "Shopping is done"
+   set shoppingList = [], and with it went every checkedAt (the order the shop is actually
+   walked), every atHome decision (the real pantry), and every record of what the week's
+   picks turned into. That is the paper menu sheet inherited literally: a sheet is
+   something you throw away.
+
+   trip-history.json is a third file beside recipes-data.json and shopping-list.json,
+   appended to once per shop and never rewritten. Design notes worth keeping:
+
+   - A trip is a CLOSED record, written once by the device that finished it. So the merge
+     is a union keyed by tripId and cannot conflict — mergeShoppingData, the most delicate
+     function in the app, is not touched by any of this.
+   - It is never read at startup. The localStorage mirror is what every feature reads, so
+     launch time is unchanged; the remote copy is folded in on sign-in, on "Sync now", and
+     right after this device archives a trip of its own.
+   - It is written once a week, never on a tick. Same reasoning as v21.2 and the 992 KB
+     recipe file: nothing large goes up over supermarket mobile data.
+   - It does not go through persist(). persist()'s `which` is 'recipes' | 'shopping' |
+     both, and squeezing a third value into that test is exactly how a tick would start
+     re-uploading something it should not. This file has its own writer.
+   - A phone still on v21.9 neither reads nor writes it. A shop finished on an old build
+     is a gap in the history, not a corruption of it. */
+
+const LS_TRIPS = 'fma_trips_v1';
+const TRIPS_FILE = 'trip-history.json';
+const TRIP_HISTORY_MAX = 52;   // about a year of weekly shops
+let tripHistory = null;        // null = not read from localStorage yet
+let pendingSaveTrips = false;
+
+function defaultTripHistory(){ return { version: 1, trips: [] }; }
+
+/* Pure. Reduces a finished trip to what the memory features actually read. Deliberately
+   lean — no sources, no textQtyParts, no per-line stamps beyond checkedAt — because this
+   file is the one thing in the app that grows without bound and 52 fat trips would undo
+   the point of not re-uploading the recipe file. */
+function tripRecordFromShopping(sd, byDevice){
+  if(!sd || !sd.weekPlan || !sd.weekPlan.tripId) return null;
+  const wp = sd.weekPlan;
+  return {
+    tripId: wp.tripId,
+    generatedAt: wp.generatedAt || null,
+    doneAt: wp.shoppingDoneAt || new Date().toISOString(),
+    doneBy: byDevice || '',
+    selections: (wp.selections || []).map(s=>({
+      recipeId: s.recipeId, servings: s.servings || null, cooked: !!s.cooked
+    })),
+    lines: (sd.shoppingList || []).map(l=>({
+      name: l.ingredientName,
+      aisle: l.aisle || '',
+      category: l.shoppingCategory || '',
+      qty: (l.hasNumeric && typeof l.totalQty === 'number') ? l.totalQty : null,
+      unit: l.unit || '',
+      source: l.source || 'recipe',
+      checked: !!l.checked,
+      checkedAt: l.checkedAt || null,
+      atHome: !!l.atHome,
+      removed: !!l.removed
+    }))
+  };
+}
+
+/* Pure. Union keyed by tripId, oldest first. Two files can only ever disagree about a
+   trip if one of them saw a shorter version of it — the archiving device wrote it once
+   and never came back — so the fuller record wins. Trips are never merged line by line:
+   a closed record that later grows is a record nobody can trust. */
+function mergeTripHistory(a, b){
+  const byId = {};
+  const take = h => ((h && Array.isArray(h.trips)) ? h.trips : []).forEach(t=>{
+    if(!t || !t.tripId) return;
+    const prev = byId[t.tripId];
+    if(!prev || ((t.lines || []).length > (prev.lines || []).length)) byId[t.tripId] = t;
+  });
+  take(a); take(b);
+  const trips = Object.keys(byId).map(k=>byId[k]).sort((x,y)=> tsOf(x.doneAt) - tsOf(y.doneAt));
+  return pruneTripHistory({ version: 1, trips: trips }, TRIP_HISTORY_MAX);
+}
+
+// Pure. Keeps the newest `max` trips and nothing else.
+function pruneTripHistory(h, max){
+  const trips = (h && Array.isArray(h.trips)) ? h.trips.slice() : [];
+  const keep = (max && max > 0) ? max : TRIP_HISTORY_MAX;
+  return { version: 1, trips: trips.slice(Math.max(0, trips.length - keep)) };
+}
+
+function loadTripHistoryLocal(){
+  if(tripHistory) return tripHistory;
+  try{
+    const raw = localStorage.getItem(LS_TRIPS);
+    tripHistory = raw ? JSON.parse(raw) : defaultTripHistory();
+  }catch(e){ tripHistory = defaultTripHistory(); }
+  if(!tripHistory || !Array.isArray(tripHistory.trips)) tripHistory = defaultTripHistory();
+  return tripHistory;
+}
+
+function saveTripHistoryLocal(){
+  try{ localStorage.setItem(LS_TRIPS, JSON.stringify(tripHistory)); }
+  catch(e){ console.warn('could not save trip history locally', e); }
+}
+
+// The newest `n` trips, oldest first. Every memory feature reads through this.
+function recentTrips(n){
+  const trips = loadTripHistoryLocal().trips;
+  return (n && n > 0) ? trips.slice(Math.max(0, trips.length - n)) : trips.slice();
+}
+
+/* Called from finishShopping while shoppingList still exists. The local write is first
+   and synchronous on purpose: finishShopping deletes the list, so a trip that did not
+   reach localStorage is gone for good. The remote push is best-effort — a missing remote
+   copy costs the other phones a little history, which is not the same kind of loss. */
+function archiveFinishedTrip(){
+  const rec = tripRecordFromShopping(shoppingData, deviceId());
+  if(!rec) return false;
+  tripHistory = mergeTripHistory(loadTripHistoryLocal(), { version: 1, trips: [rec] });
+  saveTripHistoryLocal();
+  syncTripHistory();   // fire and forget: fold in anything the others archived, then push
+  return true;
+}
+
+async function syncTripHistory(){
+  await fetchTripHistory();
+  await pushTripHistory();
+}
+
+async function pushTripHistory(){
+  if(!tripHistory) return false;
+  pendingSaveTrips = true;
+  const body = JSON.stringify(tripHistory);
+  try{
+    if(msalAccount && localStorage.getItem(LS_ONEDRIVE_FLAG) === '1'){
+      if(!oneDriveFolderRef){
+        const token = await getGraphToken();
+        if(!token) return false;
+        oneDriveFolderRef = await resolveFridgeListFolder(token);
+        if(!oneDriveFolderRef) return false;
+      }
+      const ok = await writeOneDriveFile(oneDriveFolderRef.driveId, oneDriveFolderRef.itemId, TRIPS_FILE, body);
+      if(ok) pendingSaveTrips = false;
+      return ok;
+    }
+    if(dirHandle){ await writeFileToFolder(TRIPS_FILE, body); pendingSaveTrips = false; return true; }
+  }catch(e){ console.warn('could not save the trip history', e); }
+  return false;
+}
+
+/* Never on the startup path. Repaints through repaintWhenSafe(), never render(), because
+   this can land while somebody is typing on the Wait List. */
+async function fetchTripHistory(){
+  try{
+    let text = null;
+    if(msalAccount && localStorage.getItem(LS_ONEDRIVE_FLAG) === '1'){
+      const token = await getGraphToken();
+      if(!token) return;
+      if(!oneDriveFolderRef) oneDriveFolderRef = await resolveFridgeListFolder(token);
+      if(!oneDriveFolderRef) return;
+      text = await getOneDriveFileText(oneDriveFolderRef.driveId, oneDriveFolderRef.itemId, TRIPS_FILE, token);
+    } else if(dirHandle){
+      text = await getFileText(dirHandle, TRIPS_FILE);
+    } else return;
+    if(!text) return;
+    const before = JSON.stringify(loadTripHistoryLocal());
+    tripHistory = mergeTripHistory(tripHistory, JSON.parse(text));
+    if(JSON.stringify(tripHistory) !== before){ saveTripHistoryLocal(); repaintWhenSafe(); }
+  }catch(e){ console.warn('could not read the trip history', e); }
+}
 
 /* ---------------- manual export / import (works in every browser) ---------------- */
 
@@ -2603,8 +2774,11 @@ function finishShopping(){
     + '\n\nYour menu list and recipe picks are not touched.';
   if(!confirm(msg)) return;
   shoppingData.neededList = shoppingData.neededList.filter(n=> !n.done);
-  shoppingData.shoppingList = [];
   shoppingData.weekPlan.shoppingDoneAt = new Date().toISOString();
+  // Order matters: the trip goes into the archive while the list it is made of still
+  // exists. The next line is where a week's worth of ticks used to vanish for good.
+  archiveFinishedTrip();
+  shoppingData.shoppingList = [];
   shoppingData.weekPlan.lastGeneratedRecipeSignature = recipeSelectionsSignature();
   persist('shopping');
   render();
