@@ -74,7 +74,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripHasProgress', 'tripIsLiv
                'recipeHistoryLabel', 'recipeHistoryTime', 'daysSinceStamp', 'daysSinceCooked',
                'daysSincePlanned', 'migrateCookedStamps',
                'picksFromTrip', 'summarisePickNames',
-               'aisleOrderFromHistory', 'compareAisles'];
+               'aisleOrderFromHistory', 'compareAisles',
+               'cookRateSummary', 'atHomeStreaks'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -100,6 +101,7 @@ vm.runInContext(
   '             recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,' +
   '             picksFromTrip, summarisePickNames,' +
   '             aisleOrderFromHistory, compareAisles, AISLE_ORDER_MIN_SIGHTINGS, AISLE_ORDER_TRIPS,' +
+  '             cookRateSummary, atHomeStreaks,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -112,6 +114,7 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,
         picksFromTrip, summarisePickNames,
         aisleOrderFromHistory, compareAisles, AISLE_ORDER_MIN_SIGHTINGS, AISLE_ORDER_TRIPS,
+        cookRateSummary, atHomeStreaks,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -956,6 +959,68 @@ group('only the recent shops count, so a rearranged shop is followed');
   const order = aisleOrderFromHistory(olds.concat(news), { trips: AISLE_ORDER_TRIPS });
   ok('the window is the last ' + AISLE_ORDER_TRIPS + ' shops, so the new route wins',
      order['Fruit'] < order['Freezer'], order);
+}
+
+/* ---------- v22.0: what the memory tells you ---------- */
+
+group('the cook rate is the overlap of what was bought and what was cooked');
+{
+  const trips = [
+    { tripId:'t1', doneAt:T(0),     lines:[], selections:[{recipeId:'a'},{recipeId:'b'}] },
+    { tripId:'t2', doneAt:T(100000), lines:[], selections:[{recipeId:'a'},{recipeId:'c'}] }
+  ];
+  // 'a' cooked during the first week, 'c' during the second, 'b' never.
+  const book = [ {id:'a', lastCooked:T(50000)}, {id:'b'}, {id:'c', lastCooked:T(150000)} ];
+
+  const r = cookRateSummary(trips, book, 6);
+  ok('every pick across both shops is counted', r.picked === 4);
+  ok('two shops', r.shops === 2);
+  ok('a cook inside a shop’s own week counts for that shop', r.cooked === 2, r);
+
+  ok('a recipe never cooked never counts',
+     cookRateSummary([trips[0]], [{id:'a'},{id:'b'}], 6).cooked === 0);
+  ok('a cooked tick recorded at archive time is believed without a stamp',
+     cookRateSummary([{tripId:'x', doneAt:T(0), selections:[{recipeId:'a', cooked:true}]}], [], 6).cooked === 1);
+  ok('no history is not a divide by zero',
+     cookRateSummary([], [], 6).picked === 0 && cookRateSummary(null, null, 6).shops === 0);
+
+  // The window must not let the oldest visible trip claim later cooks.
+  const windowed = cookRateSummary(trips, book, 1);
+  ok('only the last shop is in view', windowed.shops === 1 && windowed.picked === 2);
+  // 'b' was only ever picked on the first shop. A cook stamped after the SECOND shop
+  // belongs to that week, and must not be credited backwards to the first.
+  ok('a cook after the next shop does not count backwards to the earlier one',
+     cookRateSummary(trips, [{id:'b', lastCooked:T(150000)}], 6).cooked === 0);
+  ok('but the same cook inside the first shop’s own week does count',
+     cookRateSummary(trips, [{id:'b', lastCooked:T(50000)}], 6).cooked === 1);
+}
+
+group('what the family already has in is learnt from the times they said so');
+{
+  const at = (name, stamped) => ({ name: name, atHome: true, atHomeAt: stamped ? T(1) : null });
+  const buy = name => ({ name: name, atHome: false });
+  const shop = (id, lines, t) => ({ tripId:id, doneAt:T(t), lines: lines, selections: [] });
+
+  const trips = [
+    shop('t1', [at('Olive oil', true), buy('Milk'), at('Flour', true)], 1000),
+    shop('t2', [at('Olive oil', true), buy('Milk'), buy('Flour')],      2000),
+    shop('t3', [at('Olive oil', true), buy('Milk'), at('Flour', true)], 3000)
+  ];
+  const s = atHomeStreaks(trips, 3);
+  const names = s.map(x=> x.name);
+  ok('an item at home every time it came up is suggested', names.indexOf('Olive oil') >= 0);
+  ok('and the run length is reported', s[0].runs === 3);
+  ok('an item that was genuinely needed once is not a pantry item — it ran out',
+     names.indexOf('Flour') < 0);
+  ok('an item always bought is never suggested', names.indexOf('Milk') < 0);
+  ok('a shorter run than asked for is not suggested', atHomeStreaks(trips, 4).length === 0);
+
+  const auto = [1,2,3].map(n=> shop('a'+n, [at('Salt', false)], n*1000));
+  ok('the pantry rule setting the flag by category does NOT count as saying so',
+     atHomeStreaks(auto, 3).length === 0);
+
+  ok('an empty history suggests nothing',
+     atHomeStreaks([], 3).length === 0 && atHomeStreaks(null, 3).length === 0);
 }
 
 /* ---------- result ---------- */

@@ -463,6 +463,11 @@ function defaultSettings(){
               shows one figure. v21.3 held free text here, which could only ever sit
               alongside the recipe amount as "125 mL + 2 L". */
            stapleQty: {},
+           /* v22.0: ingredient names that start a new list in the "at home already" group,
+              built up from the shops where somebody said so every time. A plain array of
+              names, like `staples` and for the same reason — an older device reads this
+              file and must not meet a shape it cannot parse. */
+           alwaysAtHome: [],
            // Shopping-list side only: what the servings box is pre-filled with when a
            // recipe is ticked for the week. 'recipe' = that recipe's own servings;
            // 'fixed' = always shoppingServingsCount. Recipe display is never scaled.
@@ -487,6 +492,7 @@ function ensureSettings(data){
   // silently drop feature flags added in later versions
   data.settings.features = Object.assign({}, d.features, data.settings.features || {});
   if(!Array.isArray(data.settings.staples)) data.settings.staples = [];
+  if(!Array.isArray(data.settings.alwaysAtHome)) data.settings.alwaysAtHome = [];
   const q = data.settings.stapleQty;
   if(!q || typeof q !== 'object' || Array.isArray(q)) data.settings.stapleQty = {};
   else migrateStapleQty(data);
@@ -1803,6 +1809,10 @@ function tripRecordFromShopping(sd, byDevice){
       checked: !!l.checked,
       checkedAt: l.checkedAt || null,
       atHome: !!l.atHome,
+      // The stamp, not just the flag: pantryAtHome sets atHome from a category rule and
+      // never stamps it, so its presence is what tells a deliberate "we have this" from
+      // an automatic one. atHomeStreaks would be meaningless without the difference.
+      atHomeAt: l.atHomeAt || null,
       removed: !!l.removed
     }))
   };
@@ -2729,6 +2739,22 @@ function generateShoppingList(){
       }
     });
   }
+  /* v22.0: the same effect, but earned rather than guessed — things the family has said
+     "we have that" about every time they have come up. Not feature-gated, because the
+     list is empty until somebody accepts a suggestion in Settings. Wait List lines and
+     staples are excluded for exactly the reasons above: both exist because somebody
+     asked for them to be bought. */
+  const alwaysAtHome = (recipesData.settings && recipesData.settings.alwaysAtHome) || [];
+  if(alwaysAtHome.length){
+    const athSet = {};
+    alwaysAtHome.forEach(n=>{ athSet[String(n).trim().toLowerCase()] = true; });
+    arr.forEach(l=>{
+      if(athSet[(l.ingredientName || '').trim().toLowerCase()]
+         && !l.fromFridgeList && !l.fromStaples && l.source !== 'needed'){
+        l.atHome = true;
+      }
+    });
+  }
   // Carry the trip's progress across the rebuild (ticks, removals, and any explicit
   // "Need it"/"At home" choice) together with the stamps the sync merge resolves on.
   // Without the stamps a carried-over tick would look unstamped to the other device
@@ -3407,6 +3433,62 @@ function learnedRouteTrips(){
 function activeAisleOrder(){
   if(!featureOn('learnedAisleOrder')) return {};
   return aisleOrderFromHistory(learnedRouteTrips());
+}
+
+/* Pure. How many of each shop's picks actually got cooked. Nothing is amended after the
+   fact — the trip records what was bought, the recipe records when it was cooked (since
+   v22.0, honestly), and the answer is the overlap: a cook stamp falling between this shop
+   and the next one.
+   It UNDERSTATES, and deliberately so. lastCooked is a single stamp, so a recipe cooked in
+   two different weeks only counts for the later one. Reporting "at least N" is the honest
+   way to say that, and erring downwards is the safe direction for a number whose whole
+   purpose is to ask whether the week is being over-planned. */
+function cookRateSummary(trips, recipes, n){
+  const all = Array.isArray(trips) ? trips : [];
+  const byId = {};
+  (recipes || []).forEach(r=>{ if(r && r.id) byId[r.id] = r; });
+  const window = (n && n > 0) ? all.slice(Math.max(0, all.length - n)) : all.slice();
+  let picked = 0, cooked = 0;
+  window.forEach(trip=>{
+    const from = tsOf(trip && trip.doneAt);
+    // The next shop in the WHOLE history, not just the window, or the oldest trip in view
+    // would be handed an open-ended claim on every cook since.
+    const idx = all.indexOf(trip);
+    const until = (idx >= 0 && all[idx + 1]) ? tsOf(all[idx + 1].doneAt) : Infinity;
+    (((trip && trip.selections) || [])).forEach(s=>{
+      if(!s || !s.recipeId) return;
+      picked++;
+      if(s.cooked){ cooked++; return; }   // already ticked before the shop was closed
+      const r = byId[s.recipeId];
+      const t = (r && r.lastCooked) ? tsOf(r.lastCooked) : 0;
+      if(t && t >= from && t < until) cooked++;
+    });
+  });
+  return { shops: window.length, picked: picked, cooked: cooked };
+}
+
+/* Pure. Things waved past as "we already have this" every single time they have come up
+   recently. Counted backwards from the most recent shop and stopped at the first time the
+   answer was different: an item that was at home three times and then genuinely needed is
+   not a pantry item, it is one you ran out of.
+   Only DELIBERATE at-home taps count — atHomeAt is present only when somebody pressed the
+   button, never when the pantry rule set the flag from a category. */
+function atHomeStreaks(trips, minRun){
+  const need = minRun || 3;
+  const all = Array.isArray(trips) ? trips : [];
+  const runs = {}, broken = {};
+  for(let i = all.length - 1; i >= 0; i--){
+    (((all[i] && all[i].lines) || [])).forEach(l=>{
+      if(!l || !l.name || l.removed) return;
+      if(broken[l.name]) return;
+      if(l.atHome && l.atHomeAt) runs[l.name] = (runs[l.name] || 0) + 1;
+      else broken[l.name] = true;
+    });
+  }
+  return Object.keys(runs)
+    .filter(k=> !broken[k] && runs[k] >= need)
+    .sort((a,b)=> runs[b] - runs[a] || a.localeCompare(b))
+    .map(k=>({ name: k, runs: runs[k] }));
 }
 
 /* ---- Start New Shopping List tab ---- */
@@ -4183,6 +4265,32 @@ function renderMenuTab(){
     menuCard.appendChild(row);
   });
   screen.appendChild(menuCard);
+
+  /* v22.0: the quietest number in the app. Ingredients for a meal nobody got round to
+     were bought all the same, and until there was a history nothing could say so. */
+  const rate = cookRateSummary(recentTrips(0), recipesData.recipes, 6);
+  if(rate.shops >= 2 && rate.picked){
+    const perPicked = rate.picked / rate.shops, perCooked = rate.cooked / rate.shops;
+    const rateCard = el('div',{class:'card'});
+    rateCard.appendChild(el('h4',{style:'margin-top:0;'},['How the last ' + rate.shops + ' shops went']));
+    rateCard.appendChild(el('p',{style:'margin:0 0 4px;'},[
+      rate.picked + ' meals planned, at least ' + rate.cooked + ' cooked'
+      + ' — about ' + Math.round(perPicked) + ' picked a shop and at least ' + Math.round(perCooked) + ' cooked.'
+    ]));
+    if(perCooked <= perPicked - 1.5){
+      rateCard.appendChild(el('p',{class:'muted', style:'margin:0;'},[
+        'The ones that do not get cooked are shopped for all the same. Picking nearer '
+        + Math.round(perCooked) + ' would be closer to what actually happens.'
+      ]));
+    }
+    rateCard.appendChild(el('p',{class:'muted', style:'margin:6px 0 0;font-size:.8rem;'},[
+      '"At least", because a recipe records only its most recent cook — one cooked twice in '
+      + 'different weeks is counted once. Ticking meals off above as you cook them is what '
+      + 'makes this accurate.'
+    ]));
+    screen.appendChild(rateCard);
+  }
+
   container.appendChild(screen);
 
   // ---- printable fridge-door menu (hidden on screen) ----
@@ -4704,6 +4812,57 @@ function renderSettingsTab(){
         routeCard.appendChild(resetBtn);
       }
       container.appendChild(routeCard);
+    }
+  }
+
+  /* -------- Things you always have in (v22.0) -------- */
+  {
+    const athList = recipesData.settings.alwaysAtHome || [];
+    const known = {};
+    athList.forEach(n=>{ known[String(n).toLowerCase()] = true; });
+    const suggestions = atHomeStreaks(recentTrips(0), 3).filter(s=> !known[s.name.toLowerCase()]);
+    if(athList.length || suggestions.length){
+      container.appendChild(el('h3',{},['Things you always have in']));
+      const athCard = el('div',{class:'card'});
+      athCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
+        'These start a new list in the "At home already" group rather than on the buy list, '
+        + 'with one tap to say you are out. Anything on the Wait List, or in your staples, is '
+        + 'always bought whatever is here.'
+      ]));
+      athList.forEach(name=>{
+        const row = el('div',{class:'picked-row'});
+        row.appendChild(el('div',{class:'picked-name'},[name]));
+        const rm = el('button',{class:'btn tap secondary'},['Buy it again']);
+        rm.addEventListener('click', ()=>{
+          recipesData.settings.alwaysAtHome = (recipesData.settings.alwaysAtHome || [])
+            .filter(n=> String(n).toLowerCase() !== String(name).toLowerCase());
+          persist('recipes');
+          render();
+        });
+        row.appendChild(rm);
+        athCard.appendChild(row);
+      });
+      if(suggestions.length){
+        athCard.appendChild(el('p',{style:'margin:12px 0 0;'},[
+          el('strong',{},['Noticed on your recent shops'])
+        ]));
+        suggestions.slice(0, 8).forEach(s=>{
+          const row = el('div',{class:'picked-row'});
+          row.appendChild(el('div',{class:'picked-name'},[
+            s.name,
+            el('span',{class:'muted'},[' · already at home on the last ' + s.runs + ' shops it came up'])
+          ]));
+          const add = el('button',{class:'btn tap secondary'},['Start it at home']);
+          add.addEventListener('click', ()=>{
+            recipesData.settings.alwaysAtHome = (recipesData.settings.alwaysAtHome || []).concat([s.name]);
+            persist('recipes');
+            render();
+          });
+          row.appendChild(add);
+          athCard.appendChild(row);
+        });
+      }
+      container.appendChild(athCard);
     }
   }
 
