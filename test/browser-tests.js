@@ -560,6 +560,93 @@ async function suiteBulkDelete(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+
+async function suiteFridgeDoor(browser) {
+  group('The Fridge Door — chores and noticeboard');
+  // A separate app sharing the same OneDrive folder. It has no seed and no recipes, so
+  // it must come up instantly and work with no sign-in at all.
+  const srv = await serve(8179, path.join(ROOT, 'door', 'index.html'));
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  const read = () => page.evaluate(() => JSON.parse(localStorage.getItem('fdoor_family_v1')));
+  try {
+    await page.goto('http://localhost:8179/', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(900);
+
+    ok('it starts without a sign-in',
+       await page.evaluate(() => document.querySelectorAll('#mainNav button[data-tab]').length) === 3);
+    const labels = await page.evaluate(() =>
+      [...document.querySelectorAll('.nav-label')].map(n => n.textContent.trim()).filter(Boolean));
+    ok('...under Family and Shopping headings',
+       labels.indexOf('Family') !== -1 && labels.indexOf('Shopping') !== -1, labels);
+    ok('and links across to the shopping list',
+       await page.evaluate(() => { const a = document.querySelector('.nav-link'); return a && a.getAttribute('href'); }) === '../');
+
+    // --- chores ---
+    await page.fill('#app input[type=text]', 'Put the bins out');
+    await page.click('button:has-text("Add chore")');
+    await page.waitForTimeout(300);
+    let d = await read();
+    ok('a chore is stored', d.chores.length === 1 && d.chores[0].text === 'Put the bins out', d.chores);
+    ok('with a stamp and a device', !!d.chores[0].addedAt && !!d.chores[0].changedBy);
+
+    const row = await page.$('.item-row');
+    await row.$eval('input[type=checkbox]', c => c.click());
+    await page.waitForTimeout(300);
+    d = await read();
+    ok('ticking it records done with its own stamp', d.chores[0].done === true && !!d.chores[0].doneAt, d.chores[0]);
+
+    // --- deletion is a tombstone, not a removal ---
+    page.once('dialog', dlg => dlg.accept());
+    await page.click('.item-acts button');
+    await page.waitForTimeout(400);
+    d = await read();
+    ok('deleting keeps a tombstone rather than dropping the row',
+       d.chores.length === 1 && !!d.chores[0].deletedAt, d.chores);
+    ok('and it disappears from the screen',
+       await page.evaluate(() => document.querySelectorAll('.item-row').length) === 0);
+
+    // --- noticeboard ---
+    await page.click('#mainNav button[data-tab="notices"]');
+    await page.waitForTimeout(300);
+    await page.fill('#app textarea', 'Dentist rang, need to rebook');
+    await page.click('button:has-text("Put it up")');
+    await page.waitForTimeout(300);
+    d = await read();
+    ok('a notice is stored', d.notices.length === 1, d.notices);
+    ok('and shows on the board',
+       await page.evaluate(() => document.querySelectorAll('.notice').length) === 1);
+
+    await page.click('button:has-text("Pin to top")');
+    await page.waitForTimeout(300);
+    d = await read();
+    ok('pinning is stamped separately from the text', d.notices[0].pinned === true && !!d.notices[0].pinnedAt);
+
+    // --- the state survives a reload, and the tab with it ---
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(900);
+    ok('it reopens on the tab you were using',
+       await page.evaluate(() => { const b = document.querySelector('#mainNav button.active'); return b && b.dataset.tab; }) === 'notices');
+    ok('and the notice is still there',
+       await page.evaluate(() => document.querySelectorAll('.notice').length) === 1);
+
+    // --- typing is never interrupted by a repaint ---
+    await page.click('#mainNav button[data-tab="chores"]');
+    await page.waitForTimeout(300);
+    await page.click('#app input[type=text]');
+    await page.keyboard.type('half typed');
+    const kept = await page.evaluate(() => {
+      const before = document.querySelector('#app input[type=text]').value;
+      window.dispatchEvent(new Event('resize'));       // any stray repaint trigger
+      return before === document.querySelector('#app input[type=text]').value;
+    });
+    ok('an in-progress entry is not wiped', kept === true);
+
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 async function suitePrinting(browser) {
   group('printing survives Safari capturing the page late');
   const srv = await serve(8174);
@@ -796,7 +883,7 @@ async function suiteShareOneRecipe(browser) {
     // remaining suites still have something useful to say about the build.
     for (const suite of [suiteTicksSurviveRebuild, suiteRemoteMergeKeepsTicks,
                          suiteWriteSplitting, suiteStapleQuantities, suiteTypingIsNotInterrupted,
-                         suiteBulkDelete, suiteShareOneRecipe,
+                         suiteBulkDelete, suiteShareOneRecipe, suiteFridgeDoor,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
       catch (e) {

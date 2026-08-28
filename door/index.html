@@ -1,0 +1,1068 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Fridge Door</title>
+<link rel="apple-touch-icon" href="../apple-touch-icon.png">
+<meta name="theme-color" content="#435c39">
+<script>
+(function(){
+  var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if(!isIOS){
+    var l = document.createElement('link');
+    l.rel = 'manifest'; l.href = 'manifest.webmanifest';
+    document.head.appendChild(l);
+  }
+
+  /* Offline support, same design as the Fridge List: network-first for the page so a
+     cached copy can never pin a device on an old build. Scoped to /door/ so the two
+     apps never fight over each other's cache. */
+  if('serviceWorker' in navigator && location.protocol.indexOf('http') === 0){
+    window.addEventListener('load', function(){
+      navigator.serviceWorker.register('sw.js').then(function(reg){
+        function promote(w){ if(w) w.postMessage('skip-waiting'); }
+        if(reg.waiting) promote(reg.waiting);
+        reg.addEventListener('updatefound', function(){
+          var nw = reg.installing;
+          if(!nw) return;
+          nw.addEventListener('statechange', function(){
+            if(nw.state === 'installed' && navigator.serviceWorker.controller) promote(nw);
+          });
+        });
+        document.addEventListener('visibilitychange', function(){
+          if(!document.hidden) reg.update().catch(function(){});
+        });
+      }).catch(function(e){ console.warn('Service worker registration failed', e); });
+
+      var reloading = false;
+      navigator.serviceWorker.addEventListener('controllerchange', function(){
+        if(reloading) return;
+        reloading = true;
+        if(typeof window.__doorSafeToReload === 'function' && !window.__doorSafeToReload()) return;
+        location.reload();
+      });
+    });
+  }
+})();
+</script>
+<style>
+:root{
+  --bg:#f6f5f2; --card:#ffffff; --ink:#2b2b2b; --muted:#5f5b52; --accent:#5b7a4f;
+  --accent-dark:#435c39; --border:#e2ddd2; --warn:#b3541e; --danger:#a23b3b;
+  --chip:#eef1e9;
+}
+*{box-sizing:border-box;}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:var(--bg);color:var(--ink);}
+header{background:var(--accent-dark);color:#fff;padding:10px 16px;position:sticky;top:0;z-index:20;}
+header .top-row{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;}
+header h1{font-size:1.15rem;margin:0;font-weight:600;}
+
+/* --- the shell: tabs grouped under headings, rather than one flat row --- */
+nav{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;align-items:flex-end;}
+.nav-group{display:flex;flex-direction:column;gap:4px;}
+.nav-label{font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;opacity:.72;padding-left:2px;}
+.nav-buttons{display:flex;gap:4px;flex-wrap:wrap;}
+nav button,.nav-link{background:transparent;border:1px solid rgba(255,255,255,.35);color:#fff;padding:7px 12px;
+  border-radius:6px;cursor:pointer;font-size:.88rem;text-decoration:none;display:inline-block;font-family:inherit;}
+nav button.active{background:#fff;color:var(--accent-dark);font-weight:600;}
+.nav-link:hover{background:rgba(255,255,255,.14);}
+
+main{max-width:960px;margin:0 auto;padding:16px;padding-bottom:80px;}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:14px;}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
+.muted{color:var(--muted);font-size:.85rem;}
+button{font-family:inherit;}
+.btn{background:var(--accent);color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:.9rem;}
+.btn:hover{background:var(--accent-dark);}
+.btn.secondary{background:#fff;color:var(--accent-dark);border:1px solid var(--accent);}
+.btn.danger{background:var(--danger);}
+.btn.small{padding:4px 9px;font-size:.78rem;border-radius:5px;}
+.btn.tap{min-width:46px;min-height:46px;padding:6px 10px;font-size:.82rem;border-radius:8px;
+  display:inline-flex;align-items:center;justify-content:center;}
+input[type=text],input[type=search],select,textarea{
+  font-family:inherit;padding:7px 9px;border:1px solid var(--border);border-radius:6px;font-size:.9rem;background:#fff;color:var(--ink);
+}
+textarea{width:100%;resize:vertical;}
+.section-title{font-size:1rem;font-weight:700;margin:0 0 10px;color:var(--accent-dark);}
+.status-bar{font-size:.78rem;color:#d9d4c6;margin-top:6px;}
+.status-bar.ok{color:#bfe3ae;}
+.status-bar.warn{color:#f0c98a;}
+.empty-state{text-align:center;color:var(--muted);padding:40px 10px;}
+.searchbar{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;}
+.searchbar input[type=search]{flex:1;min-width:180px;}
+.tag{display:inline-block;background:var(--chip);color:var(--accent-dark);font-size:.72rem;padding:2px 8px;border-radius:20px;margin-right:4px;}
+
+.sync-alert{position:sticky;top:0;z-index:19;margin:0;padding:11px 16px;font-size:.9rem;line-height:1.35;
+  border-bottom:1px solid rgba(0,0,0,.12);}
+.sync-alert[hidden]{display:none;}
+.sync-alert.err{background:#7d2b2b;color:#fff;}
+.sync-alert.pending{background:#f0c98a;color:#4a3208;}
+.sync-alert strong{display:block;font-size:.95rem;margin-bottom:2px;}
+.sync-alert .hint{opacity:.9;font-size:.82rem;}
+
+/* --- chore and notice rows: same 52px tap target as the trolley screen --- */
+.item-row{display:flex;align-items:stretch;border-bottom:1px solid var(--border);}
+.item-row:last-child{border-bottom:none;}
+.item-tap{display:flex;align-items:center;gap:12px;flex:1;min-height:52px;padding:8px 6px 8px 2px;
+  cursor:pointer;-webkit-tap-highlight-color:rgba(91,122,79,.18);}
+.item-tap input[type=checkbox]{width:26px;height:26px;flex:0 0 auto;margin:0;}
+.item-text{font-size:.98rem;line-height:1.3;}
+.item-meta{display:block;font-size:.8rem;color:var(--muted);margin-top:2px;}
+.item-row.done .item-text{text-decoration:line-through;color:var(--muted);}
+.item-acts{display:flex;align-items:center;gap:6px;flex:0 0 auto;padding-left:6px;}
+
+.notice{border-left:4px solid var(--border);padding:10px 12px;margin-bottom:10px;background:var(--card);
+  border-radius:0 8px 8px 0;border-top:1px solid var(--border);border-right:1px solid var(--border);border-bottom:1px solid var(--border);}
+.notice.pinned{border-left-color:var(--accent);}
+.notice-text{white-space:pre-wrap;line-height:1.4;}
+.notice-meta{font-size:.78rem;color:var(--muted);margin-top:6px;}
+.person-chip{background:var(--chip);color:var(--accent-dark);border:none;border-radius:20px;
+  font-size:.78rem;padding:4px 11px;cursor:pointer;font-family:inherit;}
+.person-chip.on{background:var(--accent);color:#fff;}
+</style>
+</head>
+<body>
+<header>
+  <div class="top-row">
+    <h1>🧲 The Fridge Door</h1>
+    <button class="btn secondary" id="btnSync" type="button">Sync options</button>
+  </div>
+  <nav id="mainNav">
+    <span class="nav-group">
+      <span class="nav-label">Family</span>
+      <span class="nav-buttons">
+        <button data-tab="chores" class="active">Chores</button>
+        <button data-tab="notices">Noticeboard</button>
+      </span>
+    </span>
+    <span class="nav-group">
+      <span class="nav-label">Shopping</span>
+      <span class="nav-buttons">
+        <a class="nav-link" href="../">The Fridge List ↗</a>
+      </span>
+    </span>
+    <span class="nav-group">
+      <span class="nav-buttons">
+        <button data-tab="settings">Settings</button>
+      </span>
+    </span>
+  </nav>
+  <div class="status-bar" id="statusBar">Loading…</div>
+</header>
+<div id="syncAlert" class="sync-alert" hidden></div>
+<main id="app"></main>
+<div id="modalRoot"></div>
+
+<script src="https://alcdn.msauth.net/browser/2.35.0/js/msal-browser.min.js" crossorigin="anonymous"></script>
+<script>/* ===================== The Fridge Door ===================== */
+(function(){
+'use strict';
+
+/* The family half of the fridge door: chores and a noticeboard. The shopping list is
+   its own app in the parent folder — see the nav — and the two share one OneDrive
+   folder rather than one codebase, so neither can break the other.
+
+   Everything here follows the conventions in CLAUDE.md, because the bugs those rules
+   exist to prevent are not specific to shopping:
+     - no background path calls render() directly; they all go through repaintWhenSafe()
+     - familyData is only ever assigned inside applyMergedFamily()
+     - row handlers resolve their item by id at tap time, never by closure
+     - mergeFamilyData is pure                                                        */
+
+const APP_VERSION = 'v1.0';
+
+// Storage shim — Safari throws on localStorage for file:// pages, and any browser can
+// throw once storage is full. Neither should stop the app running.
+let storageBlockedReason = '';
+const localStorage = (function(){
+  try{
+    const probe = '__fridgedoor_probe__';
+    window.localStorage.setItem(probe, '1');
+    window.localStorage.removeItem(probe);
+    return window.localStorage;
+  }catch(e){
+    storageBlockedReason = (e && e.name === 'SecurityError')
+      ? 'This browser blocks saving for files opened straight from disk. Nothing you change will be kept.'
+      : ('Local saving is unavailable (' + ((e && e.message) || e) + '). Nothing you change will be kept.');
+    const mem = Object.create(null);
+    return {
+      getItem: k => Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null,
+      setItem: (k,v) => { mem[k] = String(v); },
+      removeItem: k => { delete mem[k]; }
+    };
+  }
+})();
+
+const LS_FAMILY   = 'fdoor_family_v1';
+const LS_ONEDRIVE_FLAG = 'fma_onedrive_connected_v4';   // shared with the Fridge List on purpose
+const LS_DEVICE_ID = 'fma_device_id_v1';                // same device identity as the Fridge List
+const LS_UI_STATE = 'fdoor_ui_state_v1';
+const LS_WHOAMI   = 'fdoor_whoami_v1';
+
+const DATA_FILE = 'family-data.json';
+const FOLDER_NAME = 'FridgeList';
+
+/* Same client id, same folder, same consent as the Fridge List — signing into one
+   signs you into the other. The redirect URI is computed from window.location, so
+   /door/ must also be registered in the app registration as a redirect URI. */
+const MSAL_CLIENT_ID = '9d7d9cf4-053d-441c-a4c6-c0a07f6dbae3';
+const MSAL_CONFIG = {
+  auth: {
+    clientId: MSAL_CLIENT_ID,
+    authority: 'https://login.microsoftonline.com/common',
+    redirectUri: window.location.origin + window.location.pathname
+  },
+  cache: { cacheLocation: 'localStorage', storeAuthStateInCookie: false }
+};
+const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
+
+// A "done" beats an "undone" inside this window: two phones are never perfectly in
+// sync, and losing a completed chore is more annoying than briefly keeping one.
+const TICK_TIE_WINDOW_MS = 10000;
+// Deleted items are kept as tombstones this long so a device that was offline cannot
+// resurrect them, then purged so the file does not grow forever.
+const TOMBSTONE_TTL_MS = 30*24*60*60*1000;
+const POLL_MS = 20000;
+const SYNC_STALE_MS = 5*60*1000;
+
+let familyData = null;
+let currentTab = 'chores';
+let msalInstance = null, msalAccount = null;
+let folderRef = null;
+let pollTimer = null, syncAlertTimer = null;
+let lastWriteError = null, syncPendingSince = null;
+let syncInFlight = false, pendingSave = false;
+let deferredRepaint = false;
+let lastSeenStamp = null;
+
+function deviceId(){
+  let id = localStorage.getItem(LS_DEVICE_ID);
+  if(!id){
+    id = 'd' + Math.random().toString(36).slice(2, 10);
+    try{ localStorage.setItem(LS_DEVICE_ID, id); }catch(e){}
+  }
+  return id;
+}
+
+function whoAmI(){ return localStorage.getItem(LS_WHOAMI) || ''; }
+function setWhoAmI(name){ try{ localStorage.setItem(LS_WHOAMI, name || ''); }catch(e){} }
+
+/* ---------------- tiny DOM helper ---------------- */
+
+function el(tag, attrs, children){
+  const e = document.createElement(tag);
+  if(attrs) Object.entries(attrs).forEach(([k,v])=>{
+    if(k==='class') e.className = v;
+    else if(k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v);
+  });
+  (children||[]).forEach(c=>{ if(c) e.appendChild(typeof c==='string'?document.createTextNode(c):c); });
+  return e;
+}
+
+function setStatus(msg, cls){
+  const bar = document.getElementById('statusBar');
+  bar.textContent = msg;
+  bar.className = 'status-bar' + (cls ? ' ' + cls : '');
+}
+
+/* ---------------- data shape ---------------- */
+
+function defaultFamilyData(){
+  return { chores: [], notices: [], people: [], lastUpdated: null };
+}
+
+function newId(prefix){
+  return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+}
+
+function tsOf(v){ return v ? (Date.parse(v) || 0) : 0; }
+
+/* ---------------- merge ----------------
+   Union by id with per-flag timestamps, and deletion as a tombstone on the entry
+   itself. The Fridge List's Wait List cannot do this — changing its shape would break
+   older devices — but this file is new, so it is worth doing properly from the start:
+   an addition made offline can never be lost, and a deletion still propagates. */
+
+function mergeFlag(aVal, aAt, bVal, bAt, tickBias){
+  const at = tsOf(aAt), bt = tsOf(bAt);
+  if(at && bt){
+    if(tickBias && Math.abs(at - bt) <= TICK_TIE_WINDOW_MS && (aVal || bVal)){
+      return { val: true, at: at >= bt ? aAt : bAt };
+    }
+    return at >= bt ? { val: !!aVal, at: aAt } : { val: !!bVal, at: bAt };
+  }
+  if(at) return (tickBias && bVal && !aVal) ? { val:true, at:aAt } : { val: !!aVal, at: aAt };
+  if(bt) return (tickBias && aVal && !bVal) ? { val:true, at:bAt } : { val: !!bVal, at: bAt };
+  return { val: !!(aVal || bVal), at: null };
+}
+
+function mergeChore(x, y){
+  const xNewer = tsOf(x.changedAt) >= tsOf(y.changedAt);
+  const out = Object.assign({}, xNewer ? y : x, xNewer ? x : y);
+  const d = mergeFlag(x.done, x.doneAt, y.done, y.doneAt, true);
+  out.done = d.val;
+  if(d.at) out.doneAt = d.at; else delete out.doneAt;
+  // A deletion is never undone by the other side simply not having seen it yet.
+  out.deletedAt = tsOf(x.deletedAt) >= tsOf(y.deletedAt) ? (x.deletedAt || y.deletedAt) : (y.deletedAt || x.deletedAt);
+  if(!out.deletedAt) delete out.deletedAt;
+  out.changedAt = [x.changedAt, y.changedAt, d.at].reduce((best,v)=> tsOf(v) > tsOf(best) ? v : best, null);
+  return out;
+}
+
+function mergeNotice(x, y){
+  const xNewer = tsOf(x.changedAt) >= tsOf(y.changedAt);
+  const out = Object.assign({}, xNewer ? y : x, xNewer ? x : y);
+  const p = mergeFlag(x.pinned, x.pinnedAt, y.pinned, y.pinnedAt, false);
+  out.pinned = p.val;
+  if(p.at) out.pinnedAt = p.at; else delete out.pinnedAt;
+  out.deletedAt = tsOf(x.deletedAt) >= tsOf(y.deletedAt) ? (x.deletedAt || y.deletedAt) : (y.deletedAt || x.deletedAt);
+  if(!out.deletedAt) delete out.deletedAt;
+  out.changedAt = [x.changedAt, y.changedAt, p.at].reduce((best,v)=> tsOf(v) > tsOf(best) ? v : best, null);
+  return out;
+}
+
+function mergeList(a, b, mergeOne){
+  const byId = new Map(); const order = [];
+  const take = it => {
+    if(!it || !it.id) return;
+    if(byId.has(it.id)) byId.set(it.id, mergeOne(byId.get(it.id), it));
+    else { byId.set(it.id, Object.assign({}, it)); order.push(it.id); }
+  };
+  (a||[]).forEach(take);
+  (b||[]).forEach(take);
+  return order.map(id => byId.get(id));
+}
+
+// Pure: builds a new object and mutates neither input.
+function mergeFamilyData(a, b){
+  if(!a) return b;
+  if(!b) return a;
+  const newer = tsOf(a.lastUpdated) >= tsOf(b.lastUpdated) ? a : b;
+  return {
+    chores:  mergeList(a.chores,  b.chores,  mergeChore),
+    notices: mergeList(a.notices, b.notices, mergeNotice),
+    // People is a small set that only grows in practice; union it so a name added on
+    // one phone is never dropped by the other's save.
+    people:  Array.from(new Set([].concat(a.people||[], b.people||[]))).sort(),
+    lastUpdated: newer.lastUpdated
+  };
+}
+
+// Drop tombstones old enough that no device can still be carrying the original.
+function purgeTombstones(data){
+  const cutoff = Date.now() - TOMBSTONE_TTL_MS;
+  const keep = it => !it.deletedAt || tsOf(it.deletedAt) > cutoff;
+  data.chores  = (data.chores  || []).filter(keep);
+  data.notices = (data.notices || []).filter(keep);
+  return data;
+}
+
+const liveChores  = () => (familyData.chores  || []).filter(c => !c.deletedAt);
+const liveNotices = () => (familyData.notices || []).filter(n => !n.deletedAt);
+
+/* ---------------- repaint gate ----------------
+   A background sync must never rebuild the page while somebody is typing into it.
+   Same rule, and the same bug behind it, as the Fridge List. */
+
+function safeToRepaint(){
+  if(document.getElementById('modalRoot').innerHTML !== '') return false;
+  const ae = document.activeElement;
+  if(ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT')) return false;
+  return true;
+}
+
+function repaintWhenSafe(){
+  if(!safeToRepaint()){ deferredRepaint = true; return false; }
+  deferredRepaint = false;
+  const y = window.scrollY;
+  render();
+  requestAnimationFrame(()=> window.scrollTo(0, y));
+  return true;
+}
+
+function flushDeferredRepaint(){
+  if(!deferredRepaint || !safeToRepaint()) return;
+  deferredRepaint = false;
+  repaintWhenSafe();
+}
+document.addEventListener('focusout', ()=> setTimeout(flushDeferredRepaint, 0));
+
+window.__doorSafeToReload = function(){
+  if(!safeToRepaint()) return false;
+  if(pendingSave) return false;
+  return true;
+};
+
+/* The only way familyData is ever replaced. Returns whether anything changed, so a
+   sync that brings back an identical copy neither repaints nor interrupts anyone. */
+function applyMergedFamily(merged){
+  if(JSON.stringify(merged) === JSON.stringify(familyData)) return false;
+  familyData = merged;
+  saveLocal();
+  repaintWhenSafe();
+  return true;
+}
+
+/* ---------------- persistence ---------------- */
+
+function saveLocal(){
+  try{ localStorage.setItem(LS_FAMILY, JSON.stringify(familyData)); }
+  catch(e){ storageBlockedReason = 'Could not save locally (' + ((e && e.message) || e) + ').'; }
+}
+
+function persist(){
+  familyData.lastUpdated = new Date().toISOString();
+  purgeTombstones(familyData);
+  saveLocal();
+  pendingSave = true;
+  markSyncPending();
+  autoSave();
+}
+
+function saveUiState(){
+  try{ localStorage.setItem(LS_UI_STATE, JSON.stringify({ tab: currentTab })); }catch(e){}
+}
+function loadUiState(){
+  try{
+    const s = JSON.parse(localStorage.getItem(LS_UI_STATE) || '{}');
+    if(['chores','notices','settings'].indexOf(s.tab) !== -1) currentTab = s.tab;
+  }catch(e){}
+}
+
+/* ---------------- sync health ---------------- */
+
+function writeErrorMessage(status, name){
+  switch(status){
+    case 507: return ['The OneDrive account holding the ' + FOLDER_NAME + ' folder is full.',
+                      'Nothing is being saved. Free up space on that account, then try again.'];
+    case 403: return ['This account cannot write to the shared ' + FOLDER_NAME + ' folder.',
+                      'The folder is shared read-only. The owner needs to re-share it with edit permission.'];
+    case 401: return ['OneDrive sign-in has expired.', 'Open Sync options and sign in again.'];
+    case 404: return ['The ' + FOLDER_NAME + ' folder or ' + (name||'a data file') + ' could not be found.',
+                      'It may have been moved or renamed in OneDrive. Check Sync options.'];
+    case 412: return ['Another device changed ' + (name||'this file') + ' at the same time.',
+                      'Nothing was overwritten — your copy is safe on this device.'];
+    case 429: case 503: case 509:
+      return ['OneDrive is busy and refused the save.', 'This usually clears by itself — the app keeps retrying.'];
+    default:  return ['Could not save to OneDrive (HTTP ' + status + ').',
+                      'Your changes are safe on this device but are not reaching the other devices.'];
+  }
+}
+
+function renderSyncAlert(){
+  const box = document.getElementById('syncAlert');
+  if(!box) return;
+  if(lastWriteError){
+    const [head, hint] = writeErrorMessage(lastWriteError.status, lastWriteError.name);
+    box.className = 'sync-alert err'; box.innerHTML = '';
+    box.appendChild(el('strong',{},[head]));
+    box.appendChild(el('span',{class:'hint'},[hint]));
+    box.hidden = false; return;
+  }
+  if(syncPendingSince && (Date.now() - syncPendingSince) > SYNC_STALE_MS){
+    const mins = Math.round((Date.now() - syncPendingSince)/60000);
+    box.className = 'sync-alert pending'; box.innerHTML = '';
+    box.appendChild(el('strong',{},['Changes have not reached OneDrive for ' + mins + ' minutes.']));
+    box.appendChild(el('span',{class:'hint'},['They are saved on this device. Other devices will not see them yet.']));
+    box.hidden = false; return;
+  }
+  box.hidden = true;
+}
+function markSyncPending(){ if(!syncPendingSince) syncPendingSince = Date.now(); renderSyncAlert(); }
+function markSyncOk(){ lastWriteError = null; syncPendingSince = null; renderSyncAlert(); }
+function markSyncFailed(status, name){ lastWriteError = { status, name }; renderSyncAlert(); }
+if(!syncAlertTimer) syncAlertTimer = setInterval(renderSyncAlert, 60000);
+
+/* ---------------- OneDrive ---------------- */
+
+function oneDriveSupported(){ return typeof msal !== 'undefined'; }
+
+async function initMsal(){
+  if(!oneDriveSupported()){
+    console.warn('MSAL.js did not load — OneDrive sync unavailable this session.');
+    return;
+  }
+  try{
+    msalInstance = new msal.PublicClientApplication(MSAL_CONFIG);
+    const resp = await msalInstance.handleRedirectPromise();
+    if(resp && resp.account) msalAccount = resp.account;
+    else {
+      const accounts = msalInstance.getAllAccounts();
+      if(accounts.length) msalAccount = accounts[0];
+    }
+    if(msalAccount && localStorage.getItem(LS_ONEDRIVE_FLAG) === '1'){
+      await loadFromOneDrive();
+      setStatus('Connected to OneDrive (' + (msalAccount.username||'') + ').', 'ok');
+      startPolling();
+    }
+  }catch(e){ console.error('MSAL init failed', e); }
+}
+
+async function signIn(){
+  if(!oneDriveSupported()){
+    alert('The Microsoft sign-in library did not load. Check your connection and try again.');
+    return;
+  }
+  try{
+    localStorage.setItem(LS_ONEDRIVE_FLAG, '1');
+    await msalInstance.loginRedirect({ scopes: GRAPH_SCOPES, prompt: 'select_account' });
+  }catch(e){ setStatus('Sign-in failed: ' + e.message, 'warn'); }
+}
+
+function signOut(){
+  stopPolling();
+  localStorage.removeItem(LS_ONEDRIVE_FLAG);
+  folderRef = null;
+  const account = msalAccount;
+  msalAccount = null;
+  if(msalInstance && account) msalInstance.logoutRedirect({ account });
+  else { setStatus('Signed out of OneDrive.', 'ok'); render(); }
+}
+
+async function getToken(){
+  if(!msalInstance || !msalAccount) return null;
+  try{
+    const res = await msalInstance.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: msalAccount });
+    return res.accessToken;
+  }catch(e){
+    try{
+      localStorage.setItem(LS_ONEDRIVE_FLAG, '1');
+      await msalInstance.acquireTokenRedirect({ scopes: GRAPH_SCOPES, account: msalAccount });
+    }catch(e2){ console.error(e2); }
+    return null;
+  }
+}
+
+async function graphFetch(path, token, opts){
+  opts = opts || {};
+  const headers = Object.assign({ 'Authorization': 'Bearer ' + token }, opts.headers || {});
+  return fetch('https://graph.microsoft.com/v1.0' + path, Object.assign({}, opts, { headers }));
+}
+
+/* Finds the same FridgeList folder the shopping list uses. A family member who does
+   not own it needs a shortcut in their own OneDrive first — onedrive.com, Shared,
+   FridgeList, "Add shortcut to My files" — exactly as for the Fridge List. */
+async function resolveFolder(token){
+  const res = await graphFetch('/me/drive/root:/' + FOLDER_NAME, token);
+  if(res.status === 200){
+    const j = await res.json();
+    if(j.remoteItem) return { driveId: j.remoteItem.parentReference.driveId, itemId: j.remoteItem.id };
+    return { driveId: j.parentReference.driveId, itemId: j.id };
+  }
+  const shared = await graphFetch('/me/drive/sharedWithMe', token);
+  if(shared.status === 200){
+    const j = await shared.json();
+    const hit = (j.value || []).find(it => it.name === FOLDER_NAME && it.folder && it.remoteItem);
+    if(hit) return { driveId: hit.remoteItem.parentReference.driveId, itemId: hit.remoteItem.id };
+  }
+  return null;
+}
+
+async function fetchRemote(token){
+  if(!folderRef) return null;
+  const { driveId, itemId } = folderRef;
+  const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/' + DATA_FILE, token);
+  if(res.status !== 200) return null;                    // 404 = not created yet
+  const meta = await res.json();
+  let data = null;
+  try{
+    const dl = meta['@microsoft.graph.downloadUrl'];
+    if(dl){ const r = await fetch(dl); if(r.ok) data = await r.json(); }
+  }catch(e){ console.warn('family download failed', e); }
+  return { etag: meta.eTag, modified: meta.lastModifiedDateTime, data };
+}
+
+/* Merge-then-write guarded by the file's ETag. On a 412 somebody else wrote between
+   our read and our write, so re-merge their copy in and try again rather than
+   overwriting it. Never falls back to an unguarded write. */
+async function writeMerged(token){
+  const { driveId, itemId } = folderRef;
+  for(let attempt = 0; attempt < 5; attempt++){
+    const remote = await fetchRemote(token);
+    if(remote && remote.data) applyMergedFamily(mergeFamilyData(familyData, remote.data));
+    const headers = { 'Content-Type': 'application/json' };
+    if(remote && remote.etag) headers['If-Match'] = remote.etag;
+    const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/' + DATA_FILE + ':/content', token, {
+      method: 'PUT', headers, body: JSON.stringify(familyData)
+    });
+    if(res.status === 200 || res.status === 201){
+      try{
+        const wrote = await res.json();
+        if(wrote && wrote.lastModifiedDateTime) lastSeenStamp = wrote.lastModifiedDateTime;
+      }catch(e){}
+      return true;
+    }
+    if(res.status !== 412){
+      lastWriteError = { status: res.status, name: DATA_FILE };
+      return false;
+    }
+  }
+  lastWriteError = { status: 412, name: DATA_FILE };
+  return false;
+}
+
+let saveTimer = null;
+function autoSave(){
+  if(!msalAccount || localStorage.getItem(LS_ONEDRIVE_FLAG) !== '1') return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async ()=>{
+    const token = await getToken();
+    if(!token){ markSyncFailed(401, DATA_FILE); return; }
+    if(!folderRef) folderRef = await resolveFolder(token);
+    if(!folderRef){ markSyncFailed(404, FOLDER_NAME); return; }
+    lastWriteError = null;
+    const ok = await writeMerged(token);
+    pendingSave = false;
+    if(ok){
+      markSyncOk();
+      setStatus('Saved — ' + new Date().toLocaleTimeString(), 'ok');
+    } else {
+      const err = lastWriteError || { status: 0, name: DATA_FILE };
+      markSyncFailed(err.status, err.name);
+      setStatus(writeErrorMessage(err.status, err.name)[0], 'warn');
+    }
+  }, 600);
+}
+
+async function loadFromOneDrive(){
+  const token = await getToken();
+  if(!token){ setStatus('Could not get a sign-in token — try Sync options.', 'warn'); return; }
+  try{
+    folderRef = await resolveFolder(token);
+    if(!folderRef){
+      setStatus('No "' + FOLDER_NAME + '" folder found. Set up the Fridge List first, then reload.', 'warn');
+      return;
+    }
+    const remote = await fetchRemote(token);
+    if(remote && remote.data){
+      lastSeenStamp = remote.modified;
+      applyMergedFamily(mergeFamilyData(familyData, remote.data));
+    } else {
+      // Nothing there yet: seed the file so the other devices have something to find.
+      await writeMerged(token);
+    }
+  }catch(e){
+    console.error(e);
+    setStatus('Could not sync: ' + e.message, 'warn');
+  }
+}
+
+async function poll(){
+  if(document.hidden) return;
+  if(!safeToRepaint()) return;                 // never interrupt typing or a modal
+  if(!msalAccount || !folderRef || localStorage.getItem(LS_ONEDRIVE_FLAG) !== '1') return;
+  if(syncInFlight) return;
+  syncInFlight = true;
+  try{
+    const token = await getToken();
+    if(!token) return;
+    const { driveId, itemId } = folderRef;
+    const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/' + DATA_FILE + '?$select=lastModifiedDateTime', token);
+    if(res.status !== 200) return;
+    const meta = await res.json();
+    if(lastSeenStamp === meta.lastModifiedDateTime) return;   // nothing new; don't download
+    lastSeenStamp = meta.lastModifiedDateTime;
+    const remote = await fetchRemote(token);
+    if(remote && remote.data && applyMergedFamily(mergeFamilyData(familyData, remote.data))){
+      setStatus('Updated from another device — ' + new Date().toLocaleTimeString(), 'ok');
+    }
+  }catch(e){ console.warn('poll failed', e); }
+  finally{ syncInFlight = false; }
+}
+
+function startPolling(){ stopPolling(); pollTimer = setInterval(poll, POLL_MS); }
+function stopPolling(){ if(pollTimer){ clearInterval(pollTimer); pollTimer = null; } }
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) poll(); });
+
+/* ---------------- modal ---------------- */
+
+function openModal(bodyEl){
+  const root = document.getElementById('modalRoot');
+  const backdrop = el('div',{class:'modal-backdrop', style:'position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:flex-start;justify-content:center;padding:30px 12px;overflow:auto;z-index:50;'});
+  const modal = el('div',{style:'background:#fff;border-radius:10px;max-width:640px;width:100%;padding:20px;position:relative;'});
+  const close = el('button',{class:'close-x', style:'position:absolute;top:10px;right:14px;background:none;border:none;font-size:1.3rem;cursor:pointer;color:var(--muted);'},['×']);
+  close.addEventListener('click', closeModal);
+  modal.appendChild(close); modal.appendChild(bodyEl);
+  backdrop.appendChild(modal);
+  backdrop.addEventListener('click', e=>{ if(e.target === backdrop) closeModal(); });
+  root.innerHTML = ''; root.appendChild(backdrop);
+}
+function closeModal(){ document.getElementById('modalRoot').innerHTML = ''; flushDeferredRepaint(); }
+
+/* ---------------- rendering ---------------- */
+
+function render(){
+  document.querySelectorAll('#mainNav button[data-tab]').forEach(b=>
+    b.classList.toggle('active', b.dataset.tab === currentTab));
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+  if(currentTab === 'chores') app.appendChild(renderChoresTab());
+  else if(currentTab === 'notices') app.appendChild(renderNoticesTab());
+  else app.appendChild(renderSettingsTab());
+}
+
+function bindNav(){
+  document.getElementById('mainNav').addEventListener('click', e=>{
+    const btn = e.target.closest('button[data-tab]');
+    if(!btn) return;
+    currentTab = btn.dataset.tab;
+    saveUiState();
+    render();
+  });
+  document.getElementById('btnSync').addEventListener('click', showSyncModal);
+}
+
+function personPicker(selected, onPick){
+  const wrap = el('div',{class:'row', style:'gap:6px;margin:6px 0;'});
+  const people = familyData.people || [];
+  if(!people.length){
+    wrap.appendChild(el('span',{class:'muted'},['Add family names in Settings to assign chores.']));
+    return wrap;
+  }
+  const mk = (name, label)=>{
+    const b = el('button',{class:'person-chip' + (selected === name ? ' on' : ''), type:'button'},[label]);
+    b.addEventListener('click', ()=> onPick(name));
+    return b;
+  };
+  wrap.appendChild(mk('', 'Anyone'));
+  people.forEach(p=> wrap.appendChild(mk(p, p)));
+  return wrap;
+}
+
+/* ---- Chores ---- */
+
+function renderChoresTab(){
+  const c = el('div',{});
+  c.appendChild(el('div',{class:'card'},[
+    el('p',{class:'muted', style:'margin:0;'},[
+      'What needs doing this week. Tick things off as you do them — everyone else sees it within a few seconds.'
+    ])
+  ]));
+
+  // --- add form ---
+  const add = el('div',{class:'card'});
+  const input = el('input',{type:'text', placeholder:'Something that needs doing…', style:'flex:1;min-width:180px;'});
+  let assignee = whoAmI();
+  const picker = el('div',{});
+  const drawPicker = ()=>{
+    picker.innerHTML = '';
+    picker.appendChild(personPicker(assignee, n=>{ assignee = n; drawPicker(); }));
+  };
+  drawPicker();
+  const addBtn = el('button',{class:'btn'},['Add chore']);
+  function addChore(){
+    const text = input.value.trim();
+    if(!text) return;
+    const now = new Date().toISOString();
+    familyData.chores.push({
+      id: newId('c'), text, assignee: assignee || '', done: false,
+      addedAt: now, addedBy: whoAmI() || deviceId(), changedAt: now, changedBy: deviceId()
+    });
+    input.value = '';
+    persist();
+    render();
+  }
+  addBtn.addEventListener('click', addChore);
+  input.addEventListener('keydown', e=>{ if(e.key === 'Enter'){ e.preventDefault(); addChore(); } });
+  add.appendChild(el('div',{class:'row'},[input, addBtn]));
+  add.appendChild(picker);
+  c.appendChild(add);
+
+  const chores = liveChores();
+  const outstanding = chores.filter(x=>!x.done);
+  const done = chores.filter(x=>x.done);
+
+  if(!chores.length){
+    c.appendChild(el('div',{class:'empty-state'},['Nothing on the list. Enjoy it while it lasts.']));
+    return c;
+  }
+
+  const mine = whoAmI();
+  const sortFn = (a,b)=>{
+    if(mine){
+      const am = a.assignee === mine ? 0 : 1, bm = b.assignee === mine ? 0 : 1;
+      if(am !== bm) return am - bm;               // your own chores first
+    }
+    return tsOf(a.addedAt) - tsOf(b.addedAt);
+  };
+
+  if(outstanding.length){
+    const card = el('div',{class:'card'});
+    card.appendChild(el('div',{class:'section-title'},['To do (' + outstanding.length + ')']));
+    outstanding.slice().sort(sortFn).forEach(ch=> card.appendChild(choreRow(ch)));
+    c.appendChild(card);
+  }
+  if(done.length){
+    const card = el('div',{class:'card'});
+    card.appendChild(el('div',{class:'section-title'},['Done (' + done.length + ')']));
+    done.slice().sort((a,b)=> tsOf(b.doneAt) - tsOf(a.doneAt)).forEach(ch=> card.appendChild(choreRow(ch)));
+    const clear = el('button',{class:'btn small secondary', style:'margin-top:10px;'},['Clear the done ones']);
+    clear.addEventListener('click', ()=>{
+      if(!confirm('Clear ' + done.length + ' completed chore(s)? They disappear for everyone.')) return;
+      const now = new Date().toISOString();
+      done.forEach(d=>{
+        const live = familyData.chores.find(x=> x.id === d.id);
+        if(live){ live.deletedAt = now; live.changedAt = now; live.changedBy = deviceId(); }
+      });
+      persist(); render();
+    });
+    card.appendChild(clear);
+    c.appendChild(card);
+  }
+  return c;
+}
+
+function choreRow(chore){
+  // Resolve by id at tap time — a sync may have replaced this object since it was drawn.
+  const id = chore.id;
+  const row = el('div',{class:'item-row' + (chore.done ? ' done' : '')});
+  const tap = el('label',{class:'item-tap'});
+  const cb = el('input',{type:'checkbox'});
+  cb.checked = !!chore.done;
+  cb.addEventListener('change', ()=>{
+    const live = (familyData.chores || []).find(x=> x.id === id);
+    if(!live){ render(); return; }
+    const now = new Date().toISOString();
+    live.done = cb.checked;
+    live.doneAt = now;
+    live.changedAt = now;
+    live.changedBy = deviceId();
+    if(cb.checked && !live.doneBy) live.doneBy = whoAmI() || '';
+    if(!cb.checked) delete live.doneBy;
+    persist();
+    render();
+  });
+  const label = el('div',{});
+  label.appendChild(el('span',{class:'item-text'},[chore.text]));
+  const bits = [];
+  if(chore.assignee) bits.push(chore.assignee);
+  if(chore.done && chore.doneBy) bits.push('done by ' + chore.doneBy);
+  if(bits.length) label.appendChild(el('span',{class:'item-meta'},[bits.join(' · ')]));
+  tap.appendChild(cb); tap.appendChild(label);
+  row.appendChild(tap);
+
+  const acts = el('div',{class:'item-acts'});
+  const del = el('button',{class:'btn tap danger', title:'Remove this chore'},['✕']);
+  del.addEventListener('click', ()=>{
+    const live = (familyData.chores || []).find(x=> x.id === id);
+    if(!live) { render(); return; }
+    if(!confirm('Remove "' + live.text + '"?')) return;
+    const now = new Date().toISOString();
+    live.deletedAt = now; live.changedAt = now; live.changedBy = deviceId();
+    persist(); render();
+  });
+  acts.appendChild(del);
+  row.appendChild(acts);
+  return row;
+}
+
+/* ---- Noticeboard ---- */
+
+function renderNoticesTab(){
+  const c = el('div',{});
+  c.appendChild(el('div',{class:'card'},[
+    el('p',{class:'muted', style:'margin:0;'},[
+      'Things the household needs to know. Pin anything that should stay at the top.'
+    ])
+  ]));
+
+  const add = el('div',{class:'card'});
+  const box = el('textarea',{rows:'3', placeholder:'Write a note for everyone…'});
+  const addBtn = el('button',{class:'btn'},['Put it up']);
+  function addNotice(){
+    const text = box.value.trim();
+    if(!text) return;
+    const now = new Date().toISOString();
+    familyData.notices.push({
+      id: newId('n'), text, author: whoAmI() || '', pinned: false,
+      addedAt: now, changedAt: now, changedBy: deviceId()
+    });
+    box.value = '';
+    persist(); render();
+  }
+  addBtn.addEventListener('click', addNotice);
+  add.appendChild(box);
+  add.appendChild(el('div',{class:'row', style:'margin-top:8px;'},[addBtn]));
+  c.appendChild(add);
+
+  const notices = liveNotices();
+  if(!notices.length){
+    c.appendChild(el('div',{class:'empty-state'},['Nothing on the board.']));
+    return c;
+  }
+  notices.slice().sort((a,b)=>{
+    if(!!b.pinned !== !!a.pinned) return b.pinned ? 1 : -1;     // pinned first
+    return tsOf(b.addedAt) - tsOf(a.addedAt);                    // then newest
+  }).forEach(n=> c.appendChild(noticeCard(n)));
+  return c;
+}
+
+function noticeCard(notice){
+  const id = notice.id;
+  const wrap = el('div',{class:'notice' + (notice.pinned ? ' pinned' : '')});
+  wrap.appendChild(el('div',{class:'notice-text'},[notice.text]));
+
+  const when = notice.addedAt ? new Date(notice.addedAt) : null;
+  const meta = [];
+  if(notice.author) meta.push(notice.author);
+  if(when) meta.push(when.toLocaleDateString(undefined,{weekday:'short', day:'numeric', month:'short'})
+                     + ' ' + when.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}));
+  wrap.appendChild(el('div',{class:'notice-meta'},[meta.join(' · ')]));
+
+  const acts = el('div',{class:'row', style:'margin-top:8px;gap:6px;'});
+  const pin = el('button',{class:'btn small secondary'},[notice.pinned ? 'Unpin' : 'Pin to top']);
+  pin.addEventListener('click', ()=>{
+    const live = (familyData.notices || []).find(x=> x.id === id);
+    if(!live){ render(); return; }
+    const now = new Date().toISOString();
+    live.pinned = !live.pinned;
+    live.pinnedAt = now; live.changedAt = now; live.changedBy = deviceId();
+    persist(); render();
+  });
+  const del = el('button',{class:'btn small danger'},['Take it down']);
+  del.addEventListener('click', ()=>{
+    const live = (familyData.notices || []).find(x=> x.id === id);
+    if(!live){ render(); return; }
+    if(!confirm('Take this note down? It goes for everyone.')) return;
+    const now = new Date().toISOString();
+    live.deletedAt = now; live.changedAt = now; live.changedBy = deviceId();
+    persist(); render();
+  });
+  acts.appendChild(pin); acts.appendChild(del);
+  wrap.appendChild(acts);
+  return wrap;
+}
+
+/* ---- Settings ---- */
+
+function renderSettingsTab(){
+  const c = el('div',{});
+
+  c.appendChild(el('h3',{style:'margin-top:0;'},['Who are you?']));
+  const meCard = el('div',{class:'card'});
+  meCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
+    'Used to show who added a note and who did a chore, and to float your own chores to the top. '
+    + 'It is remembered on this device only — everyone sets their own.'
+  ]));
+  const meWrap = el('div',{});
+  const drawMe = ()=>{
+    meWrap.innerHTML = '';
+    meWrap.appendChild(personPicker(whoAmI(), n=>{ setWhoAmI(n); drawMe(); render(); }));
+  };
+  drawMe();
+  meCard.appendChild(meWrap);
+  c.appendChild(meCard);
+
+  c.appendChild(el('h3',{},['Family names']));
+  const pCard = el('div',{class:'card'});
+  pCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
+    'Shared with everyone, so chores can be assigned by name.'
+  ]));
+  const pInput = el('input',{type:'text', placeholder:'A name…'});
+  const pAdd = el('button',{class:'btn small'},['Add']);
+  function addPerson(){
+    const v = pInput.value.trim();
+    if(!v) return;
+    if(!(familyData.people||[]).some(p=> p.toLowerCase() === v.toLowerCase())){
+      familyData.people = (familyData.people || []).concat([v]).sort();
+      persist();
+    }
+    pInput.value = '';
+    render();
+  }
+  pAdd.addEventListener('click', addPerson);
+  pInput.addEventListener('keydown', e=>{ if(e.key === 'Enter'){ e.preventDefault(); addPerson(); } });
+  pCard.appendChild(el('div',{class:'row'},[pInput, pAdd]));
+  (familyData.people || []).forEach(p=>{
+    const row = el('div',{class:'row', style:'margin-top:8px;'});
+    row.appendChild(el('span',{style:'flex:1;'},[p]));
+    const rm = el('button',{class:'btn small danger'},['✕']);
+    rm.addEventListener('click', ()=>{
+      if(!confirm('Remove ' + p + '? Chores already assigned to them keep the name.')) return;
+      familyData.people = (familyData.people||[]).filter(x=> x !== p);
+      if(whoAmI() === p) setWhoAmI('');
+      persist(); render();
+    });
+    row.appendChild(rm);
+    pCard.appendChild(row);
+  });
+  c.appendChild(pCard);
+
+  c.appendChild(el('h3',{},['Sync']));
+  const sCard = el('div',{class:'card'});
+  const connected = msalAccount && localStorage.getItem(LS_ONEDRIVE_FLAG) === '1';
+  sCard.appendChild(el('p',{},[
+    connected ? ('Connected to OneDrive as ' + (msalAccount.username || '') + '.')
+              : 'Not connected. Chores and notes are only on this device.'
+  ]));
+  sCard.appendChild(el('p',{class:'muted'},[
+    'The Fridge Door shares the ' + FOLDER_NAME + ' folder with The Fridge List, in a separate file '
+    + '(' + DATA_FILE + '). Signing in here signs you into both.'
+  ]));
+  const sBtn = el('button',{class:'btn'},[connected ? 'Sign out' : 'Sign in to OneDrive']);
+  sBtn.addEventListener('click', connected ? signOut : signIn);
+  sCard.appendChild(sBtn);
+  c.appendChild(sCard);
+
+  c.appendChild(el('p',{class:'muted', style:'margin-top:18px;'},['The Fridge Door ' + APP_VERSION]));
+  return c;
+}
+
+function showSyncModal(){
+  const body = el('div',{});
+  body.appendChild(el('h3',{style:'margin-top:0;'},['Sync options']));
+  const connected = msalAccount && localStorage.getItem(LS_ONEDRIVE_FLAG) === '1';
+  body.appendChild(el('p',{},[
+    connected ? ('Signed in as ' + (msalAccount.username || '') + '.') : 'Not signed in.'
+  ]));
+  body.appendChild(el('p',{class:'muted'},[
+    'Chores and notes live in ' + DATA_FILE + ', in the same ' + FOLDER_NAME + ' folder as your '
+    + 'shopping list. If you have not set that folder up yet, do the Fridge List first.'
+  ]));
+  const row = el('div',{class:'row', style:'margin-top:14px;'});
+  const b = el('button',{class:'btn'},[connected ? 'Sign out' : 'Sign in to OneDrive']);
+  b.addEventListener('click', ()=>{ closeModal(); (connected ? signOut : signIn)(); });
+  const close = el('button',{class:'btn secondary'},['Close']);
+  close.addEventListener('click', closeModal);
+  row.appendChild(b); row.appendChild(close);
+  body.appendChild(row);
+  openModal(body);
+}
+
+/* ---------------- startup ---------------- */
+
+function init(){
+  const saved = localStorage.getItem(LS_FAMILY);
+  familyData = saved ? JSON.parse(saved) : defaultFamilyData();
+  // Tolerate a file written by a newer build, or a half-written one.
+  familyData.chores  = Array.isArray(familyData.chores)  ? familyData.chores  : [];
+  familyData.notices = Array.isArray(familyData.notices) ? familyData.notices : [];
+  familyData.people  = Array.isArray(familyData.people)  ? familyData.people  : [];
+  purgeTombstones(familyData);
+  loadUiState();
+  bindNav();
+  initMsal();
+  render();
+  setStatus(storageBlockedReason
+    || ('The Fridge Door ' + APP_VERSION + ' — working from this device’s copy.'),
+    storageBlockedReason ? 'warn' : 'ok');
+}
+
+document.addEventListener('DOMContentLoaded', function(){
+  try{ init(); }
+  catch(err){
+    const app = document.getElementById('app');
+    if(app){
+      app.innerHTML = '<div class="card"><h3>The Fridge Door could not start</h3><p>'
+        + String((err && err.message) || err).replace(/[<>&]/g,'') + '</p></div>';
+    }
+    throw err;
+  }
+});
+
+})();
+</script>
+</body>
+</html>

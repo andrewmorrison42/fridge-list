@@ -32,6 +32,21 @@ and keep only what you want.
 
 ---
 
+## The Fridge Door
+
+A second, separate app for the family half of the fridge door — **chores** and a
+**noticeboard** — living at
+[`/door/`](https://andrewmorrison42.github.io/fridge-list/door/).
+
+It shares the same OneDrive `FridgeList` folder and the same sign-in, in its own file
+(`family-data.json`), so signing into one signs you into both. The shopping list is
+untouched by it: two apps sharing a folder, not one codebase, so neither can break the
+other.
+
+Add it to your home screen the same way as the shopping list — it is a separate icon.
+
+---
+
 ## Setting it up for your family
 
 There are two ways to do this. **Almost everyone wants the first one.**
@@ -115,6 +130,7 @@ changing anything — several of them exist because breaking them caused real bu
 | `sw.js` | Service worker. Network-first for the page, so a cached copy can never pin a device on an old build |
 | `manifest.webmanifest` | Lets the app install to a phone's home screen |
 | `.nojekyll` | Stops GitHub Pages running the site through Jekyll, which breaks it |
+| `door/` | **The Fridge Door** — a separate app for chores and the noticeboard, sharing the same OneDrive folder |
 | `docs/` | The two setup guides |
 | `test/` | Both test suites and their own README |
 

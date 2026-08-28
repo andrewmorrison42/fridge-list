@@ -9,8 +9,8 @@ noticed mid-shop. They are worth reading before changing sync, rendering or stor
 ## Commands
 
 ```
-npm test                # 118 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 91 browser assertions — needs playwright-core + Chromium
+npm test                # 143 logic assertions (Fridge List + Fridge Door), no browser
+npm run test:browser    # 106 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -30,6 +30,27 @@ Consequences:
   Search the code with `awk 'length($0)<600 {print NR": "$0}' index.html | grep '…'`.
 - `git diff` on this file is awkward. Keep edits surgical; never reformat.
 - Reading the whole file into context is wasteful. Locate first, then read the region.
+
+## Two apps, one folder
+
+`index.html` is **The Fridge List** (recipes, menu, shopping). `door/index.html` is
+**The Fridge Door** (chores, noticeboard). They are separate applications that share
+one OneDrive folder and one sign-in, not one codebase.
+
+That was deliberate. Folding the shopping list into a combined shell would have meant a
+second copy of `generateShoppingList`, `mergeShoppingData` and the recipes UI — the most
+delicate code in the project — which would drift. Sharing the folder instead means
+neither app can break the other, at the cost of some duplicated sync plumbing
+(~200 lines: MSAL, `graphFetch`, folder resolution, the sync banner).
+
+If you change auth or folder resolution, change it in both. Everything else is separate
+on purpose.
+
+The Door's data file (`family-data.json`) is new, with no older readers, so unlike the
+Wait List it carries **deletion tombstones**: entries are marked `deletedAt` rather than
+removed, merges are a union by id, and tombstones are purged after 30 days. That means
+an addition made offline can never be lost *and* a deletion still propagates — the fix
+the Wait List cannot have without breaking older devices. Keep it that way.
 
 ## Architecture in brief
 
