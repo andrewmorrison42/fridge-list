@@ -176,6 +176,24 @@ than working around it.
   Judged low value: the Wait List is filled in during the week, usually one person at a
   time, and the cost of the bug is a forgotten bottle of shampoo.
 
+- **The menu plan is last-writer-wins too, and must stay that way.** `weekPlan.selections`
+  merges like the Wait List: the newer file's list wins, with only `cooked` resolved per
+  recipe. Two people planning the week on separate devices can lose a pick.
+
+  Do **not** "fix this for consistency" by unioning the selections. `recipeSelectionsSignature`
+  is built from `{recipeId, servings}` and is what decides whether a rebuild continues the
+  current trip or starts a new one. Changing the selection set through a merge therefore
+  changes the trip — and a new trip discards the previous trip's ticks by design. A union
+  here can silently throw away a shop in progress, which is the bug class v21.0–v21.5
+  existed to eliminate.
+
+  `servings` is also a *value* conflict rather than a membership one, so a union would not
+  resolve it anyway; it would need its own stamp, the way `cooked` has `cookedChangedAt`.
+  And changing servings changes the trip signature, so that is not hypothetical.
+
+  Judged negative value: menu planning is a single-person, single-sitting activity even
+  more than the Wait List is, so the bug is rarer while the risk of the fix is far higher.
+
 - **Recipes have no per-item merge.** Concurrent edits to different recipes on two
   devices can lose one side. The ETag guard prevents silent clobbering but does not
   merge.
