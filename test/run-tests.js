@@ -73,7 +73,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripHasProgress', 'tripIsLiv
                'tripRecordFromShopping', 'mergeTripHistory', 'pruneTripHistory',
                'recipeHistoryLabel', 'recipeHistoryTime', 'daysSinceStamp', 'daysSinceCooked',
                'daysSincePlanned', 'migrateCookedStamps',
-               'picksFromTrip', 'summarisePickNames'];
+               'picksFromTrip', 'summarisePickNames',
+               'aisleOrderFromHistory', 'compareAisles'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -88,6 +89,8 @@ vm.runInContext(
   extractConst('SHARE_MARKER') + '\n' +
   extractConst('APP_VERSION') + '\n' +
   extractConst('TRIP_HISTORY_MAX') + '\n' +
+  extractConst('AISLE_ORDER_TRIPS') + '\n' +
+  extractConst('AISLE_ORDER_MIN_SIGHTINGS') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
@@ -96,6 +99,7 @@ vm.runInContext(
   '             tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,' +
   '             recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,' +
   '             picksFromTrip, summarisePickNames,' +
+  '             aisleOrderFromHistory, compareAisles, AISLE_ORDER_MIN_SIGHTINGS, AISLE_ORDER_TRIPS,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -107,6 +111,7 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,
         recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,
         picksFromTrip, summarisePickNames,
+        aisleOrderFromHistory, compareAisles, AISLE_ORDER_MIN_SIGHTINGS, AISLE_ORDER_TRIPS,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -868,6 +873,89 @@ group('a past week can be picked again, allowing for a book that has moved on');
   const many = [1,2,3,4,5,6,7].map(n=>({name:'R'+n}));
   ok('a long week is summarised rather than filling the row',
      summarisePickNames(many, 5) === 'R1, R2, R3, R4, R5 and 2 more');
+}
+
+/* ---------- v22.0: the route through the shop ---------- */
+
+// A trip whose aisles were ticked in exactly this order.
+const walk = (id, aisles, t0) => ({
+  tripId: id, doneAt: T(t0 + aisles.length),
+  selections: [],
+  lines: aisles.map((a, i)=> ({
+    name: a + '-item', aisle: a, checked: true, checkedAt: T(t0 + i)
+  }))
+});
+
+group('the walking order is read back out of the ticks');
+{
+  const trips = [ walk('t1', ['Fruit','Dairy','Freezer'], 0),
+                  walk('t2', ['Fruit','Dairy','Freezer'], 10000),
+                  walk('t3', ['Fruit','Dairy','Freezer'], 20000) ];
+  const order = aisleOrderFromHistory(trips);
+  ok('every aisle walked often enough gets a place', Object.keys(order).length === 3);
+  ok('and they come out in the order they were walked',
+     order['Fruit'] < order['Dairy'] && order['Dairy'] < order['Freezer'],
+     order);
+
+  const alphabetical = ['Freezer','Dairy','Fruit'].slice().sort();
+  const learnt = ['Freezer','Dairy','Fruit'].slice().sort((a,b)=> compareAisles(order, a, b));
+  ok('which is not the alphabetical order it replaces',
+     JSON.stringify(alphabetical) !== JSON.stringify(learnt), [alphabetical, learnt]);
+  ok('the learnt order is the walked one',
+     JSON.stringify(learnt) === JSON.stringify(['Fruit','Dairy','Freezer']));
+}
+
+group('an aisle seen once is an anecdote, not a route');
+{
+  const trips = [ walk('t1', ['Fruit','Dairy','Freezer'], 0),
+                  walk('t2', ['Fruit','Dairy','Freezer'], 10000),
+                  walk('t3', ['Fruit','Dairy','Freezer'], 20000),
+                  { tripId:'t4', doneAt:T(30000), selections:[], lines:[
+                      {name:'x', aisle:'Fruit', checked:true, checkedAt:T(30000)},
+                      {name:'y', aisle:'Pharmacy', checked:true, checkedAt:T(30001)} ] } ];
+  const order = aisleOrderFromHistory(trips);
+  ok('a one-off aisle gets no place at all', order['Pharmacy'] === undefined);
+  ok('and it sorts after the aisles that do have one',
+     compareAisles(order, 'Pharmacy', 'Freezer') > 0);
+  ok('two placeless aisles fall back to alphabetical',
+     compareAisles(order, 'Aardvark', 'Pharmacy') < 0);
+}
+
+group('doubling back for a forgotten item does not move the aisle');
+{
+  // Fruit first, then Dairy, then back to Fruit for the thing that was forgotten.
+  const trips = [1,2,3].map((n,i)=> ({
+    tripId:'t'+n, doneAt:T(i*10000 + 5), selections:[], lines:[
+      {name:'apple',  aisle:'Fruit', checked:true, checkedAt:T(i*10000 + 0)},
+      {name:'milk',   aisle:'Dairy', checked:true, checkedAt:T(i*10000 + 1)},
+      {name:'pears',  aisle:'Fruit', checked:true, checkedAt:T(i*10000 + 2)} ]
+  }));
+  const order = aisleOrderFromHistory(trips);
+  ok('the aisle keeps the place it was FIRST reached', order['Fruit'] < order['Dairy'], order);
+}
+
+group('the route refuses to guess when it has nothing to go on');
+{
+  ok('no history at all', Object.keys(aisleOrderFromHistory([])).length === 0);
+  ok('null is harmless', Object.keys(aisleOrderFromHistory(null)).length === 0);
+  ok('unticked lines carry no order',
+     Object.keys(aisleOrderFromHistory([1,2,3].map(n=>({
+       tripId:'t'+n, doneAt:T(n), lines:[{name:'a', aisle:'Fruit', checked:false}] })))).length === 0);
+  ok('a single tick in a shop says nothing about an order',
+     Object.keys(aisleOrderFromHistory([1,2,3].map(n=>({
+       tripId:'t'+n, doneAt:T(n),
+       lines:[{name:'a', aisle:'Fruit', checked:true, checkedAt:T(n)}] })))).length === 0);
+  ok('and with an empty route compareAisles IS localeCompare',
+     compareAisles({}, 'Dairy', 'Freezer') === 'Dairy'.localeCompare('Freezer'));
+}
+
+group('only the recent shops count, so a rearranged shop is followed');
+{
+  const olds = [1,2,3,4,5,6].map((n,i)=> walk('old'+n, ['Freezer','Fruit'], i*10000));
+  const news = [1,2,3,4,5,6].map((n,i)=> walk('new'+n, ['Fruit','Freezer'], 100000 + i*10000));
+  const order = aisleOrderFromHistory(olds.concat(news), { trips: AISLE_ORDER_TRIPS });
+  ok('the window is the last ' + AISLE_ORDER_TRIPS + ' shops, so the new route wins',
+     order['Fruit'] < order['Freezer'], order);
 }
 
 /* ---------- result ---------- */
