@@ -624,7 +624,24 @@ function migrateIngredientsIfStale(data, seed){
     });
     data.meta = Object.assign({}, data.meta, { version: seedVersion });
   }
+  migrateCookedStamps(data);
   return ensureSettings(data);
+}
+
+/* Every lastCooked written before v22.0 was set by generateShoppingList, so what it
+   actually recorded was "this went on a list" — a plan, not a meal. Copy those stamps
+   across to lastPlanned, where they are true, and leave lastCooked alone so nothing a
+   family can already see on screen changes on the day they update. From here on the two
+   fields diverge honestly: only the Menu tab's tick writes lastCooked.
+   Runs once — the marker is on data.meta, not on each recipe, so it costs one field. */
+function migrateCookedStamps(data){
+  if(!data || !Array.isArray(data.recipes)) return data;
+  if(data.meta && data.meta.cookedStampsSplit) return data;
+  data.recipes.forEach(r=>{
+    if(r.lastCooked && !r.lastPlanned) r.lastPlanned = r.lastCooked;
+  });
+  data.meta = Object.assign({}, data.meta, { cookedStampsSplit: true });
+  return data;
 }
 
 function init(){
@@ -2410,7 +2427,12 @@ function generateShoppingList(){
   shoppingData.weekPlan.selections.forEach(sel=>{
     const recipe = recipesData.recipes.find(r=>r.id===sel.recipeId);
     if(!recipe) return;
-    recipe.lastCooked = generatedNow; // recipe history: stamped whenever a recipe is put on a generated shopping list
+    /* v22.0: putting a recipe on a list only ever proved it was PLANNED, so that is what
+       this stamp now says. It used to be written to lastCooked, which made "not cooked
+       recently" really mean "not shopped for recently" — a recipe picked and never got
+       round to looked exactly like one the family had eaten. lastCooked is now written
+       only where somebody actually says so: the cooked tick on the Menu tab. */
+    recipe.lastPlanned = generatedNow;
     const factor = (sel.servings || recipe.servings || 1) / (recipe.servings || 1);
     recipe.ingredients.forEach(ing=>{
       const meta = findIngredientMeta(ing.ingredientName);
@@ -2681,19 +2703,42 @@ function el(tag, attrs, children){
 }
 
 /* ---- All Recipes tab ---- */
-function daysSinceCooked(recipe){
-  if(!recipe.lastCooked) return null;
-  const ms = Date.now() - new Date(recipe.lastCooked).getTime();
+function daysSinceStamp(stamp){
+  if(!stamp) return null;
+  const ms = Date.now() - new Date(stamp).getTime();
   return Math.max(0, Math.floor(ms / (1000*60*60*24)));
 }
+function daysSinceCooked(recipe){ return daysSinceStamp(recipe.lastCooked); }
+function daysSincePlanned(recipe){ return daysSinceStamp(recipe.lastPlanned); }
 
+/* v22.0: two different facts, and the difference is the whole point of the badge.
+   "Cooked" means somebody ticked it on the Menu tab. "Planned" means it went on a
+   shopping list and nobody ever said what happened next. Show the stronger claim when
+   there is one, and never dress the weaker one up as the stronger. */
 function recipeHistoryLabel(recipe){
-  const days = daysSinceCooked(recipe);
   const threshold = (recipesData.settings && recipesData.settings.notCookedRecentlyDays) || 60;
-  if(days === null) return {text:'Never cooked', stale:true};
-  if(days === 0) return {text:'Cooked today', stale:false};
-  if(days === 1) return {text:'Cooked yesterday', stale:false};
-  return {text:'Cooked ' + days + ' days ago', stale: days >= threshold};
+  const cooked = daysSinceCooked(recipe);
+  if(cooked !== null){
+    if(cooked === 0) return {text:'Cooked today', stale:false};
+    if(cooked === 1) return {text:'Cooked yesterday', stale:false};
+    return {text:'Cooked ' + cooked + ' days ago', stale: cooked >= threshold};
+  }
+  const planned = daysSincePlanned(recipe);
+  if(planned !== null){
+    if(planned === 0) return {text:'Planned today', stale:false};
+    if(planned === 1) return {text:'Planned yesterday', stale:false};
+    return {text:'Planned ' + planned + ' days ago', stale: planned >= threshold};
+  }
+  return {text:'Never cooked', stale:true};
+}
+
+// What the "not cooked recently" sort orders by: the most recent thing known about this
+// recipe, whether that is a cook or merely a plan. 0 means nothing is known, which sorts
+// first — the same rule as before, now reading both stamps instead of one.
+function recipeHistoryTime(recipe){
+  const c = recipe.lastCooked ? new Date(recipe.lastCooked).getTime() : 0;
+  const p = recipe.lastPlanned ? new Date(recipe.lastPlanned).getTime() : 0;
+  return Math.max(c, p);
 }
 
 function renderRecipesTab(){
@@ -2775,8 +2820,7 @@ function renderRecipesTab(){
       return true;
     }).sort((a,b)=>{
       if(sortMode === 'history'){
-        const da = a.lastCooked ? new Date(a.lastCooked).getTime() : 0;
-        const db = b.lastCooked ? new Date(b.lastCooked).getTime() : 0;
+        const da = recipeHistoryTime(a), db = recipeHistoryTime(b);
         if(da !== db) return da - db; // never-cooked (0) and oldest first
       }
       return a.name.localeCompare(b.name);
@@ -2880,6 +2924,12 @@ function openRecipeViewer(id){
   }
   cols.appendChild(ingCol); cols.appendChild(methodCol);
   body.appendChild(cols);
+  // Every recipe has carried a notes field since the Access DB import, and until v22.0
+  // nothing ever showed it or let anyone write one.
+  if(r.notes && String(r.notes).trim()){
+    body.appendChild(el('h4',{style:'margin-bottom:4px;'},['Notes']));
+    body.appendChild(el('div',{style:'white-space:pre-wrap;'},[String(r.notes)]));
+  }
   const btnRow = el('div',{class:'row',style:'margin-top:14px;'});
   const editBtn = el('button',{class:'btn'},['Edit']);
   editBtn.addEventListener('click', ()=>{ closeModal(); openRecipeEditor(r.id); });
@@ -2923,6 +2973,17 @@ function openRecipeEditor(id){
   body.appendChild(catField);
   const servingsInput = el('input',{type:'number', value:r.servings||4, min:'1'});
   body.appendChild(field('Default servings', servingsInput));
+  /* Both of these have been on every recipe since the Access DB import and both were
+     shown but uneditable — slowCooker was hardcoded false on save, so ticking one was
+     impossible, and inSeason was hardcoded true. */
+  const slowCb = el('input',{type:'checkbox'});
+  slowCb.checked = !!r.slowCooker;
+  const seasonCb = el('input',{type:'checkbox'});
+  seasonCb.checked = r.inSeason !== false;
+  const flagRow = el('div',{class:'field'});
+  flagRow.appendChild(el('label',{style:'display:flex;align-items:center;gap:6px;cursor:pointer;'},[slowCb, 'Slow cooker recipe']));
+  flagRow.appendChild(el('label',{style:'display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:4px;'},[seasonCb, 'In season']));
+  body.appendChild(flagRow);
 
   body.appendChild(el('h4',{},['Ingredients']));
   body.appendChild(el('p',{class:'muted', style:'margin-top:-6px;font-size:0.85em;'},['Start typing an ingredient name to reuse one already in your book — its usual unit fills in and it keeps its aisle on the shopping list. Typing something new adds it as a fresh ingredient (uncategorised until you use "Edit" on it later).']));
@@ -2972,6 +3033,11 @@ function openRecipeEditor(id){
   methodArea.value = (r.method||[]).join('\n');
   body.appendChild(methodArea);
 
+  body.appendChild(el('h4',{},['Notes']));
+  const notesArea = el('textarea',{rows:'3', placeholder:'Anything that is not a step — which tin to use, what the children will not eat, where it came from.'});
+  notesArea.value = r.notes || '';
+  body.appendChild(notesArea);
+
   const saveRow = el('div',{class:'row',style:'margin-top:16px;'});
   const saveBtn = el('button',{class:'btn'},['Save recipe']);
   saveBtn.addEventListener('click', ()=>{
@@ -2984,12 +3050,14 @@ function openRecipeEditor(id){
     const method = normalizeMethodLines(methodArea.value);
     if(isNew){
       const id = slugify(name);
-      recipesData.recipes.push({id, name, category:catInput.value.trim(), servings:parseInt(servingsInput.value,10)||4, slowCooker:false, inSeason:true, ingredients, method, images:[], notes:'', source:'manual'});
+      recipesData.recipes.push({id, name, category:catInput.value.trim(), servings:parseInt(servingsInput.value,10)||4, slowCooker:slowCb.checked, inSeason:seasonCb.checked, ingredients, method, images:[], notes:notesArea.value.trim(), source:'manual'});
     } else {
       const existing = recipesData.recipes.find(x=>x.id===id);
       existing.name = name; existing.category = catInput.value.trim();
       existing.servings = parseInt(servingsInput.value,10)||4;
       existing.ingredients = ingredients; existing.method = method;
+      existing.slowCooker = slowCb.checked; existing.inSeason = seasonCb.checked;
+      existing.notes = notesArea.value.trim();
     }
     persist('recipes');
     closeModal(); currentTab='recipes'; render();
@@ -3751,12 +3819,33 @@ function renderMenuTab(){
     // Resolve by recipeId at tap time — a merge replaces the selection objects, and
     // mutating the one this row was drawn from would write into a discarded graph.
     const selId = sel.recipeId;
+    /* v22.0: this tick is the only place in the app where somebody states that a meal was
+       actually cooked, so it is the only place that writes recipe.lastCooked. Unticking is
+       a correction, not a new fact, so it puts back whatever the stamp was before —
+       cookedPrev, remembered on the selection. If a merge ever loses cookedPrev the
+       restore lands on null, which understates the history rather than inventing it.
+       This persists BOTH files, so a cook tick re-uploads the recipe file. That is the
+       thing v21.2 went out of its way to avoid for shopping ticks, and it is fine here:
+       this tick happens a few times a week, at home, not forty times over mobile data in
+       the middle of a shop. */
     cb.addEventListener('change', ()=>{
       const live = (shoppingData.weekPlan.selections || []).find(s=> s.recipeId === selId);
       if(!live){ render(); return; }
+      const recipe = recipesData.recipes.find(x=> x.id === selId);
+      const now = new Date().toISOString();
       live.cooked = cb.checked;
-      live.cookedChangedAt = new Date().toISOString();
-      persist('shopping');
+      live.cookedChangedAt = now;
+      if(recipe){
+        if(cb.checked){
+          live.cookedPrev = recipe.lastCooked || null;
+          recipe.lastCooked = now;
+        } else {
+          const prev = live.cookedPrev || null;
+          if(prev) recipe.lastCooked = prev; else delete recipe.lastCooked;
+          delete live.cookedPrev;
+        }
+      }
+      persist();
       row.classList.toggle('removed', cb.checked);
     });
     const label = el('label',{},[r.name + ' — serves ' + sel.servings + (r.category?'  ('+r.category+')':'')]);
