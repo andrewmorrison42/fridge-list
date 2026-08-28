@@ -69,7 +69,13 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripHasProgress', 'tripIsLiv
                'recipeSelectionsSignature', 'shoppingListIsStale',
                'featureOn', 'stapleQtyFor', 'stapleQtyToShopping', 'parseQty', 'fmtQty',
                'displayUnit', 'lineQtyText', 'findIngredientMeta', 'rollUpQty', 'fmtExactQty',
-               'ingredientLineText', 'recipeToPlainText', 'recipeToHtml', 'buildShareBundle'];
+               'ingredientLineText', 'recipeToPlainText', 'recipeToHtml', 'buildShareBundle',
+               'tripRecordFromShopping', 'mergeTripHistory', 'pruneTripHistory',
+               'recipeHistoryLabel', 'recipeHistoryTime', 'daysSinceStamp', 'daysSinceCooked',
+               'daysSincePlanned', 'migrateCookedStamps',
+               'picksFromTrip', 'summarisePickNames',
+               'aisleOrderFromHistory', 'compareAisles',
+               'cookRateSummary', 'atHomeStreaks'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -83,11 +89,19 @@ vm.runInContext(
   extractConst('TRIP_LIVE_WINDOW_MS') + '\n' +
   extractConst('SHARE_MARKER') + '\n' +
   extractConst('APP_VERSION') + '\n' +
+  extractConst('TRIP_HISTORY_MAX') + '\n' +
+  extractConst('AISLE_ORDER_TRIPS') + '\n' +
+  extractConst('AISLE_ORDER_MIN_SIGHTINGS') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
   '             ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,' +
   '             tripProgress, tripHasProgress, tripIsLive, chooseTripWinner, TRIP_LIVE_WINDOW_MS,' +
+  '             tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,' +
+  '             recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,' +
+  '             picksFromTrip, summarisePickNames,' +
+  '             aisleOrderFromHistory, compareAisles, AISLE_ORDER_MIN_SIGHTINGS, AISLE_ORDER_TRIPS,' +
+  '             cookRateSummary, atHomeStreaks,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -96,6 +110,11 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,
         ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,
         tripProgress, tripHasProgress, tripIsLive, chooseTripWinner, TRIP_LIVE_WINDOW_MS,
+        tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,
+        recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,
+        picksFromTrip, summarisePickNames,
+        aisleOrderFromHistory, compareAisles, AISLE_ORDER_MIN_SIGHTINGS, AISLE_ORDER_TRIPS,
+        cookRateSummary, atHomeStreaks,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -708,6 +727,300 @@ group('the merge is still pure with the new rules in it');
   mergeShoppingData(live, other);
   ok('input a is untouched', JSON.stringify(live) === beforeA);
   ok('input b is untouched', JSON.stringify(other) === beforeB);
+}
+
+/* ---------- v22.0: the trip archive ---------- */
+
+group('a finished trip is reduced to a record worth keeping');
+{
+  const sd = {
+    weekPlan: { tripId: 'trip:a', generatedAt: T(0), shoppingDoneAt: T(9000),
+                selections: [{recipeId:'risotto', servings:4, cooked:true},
+                             {recipeId:'curry', servings:2}] },
+    shoppingList: [
+      line('Milk', {aisle:'Dairy', shoppingCategory:'Cold', unit:'mL', totalQty:2000,
+                    hasNumeric:true, checked:true, checkedAt:T(100), source:'staple'}),
+      line('Salt', {aisle:'Spices', shoppingCategory:'Pantry', atHome:true}),
+      line('Rice', {aisle:'Dry goods', shoppingCategory:'Pantry',
+                    totalQty:500, hasNumeric:false})
+    ]
+  };
+  const rec = tripRecordFromShopping(sd, 'phone-1');
+  ok('carries the trip id', rec.tripId === 'trip:a');
+  ok('carries who finished it', rec.doneBy === 'phone-1');
+  ok('keeps the cooked flag on each pick',
+     rec.selections[0].cooked === true && rec.selections[1].cooked === false);
+  ok('keeps the tick and its stamp — the walking order lives here',
+     rec.lines[0].checked === true && rec.lines[0].checkedAt === T(100));
+  ok('keeps the at-home decision', rec.lines[1].atHome === true);
+  ok('keeps a real quantity', rec.lines[0].qty === 2000 && rec.lines[0].unit === 'mL');
+  ok('drops a quantity that was never numeric', rec.lines[2].qty === null);
+  ok('drops the bulk it does not need',
+     rec.lines[0].sources === undefined && rec.lines[0].textQtyParts === undefined);
+  ok('a trip with no id is not archivable',
+     tripRecordFromShopping({weekPlan:{selections:[]}, shoppingList:[]}, 'x') === null);
+}
+
+group('trip history merges as a union, because a trip is written once');
+{
+  const trip1 = { tripId:'t1', doneAt: T(1000), lines:[{name:'Milk'}], selections:[] };
+  const trip2 = { tripId:'t2', doneAt: T(2000), lines:[{name:'Rice'}], selections:[] };
+  const mine = { version:1, trips:[trip1] };
+  const theirs = { version:1, trips:[trip2] };
+
+  const m = mergeTripHistory(mine, theirs);
+  ok('both trips survive', m.trips.length === 2);
+  ok('oldest first', m.trips[0].tripId === 't1' && m.trips[1].tripId === 't2');
+  ok('order of arguments makes no difference',
+     JSON.stringify(mergeTripHistory(theirs, mine)) === JSON.stringify(m));
+  ok('merging with itself changes nothing',
+     JSON.stringify(mergeTripHistory(m, m)) === JSON.stringify(m));
+  ok('merging with nothing changes nothing',
+     JSON.stringify(mergeTripHistory(m, null)) === JSON.stringify(m));
+
+  const beforeA = JSON.stringify(mine), beforeB = JSON.stringify(theirs);
+  mergeTripHistory(mine, theirs);
+  ok('and the merge is pure', JSON.stringify(mine) === beforeA && JSON.stringify(theirs) === beforeB);
+
+  const short = { version:1, trips:[{tripId:'t1', doneAt:T(1000), lines:[], selections:[]}] };
+  const full  = { version:1, trips:[{tripId:'t1', doneAt:T(1000), lines:[{name:'Milk'},{name:'Eggs'}], selections:[]}] };
+  ok('the same trip from two files resolves to the fuller record',
+     mergeTripHistory(short, full).trips[0].lines.length === 2);
+  ok('and resolves the same way round the other way',
+     mergeTripHistory(full, short).trips[0].lines.length === 2);
+  ok('an entry with no trip id is dropped rather than archived',
+     mergeTripHistory({version:1, trips:[{doneAt:T(1)}]}, null).trips.length === 0);
+}
+
+group('the archive is capped, so it cannot grow without bound');
+{
+  const many = { version:1, trips: [] };
+  for(let i = 0; i < TRIP_HISTORY_MAX + 10; i++){
+    many.trips.push({ tripId:'t'+i, doneAt:T(i*1000), lines:[], selections:[] });
+  }
+  const pruned = pruneTripHistory(many, TRIP_HISTORY_MAX);
+  ok('kept at the cap', pruned.trips.length === TRIP_HISTORY_MAX);
+  ok('and it is the NEWEST that are kept',
+     pruned.trips[pruned.trips.length - 1].tripId === 't' + (TRIP_HISTORY_MAX + 9));
+  ok('the merge applies the cap too', mergeTripHistory(many, null).trips.length === TRIP_HISTORY_MAX);
+  ok('an empty history prunes to an empty history', pruneTripHistory(null, 5).trips.length === 0);
+}
+
+/* ---------- v22.0: cooked means cooked ---------- */
+
+group('a recipe history badge does not call a plan a meal');
+{
+  setRecipesData({ recipes: [], ingredients: [], settings: { notCookedRecentlyDays: 60, features: {} } });
+  const daysAgo = n => new Date(Date.now() - n*24*60*60*1000).toISOString();
+
+  ok('nothing known reads as never cooked',
+     recipeHistoryLabel({}).text === 'Never cooked');
+  ok('a cook is reported as a cook',
+     recipeHistoryLabel({lastCooked: daysAgo(3)}).text === 'Cooked 3 days ago');
+  ok('a plan with no cook is reported as a plan, not a cook',
+     recipeHistoryLabel({lastPlanned: daysAgo(3)}).text === 'Planned 3 days ago');
+  ok('a cook outranks a plan',
+     recipeHistoryLabel({lastCooked: daysAgo(2), lastPlanned: daysAgo(9)}).text === 'Cooked 2 days ago');
+  ok('an old plan still counts as stale',
+     recipeHistoryLabel({lastPlanned: daysAgo(90)}).stale === true);
+  ok('a recent plan is not stale',
+     recipeHistoryLabel({lastPlanned: daysAgo(2)}).stale === false);
+
+  ok('the sort reads whichever stamp is fresher',
+     recipeHistoryTime({lastCooked: daysAgo(9), lastPlanned: daysAgo(1)}) ===
+     recipeHistoryTime({lastPlanned: daysAgo(1)}));
+  ok('and a recipe with neither sorts first',
+     recipeHistoryTime({}) === 0);
+}
+
+group('old lastCooked stamps are moved to where they were true');
+{
+  const data = { recipes: [ {id:'a', lastCooked: T(0)}, {id:'b'} ], meta: {} };
+  migrateCookedStamps(data);
+  ok('the old stamp is copied to lastPlanned, which is what it recorded',
+     data.recipes[0].lastPlanned === T(0));
+  ok('and lastCooked is left alone, so nothing on screen changes on update day',
+     data.recipes[0].lastCooked === T(0));
+  ok('a recipe with no history gains none', data.recipes[1].lastPlanned === undefined);
+  ok('the migration marks itself done', data.meta.cookedStampsSplit === true);
+
+  // Second run must not overwrite a genuine cook recorded since the first.
+  data.recipes[0].lastCooked = T(5000);
+  migrateCookedStamps(data);
+  ok('and it never runs twice over a real cook', data.recipes[0].lastPlanned === T(0));
+}
+
+group('a past week can be picked again, allowing for a book that has moved on');
+{
+  const book = [ {id:'risotto', name:'Mushroom Risotto', servings:4},
+                 {id:'curry', name:'Chickpea Curry', servings:6} ];
+  const trip = { tripId:'t1', doneAt:T(0), lines:[], selections:[
+    {recipeId:'risotto', servings:8, cooked:true},
+    {recipeId:'curry'},
+    {recipeId:'deleted-since', servings:2}
+  ]};
+  const picks = picksFromTrip(trip, book);
+  ok('a recipe deleted since that shop is quietly left out', picks.length === 2);
+  ok('the servings that week actually used come back', picks[0].servings === 8);
+  ok("a pick with no servings falls back to the recipe's own", picks[1].servings === 6);
+  ok('names come from the book as it is now, not as it was',
+     picks[0].name === 'Mushroom Risotto');
+  ok('whether it got cooked is history, not part of a new plan',
+     picks[0].cooked === undefined);
+  ok('a trip whose recipes have all gone yields nothing',
+     picksFromTrip(trip, []).length === 0);
+  ok('and an empty trip is harmless', picksFromTrip(null, book).length === 0);
+
+  ok('a short week lists every name',
+     summarisePickNames(picks) === 'Mushroom Risotto, Chickpea Curry');
+  const many = [1,2,3,4,5,6,7].map(n=>({name:'R'+n}));
+  ok('a long week is summarised rather than filling the row',
+     summarisePickNames(many, 5) === 'R1, R2, R3, R4, R5 and 2 more');
+}
+
+/* ---------- v22.0: the route through the shop ---------- */
+
+// A trip whose aisles were ticked in exactly this order.
+const walk = (id, aisles, t0) => ({
+  tripId: id, doneAt: T(t0 + aisles.length),
+  selections: [],
+  lines: aisles.map((a, i)=> ({
+    name: a + '-item', aisle: a, checked: true, checkedAt: T(t0 + i)
+  }))
+});
+
+group('the walking order is read back out of the ticks');
+{
+  const trips = [ walk('t1', ['Fruit','Dairy','Freezer'], 0),
+                  walk('t2', ['Fruit','Dairy','Freezer'], 10000),
+                  walk('t3', ['Fruit','Dairy','Freezer'], 20000) ];
+  const order = aisleOrderFromHistory(trips);
+  ok('every aisle walked often enough gets a place', Object.keys(order).length === 3);
+  ok('and they come out in the order they were walked',
+     order['Fruit'] < order['Dairy'] && order['Dairy'] < order['Freezer'],
+     order);
+
+  const alphabetical = ['Freezer','Dairy','Fruit'].slice().sort();
+  const learnt = ['Freezer','Dairy','Fruit'].slice().sort((a,b)=> compareAisles(order, a, b));
+  ok('which is not the alphabetical order it replaces',
+     JSON.stringify(alphabetical) !== JSON.stringify(learnt), [alphabetical, learnt]);
+  ok('the learnt order is the walked one',
+     JSON.stringify(learnt) === JSON.stringify(['Fruit','Dairy','Freezer']));
+}
+
+group('an aisle seen once is an anecdote, not a route');
+{
+  const trips = [ walk('t1', ['Fruit','Dairy','Freezer'], 0),
+                  walk('t2', ['Fruit','Dairy','Freezer'], 10000),
+                  walk('t3', ['Fruit','Dairy','Freezer'], 20000),
+                  { tripId:'t4', doneAt:T(30000), selections:[], lines:[
+                      {name:'x', aisle:'Fruit', checked:true, checkedAt:T(30000)},
+                      {name:'y', aisle:'Pharmacy', checked:true, checkedAt:T(30001)} ] } ];
+  const order = aisleOrderFromHistory(trips);
+  ok('a one-off aisle gets no place at all', order['Pharmacy'] === undefined);
+  ok('and it sorts after the aisles that do have one',
+     compareAisles(order, 'Pharmacy', 'Freezer') > 0);
+  ok('two placeless aisles fall back to alphabetical',
+     compareAisles(order, 'Aardvark', 'Pharmacy') < 0);
+}
+
+group('doubling back for a forgotten item does not move the aisle');
+{
+  // Fruit first, then Dairy, then back to Fruit for the thing that was forgotten.
+  const trips = [1,2,3].map((n,i)=> ({
+    tripId:'t'+n, doneAt:T(i*10000 + 5), selections:[], lines:[
+      {name:'apple',  aisle:'Fruit', checked:true, checkedAt:T(i*10000 + 0)},
+      {name:'milk',   aisle:'Dairy', checked:true, checkedAt:T(i*10000 + 1)},
+      {name:'pears',  aisle:'Fruit', checked:true, checkedAt:T(i*10000 + 2)} ]
+  }));
+  const order = aisleOrderFromHistory(trips);
+  ok('the aisle keeps the place it was FIRST reached', order['Fruit'] < order['Dairy'], order);
+}
+
+group('the route refuses to guess when it has nothing to go on');
+{
+  ok('no history at all', Object.keys(aisleOrderFromHistory([])).length === 0);
+  ok('null is harmless', Object.keys(aisleOrderFromHistory(null)).length === 0);
+  ok('unticked lines carry no order',
+     Object.keys(aisleOrderFromHistory([1,2,3].map(n=>({
+       tripId:'t'+n, doneAt:T(n), lines:[{name:'a', aisle:'Fruit', checked:false}] })))).length === 0);
+  ok('a single tick in a shop says nothing about an order',
+     Object.keys(aisleOrderFromHistory([1,2,3].map(n=>({
+       tripId:'t'+n, doneAt:T(n),
+       lines:[{name:'a', aisle:'Fruit', checked:true, checkedAt:T(n)}] })))).length === 0);
+  ok('and with an empty route compareAisles IS localeCompare',
+     compareAisles({}, 'Dairy', 'Freezer') === 'Dairy'.localeCompare('Freezer'));
+}
+
+group('only the recent shops count, so a rearranged shop is followed');
+{
+  const olds = [1,2,3,4,5,6].map((n,i)=> walk('old'+n, ['Freezer','Fruit'], i*10000));
+  const news = [1,2,3,4,5,6].map((n,i)=> walk('new'+n, ['Fruit','Freezer'], 100000 + i*10000));
+  const order = aisleOrderFromHistory(olds.concat(news), { trips: AISLE_ORDER_TRIPS });
+  ok('the window is the last ' + AISLE_ORDER_TRIPS + ' shops, so the new route wins',
+     order['Fruit'] < order['Freezer'], order);
+}
+
+/* ---------- v22.0: what the memory tells you ---------- */
+
+group('the cook rate is the overlap of what was bought and what was cooked');
+{
+  const trips = [
+    { tripId:'t1', doneAt:T(0),     lines:[], selections:[{recipeId:'a'},{recipeId:'b'}] },
+    { tripId:'t2', doneAt:T(100000), lines:[], selections:[{recipeId:'a'},{recipeId:'c'}] }
+  ];
+  // 'a' cooked during the first week, 'c' during the second, 'b' never.
+  const book = [ {id:'a', lastCooked:T(50000)}, {id:'b'}, {id:'c', lastCooked:T(150000)} ];
+
+  const r = cookRateSummary(trips, book, 6);
+  ok('every pick across both shops is counted', r.picked === 4);
+  ok('two shops', r.shops === 2);
+  ok('a cook inside a shop’s own week counts for that shop', r.cooked === 2, r);
+
+  ok('a recipe never cooked never counts',
+     cookRateSummary([trips[0]], [{id:'a'},{id:'b'}], 6).cooked === 0);
+  ok('a cooked tick recorded at archive time is believed without a stamp',
+     cookRateSummary([{tripId:'x', doneAt:T(0), selections:[{recipeId:'a', cooked:true}]}], [], 6).cooked === 1);
+  ok('no history is not a divide by zero',
+     cookRateSummary([], [], 6).picked === 0 && cookRateSummary(null, null, 6).shops === 0);
+
+  // The window must not let the oldest visible trip claim later cooks.
+  const windowed = cookRateSummary(trips, book, 1);
+  ok('only the last shop is in view', windowed.shops === 1 && windowed.picked === 2);
+  // 'b' was only ever picked on the first shop. A cook stamped after the SECOND shop
+  // belongs to that week, and must not be credited backwards to the first.
+  ok('a cook after the next shop does not count backwards to the earlier one',
+     cookRateSummary(trips, [{id:'b', lastCooked:T(150000)}], 6).cooked === 0);
+  ok('but the same cook inside the first shop’s own week does count',
+     cookRateSummary(trips, [{id:'b', lastCooked:T(50000)}], 6).cooked === 1);
+}
+
+group('what the family already has in is learnt from the times they said so');
+{
+  const at = (name, stamped) => ({ name: name, atHome: true, atHomeAt: stamped ? T(1) : null });
+  const buy = name => ({ name: name, atHome: false });
+  const shop = (id, lines, t) => ({ tripId:id, doneAt:T(t), lines: lines, selections: [] });
+
+  const trips = [
+    shop('t1', [at('Olive oil', true), buy('Milk'), at('Flour', true)], 1000),
+    shop('t2', [at('Olive oil', true), buy('Milk'), buy('Flour')],      2000),
+    shop('t3', [at('Olive oil', true), buy('Milk'), at('Flour', true)], 3000)
+  ];
+  const s = atHomeStreaks(trips, 3);
+  const names = s.map(x=> x.name);
+  ok('an item at home every time it came up is suggested', names.indexOf('Olive oil') >= 0);
+  ok('and the run length is reported', s[0].runs === 3);
+  ok('an item that was genuinely needed once is not a pantry item — it ran out',
+     names.indexOf('Flour') < 0);
+  ok('an item always bought is never suggested', names.indexOf('Milk') < 0);
+  ok('a shorter run than asked for is not suggested', atHomeStreaks(trips, 4).length === 0);
+
+  const auto = [1,2,3].map(n=> shop('a'+n, [at('Salt', false)], n*1000));
+  ok('the pantry rule setting the flag by category does NOT count as saying so',
+     atHomeStreaks(auto, 3).length === 0);
+
+  ok('an empty history suggests nothing',
+     atHomeStreaks([], 3).length === 0 && atHomeStreaks(null, 3).length === 0);
 }
 
 /* ---------- result ---------- */

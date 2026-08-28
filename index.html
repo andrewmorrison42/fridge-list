@@ -335,7 +335,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v21.9';
+const APP_VERSION = 'v22.0';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -450,7 +450,7 @@ function defaultSettings(){
            // UI is entirely absent until switched on (Settings -> Features). Synced with
            // the family's data so all devices behave the same. recipeFinder defaults ON
            // because it was already in live use before the switchboard existed.
-           features: { staples: false, pantryAtHome: false, recipeFinder: true },
+           features: { staples: false, pantryAtHome: false, recipeFinder: true, learnedAisleOrder: false },
            staples: [],
            /* How much of each staple to buy, keyed by the staple's canonical name:
               { "Milk": 2000, "Eggs (whole)": 12 }. Deliberately held OUTSIDE the staples
@@ -463,6 +463,11 @@ function defaultSettings(){
               shows one figure. v21.3 held free text here, which could only ever sit
               alongside the recipe amount as "125 mL + 2 L". */
            stapleQty: {},
+           /* v22.0: ingredient names that start a new list in the "at home already" group,
+              built up from the shops where somebody said so every time. A plain array of
+              names, like `staples` and for the same reason — an older device reads this
+              file and must not meet a shape it cannot parse. */
+           alwaysAtHome: [],
            // Shopping-list side only: what the servings box is pre-filled with when a
            // recipe is ticked for the week. 'recipe' = that recipe's own servings;
            // 'fixed' = always shoppingServingsCount. Recipe display is never scaled.
@@ -487,6 +492,7 @@ function ensureSettings(data){
   // silently drop feature flags added in later versions
   data.settings.features = Object.assign({}, d.features, data.settings.features || {});
   if(!Array.isArray(data.settings.staples)) data.settings.staples = [];
+  if(!Array.isArray(data.settings.alwaysAtHome)) data.settings.alwaysAtHome = [];
   const q = data.settings.stapleQty;
   if(!q || typeof q !== 'object' || Array.isArray(q)) data.settings.stapleQty = {};
   else migrateStapleQty(data);
@@ -624,7 +630,24 @@ function migrateIngredientsIfStale(data, seed){
     });
     data.meta = Object.assign({}, data.meta, { version: seedVersion });
   }
+  migrateCookedStamps(data);
   return ensureSettings(data);
+}
+
+/* Every lastCooked written before v22.0 was set by generateShoppingList, so what it
+   actually recorded was "this went on a list" — a plan, not a meal. Copy those stamps
+   across to lastPlanned, where they are true, and leave lastCooked alone so nothing a
+   family can already see on screen changes on the day they update. From here on the two
+   fields diverge honestly: only the Menu tab's tick writes lastCooked.
+   Runs once — the marker is on data.meta, not on each recipe, so it costs one field. */
+function migrateCookedStamps(data){
+  if(!data || !Array.isArray(data.recipes)) return data;
+  if(data.meta && data.meta.cookedStampsSplit) return data;
+  data.recipes.forEach(r=>{
+    if(r.lastCooked && !r.lastPlanned) r.lastPlanned = r.lastCooked;
+  });
+  data.meta = Object.assign({}, data.meta, { cookedStampsSplit: true });
+  return data;
 }
 
 function init(){
@@ -814,6 +837,7 @@ async function loadFromFolderOrSeed(){
     if(sFile){ mergeRemoteShopping(JSON.parse(sFile)); }
     else { await writeFileToFolder('shopping-list.json', JSON.stringify(shoppingData)); }
     if(recipesChanged) repaintWhenSafe();
+    fetchTripHistory();
   }catch(e){
     console.error(e);
     setStatus('Could not read the shared folder: ' + e.message, 'warn');
@@ -1088,6 +1112,9 @@ async function loadFromOneDriveOrSeed(){
       await writeOneDriveFile(driveId, itemId, 'shopping-list.json', JSON.stringify(shoppingData));
     }
     if(changed) repaintWhenSafe();
+    // Deliberately last, and not awaited by anything the user is waiting on: the trip
+    // archive is never on the critical path to seeing this week's list.
+    fetchTripHistory();
   }catch(e){
     console.error(e);
     setStatus('Could not sync with OneDrive: ' + e.message, 'warn');
@@ -1723,6 +1750,206 @@ function stopShoppingFastPoll(){
 document.addEventListener('visibilitychange', ()=>{
   if(!document.hidden) pollShoppingNow();
 });
+
+/* ================= trip history: what the app remembers =================
+
+   Until v22.0 The Fridge List had no memory beyond the current week. "Shopping is done"
+   set shoppingList = [], and with it went every checkedAt (the order the shop is actually
+   walked), every atHome decision (the real pantry), and every record of what the week's
+   picks turned into. That is the paper menu sheet inherited literally: a sheet is
+   something you throw away.
+
+   trip-history.json is a third file beside recipes-data.json and shopping-list.json,
+   appended to once per shop and never rewritten. Design notes worth keeping:
+
+   - A trip is a CLOSED record, written once by the device that finished it. So the merge
+     is a union keyed by tripId and cannot conflict — mergeShoppingData, the most delicate
+     function in the app, is not touched by any of this.
+   - It is never read at startup. The localStorage mirror is what every feature reads, so
+     launch time is unchanged; the remote copy is folded in on sign-in, on "Sync now", and
+     right after this device archives a trip of its own.
+   - It is written once a week, never on a tick. Same reasoning as v21.2 and the 992 KB
+     recipe file: nothing large goes up over supermarket mobile data.
+   - It does not go through persist(). persist()'s `which` is 'recipes' | 'shopping' |
+     both, and squeezing a third value into that test is exactly how a tick would start
+     re-uploading something it should not. This file has its own writer.
+   - A phone still on v21.9 neither reads nor writes it. A shop finished on an old build
+     is a gap in the history, not a corruption of it. */
+
+const LS_TRIPS = 'fma_trips_v1';
+const TRIPS_FILE = 'trip-history.json';
+const TRIP_HISTORY_MAX = 52;   // about a year of weekly shops
+let tripHistory = null;        // null = not read from localStorage yet
+let pendingSaveTrips = false;
+
+function defaultTripHistory(){ return { version: 1, trips: [] }; }
+
+/* Pure. Reduces a finished trip to what the memory features actually read. Deliberately
+   lean — no sources, no textQtyParts, no per-line stamps beyond checkedAt — because this
+   file is the one thing in the app that grows without bound and 52 fat trips would undo
+   the point of not re-uploading the recipe file. */
+function tripRecordFromShopping(sd, byDevice){
+  if(!sd || !sd.weekPlan || !sd.weekPlan.tripId) return null;
+  const wp = sd.weekPlan;
+  return {
+    tripId: wp.tripId,
+    generatedAt: wp.generatedAt || null,
+    doneAt: wp.shoppingDoneAt || new Date().toISOString(),
+    doneBy: byDevice || '',
+    selections: (wp.selections || []).map(s=>({
+      recipeId: s.recipeId, servings: s.servings || null, cooked: !!s.cooked
+    })),
+    lines: (sd.shoppingList || []).map(l=>({
+      name: l.ingredientName,
+      aisle: l.aisle || '',
+      category: l.shoppingCategory || '',
+      qty: (l.hasNumeric && typeof l.totalQty === 'number') ? l.totalQty : null,
+      unit: l.unit || '',
+      source: l.source || 'recipe',
+      checked: !!l.checked,
+      checkedAt: l.checkedAt || null,
+      atHome: !!l.atHome,
+      // The stamp, not just the flag: pantryAtHome sets atHome from a category rule and
+      // never stamps it, so its presence is what tells a deliberate "we have this" from
+      // an automatic one. atHomeStreaks would be meaningless without the difference.
+      atHomeAt: l.atHomeAt || null,
+      removed: !!l.removed
+    }))
+  };
+}
+
+/* Pure. Union keyed by tripId, oldest first. Two files can only ever disagree about a
+   trip if one of them saw a shorter version of it — the archiving device wrote it once
+   and never came back — so the fuller record wins. Trips are never merged line by line:
+   a closed record that later grows is a record nobody can trust. */
+function mergeTripHistory(a, b){
+  const byId = {};
+  const take = h => ((h && Array.isArray(h.trips)) ? h.trips : []).forEach(t=>{
+    if(!t || !t.tripId) return;
+    const prev = byId[t.tripId];
+    if(!prev || ((t.lines || []).length > (prev.lines || []).length)) byId[t.tripId] = t;
+  });
+  take(a); take(b);
+  const trips = Object.keys(byId).map(k=>byId[k]).sort((x,y)=> tsOf(x.doneAt) - tsOf(y.doneAt));
+  return pruneTripHistory({ version: 1, trips: trips }, TRIP_HISTORY_MAX);
+}
+
+// Pure. Keeps the newest `max` trips and nothing else.
+function pruneTripHistory(h, max){
+  const trips = (h && Array.isArray(h.trips)) ? h.trips.slice() : [];
+  const keep = (max && max > 0) ? max : TRIP_HISTORY_MAX;
+  return { version: 1, trips: trips.slice(Math.max(0, trips.length - keep)) };
+}
+
+function loadTripHistoryLocal(){
+  if(tripHistory) return tripHistory;
+  try{
+    const raw = localStorage.getItem(LS_TRIPS);
+    tripHistory = raw ? JSON.parse(raw) : defaultTripHistory();
+  }catch(e){ tripHistory = defaultTripHistory(); }
+  if(!tripHistory || !Array.isArray(tripHistory.trips)) tripHistory = defaultTripHistory();
+  return tripHistory;
+}
+
+function saveTripHistoryLocal(){
+  try{ localStorage.setItem(LS_TRIPS, JSON.stringify(tripHistory)); }
+  catch(e){ console.warn('could not save trip history locally', e); }
+}
+
+// The newest `n` trips, oldest first. Every memory feature reads through this.
+function recentTrips(n){
+  const trips = loadTripHistoryLocal().trips;
+  return (n && n > 0) ? trips.slice(Math.max(0, trips.length - n)) : trips.slice();
+}
+
+/* Called from finishShopping while shoppingList still exists. The local write is first
+   and synchronous on purpose: finishShopping deletes the list, so a trip that did not
+   reach localStorage is gone for good. The remote push is best-effort — a missing remote
+   copy costs the other phones a little history, which is not the same kind of loss. */
+function archiveFinishedTrip(){
+  const rec = tripRecordFromShopping(shoppingData, deviceId());
+  if(!rec) return false;
+  tripHistory = mergeTripHistory(loadTripHistoryLocal(), { version: 1, trips: [rec] });
+  saveTripHistoryLocal();
+  syncTripHistory();   // fire and forget: fold in anything the others archived, then push
+  return true;
+}
+
+async function syncTripHistory(){
+  await fetchTripHistory();
+  await pushTripHistory();
+}
+
+async function pushTripHistory(){
+  if(!tripHistory) return false;
+  pendingSaveTrips = true;
+  const body = JSON.stringify(tripHistory);
+  try{
+    if(msalAccount && localStorage.getItem(LS_ONEDRIVE_FLAG) === '1'){
+      if(!oneDriveFolderRef){
+        const token = await getGraphToken();
+        if(!token) return false;
+        oneDriveFolderRef = await resolveFridgeListFolder(token);
+        if(!oneDriveFolderRef) return false;
+      }
+      const ok = await writeOneDriveFile(oneDriveFolderRef.driveId, oneDriveFolderRef.itemId, TRIPS_FILE, body);
+      if(ok) pendingSaveTrips = false;
+      return ok;
+    }
+    if(dirHandle){ await writeFileToFolder(TRIPS_FILE, body); pendingSaveTrips = false; return true; }
+  }catch(e){ console.warn('could not save the trip history', e); }
+  return false;
+}
+
+/* Never on the startup path. Repaints through repaintWhenSafe(), never render(), because
+   this can land while somebody is typing on the Wait List. */
+async function fetchTripHistory(){
+  try{
+    let text = null;
+    if(msalAccount && localStorage.getItem(LS_ONEDRIVE_FLAG) === '1'){
+      const token = await getGraphToken();
+      if(!token) return;
+      if(!oneDriveFolderRef) oneDriveFolderRef = await resolveFridgeListFolder(token);
+      if(!oneDriveFolderRef) return;
+      text = await getOneDriveFileText(oneDriveFolderRef.driveId, oneDriveFolderRef.itemId, TRIPS_FILE, token);
+    } else if(dirHandle){
+      text = await getFileText(dirHandle, TRIPS_FILE);
+    } else return;
+    if(!text) return;
+    const before = JSON.stringify(loadTripHistoryLocal());
+    tripHistory = mergeTripHistory(tripHistory, JSON.parse(text));
+    if(JSON.stringify(tripHistory) !== before){ saveTripHistoryLocal(); repaintWhenSafe(); }
+  }catch(e){ console.warn('could not read the trip history', e); }
+}
+
+/* Pure. What a past trip's picks would look like if you used them again: the recipes it
+   was built from, minus any since deleted from the book, with the servings that trip
+   actually used — so "the week we cooked for eight" comes back as it was. */
+function picksFromTrip(trip, recipes){
+  const byId = {};
+  (recipes || []).forEach(r=>{ if(r && r.id) byId[r.id] = r; });
+  return (((trip && trip.selections) || []))
+    .filter(s=> s && byId[s.recipeId])
+    .map(s=>({
+      recipeId: s.recipeId,
+      servings: s.servings || byId[s.recipeId].servings || 4,
+      name: byId[s.recipeId].name
+    }));
+}
+
+// Pure. Names for a row on a phone: a few, then a count, rather than a wall of text.
+function summarisePickNames(picks, max){
+  const cap = max || 5;
+  const names = (picks || []).map(p=> p.name);
+  if(names.length <= cap) return names.join(', ');
+  return names.slice(0, cap).join(', ') + ' and ' + (names.length - cap) + ' more';
+}
+
+function tripDateLabel(iso){
+  const d = iso ? new Date(iso) : null;
+  if(!d || isNaN(d.getTime())) return 'an earlier shop';
+  return d.toLocaleDateString(undefined, { day:'numeric', month:'short' });
+}
 
 /* ---------------- manual export / import (works in every browser) ---------------- */
 
@@ -2410,7 +2637,12 @@ function generateShoppingList(){
   shoppingData.weekPlan.selections.forEach(sel=>{
     const recipe = recipesData.recipes.find(r=>r.id===sel.recipeId);
     if(!recipe) return;
-    recipe.lastCooked = generatedNow; // recipe history: stamped whenever a recipe is put on a generated shopping list
+    /* v22.0: putting a recipe on a list only ever proved it was PLANNED, so that is what
+       this stamp now says. It used to be written to lastCooked, which made "not cooked
+       recently" really mean "not shopped for recently" — a recipe picked and never got
+       round to looked exactly like one the family had eaten. lastCooked is now written
+       only where somebody actually says so: the cooked tick on the Menu tab. */
+    recipe.lastPlanned = generatedNow;
     const factor = (sel.servings || recipe.servings || 1) / (recipe.servings || 1);
     recipe.ingredients.forEach(ing=>{
       const meta = findIngredientMeta(ing.ingredientName);
@@ -2507,6 +2739,22 @@ function generateShoppingList(){
       }
     });
   }
+  /* v22.0: the same effect, but earned rather than guessed — things the family has said
+     "we have that" about every time they have come up. Not feature-gated, because the
+     list is empty until somebody accepts a suggestion in Settings. Wait List lines and
+     staples are excluded for exactly the reasons above: both exist because somebody
+     asked for them to be bought. */
+  const alwaysAtHome = (recipesData.settings && recipesData.settings.alwaysAtHome) || [];
+  if(alwaysAtHome.length){
+    const athSet = {};
+    alwaysAtHome.forEach(n=>{ athSet[String(n).trim().toLowerCase()] = true; });
+    arr.forEach(l=>{
+      if(athSet[(l.ingredientName || '').trim().toLowerCase()]
+         && !l.fromFridgeList && !l.fromStaples && l.source !== 'needed'){
+        l.atHome = true;
+      }
+    });
+  }
   // Carry the trip's progress across the rebuild (ticks, removals, and any explicit
   // "Need it"/"At home" choice) together with the stamps the sync merge resolves on.
   // Without the stamps a carried-over tick would look unstamped to the other device
@@ -2581,8 +2829,11 @@ function finishShopping(){
     + '\n\nYour menu list and recipe picks are not touched.';
   if(!confirm(msg)) return;
   shoppingData.neededList = shoppingData.neededList.filter(n=> !n.done);
-  shoppingData.shoppingList = [];
   shoppingData.weekPlan.shoppingDoneAt = new Date().toISOString();
+  // Order matters: the trip goes into the archive while the list it is made of still
+  // exists. The next line is where a week's worth of ticks used to vanish for good.
+  archiveFinishedTrip();
+  shoppingData.shoppingList = [];
   shoppingData.weekPlan.lastGeneratedRecipeSignature = recipeSelectionsSignature();
   persist('shopping');
   render();
@@ -2681,19 +2932,42 @@ function el(tag, attrs, children){
 }
 
 /* ---- All Recipes tab ---- */
-function daysSinceCooked(recipe){
-  if(!recipe.lastCooked) return null;
-  const ms = Date.now() - new Date(recipe.lastCooked).getTime();
+function daysSinceStamp(stamp){
+  if(!stamp) return null;
+  const ms = Date.now() - new Date(stamp).getTime();
   return Math.max(0, Math.floor(ms / (1000*60*60*24)));
 }
+function daysSinceCooked(recipe){ return daysSinceStamp(recipe.lastCooked); }
+function daysSincePlanned(recipe){ return daysSinceStamp(recipe.lastPlanned); }
 
+/* v22.0: two different facts, and the difference is the whole point of the badge.
+   "Cooked" means somebody ticked it on the Menu tab. "Planned" means it went on a
+   shopping list and nobody ever said what happened next. Show the stronger claim when
+   there is one, and never dress the weaker one up as the stronger. */
 function recipeHistoryLabel(recipe){
-  const days = daysSinceCooked(recipe);
   const threshold = (recipesData.settings && recipesData.settings.notCookedRecentlyDays) || 60;
-  if(days === null) return {text:'Never cooked', stale:true};
-  if(days === 0) return {text:'Cooked today', stale:false};
-  if(days === 1) return {text:'Cooked yesterday', stale:false};
-  return {text:'Cooked ' + days + ' days ago', stale: days >= threshold};
+  const cooked = daysSinceCooked(recipe);
+  if(cooked !== null){
+    if(cooked === 0) return {text:'Cooked today', stale:false};
+    if(cooked === 1) return {text:'Cooked yesterday', stale:false};
+    return {text:'Cooked ' + cooked + ' days ago', stale: cooked >= threshold};
+  }
+  const planned = daysSincePlanned(recipe);
+  if(planned !== null){
+    if(planned === 0) return {text:'Planned today', stale:false};
+    if(planned === 1) return {text:'Planned yesterday', stale:false};
+    return {text:'Planned ' + planned + ' days ago', stale: planned >= threshold};
+  }
+  return {text:'Never cooked', stale:true};
+}
+
+// What the "not cooked recently" sort orders by: the most recent thing known about this
+// recipe, whether that is a cook or merely a plan. 0 means nothing is known, which sorts
+// first — the same rule as before, now reading both stamps instead of one.
+function recipeHistoryTime(recipe){
+  const c = recipe.lastCooked ? new Date(recipe.lastCooked).getTime() : 0;
+  const p = recipe.lastPlanned ? new Date(recipe.lastPlanned).getTime() : 0;
+  return Math.max(c, p);
 }
 
 function renderRecipesTab(){
@@ -2775,8 +3049,7 @@ function renderRecipesTab(){
       return true;
     }).sort((a,b)=>{
       if(sortMode === 'history'){
-        const da = a.lastCooked ? new Date(a.lastCooked).getTime() : 0;
-        const db = b.lastCooked ? new Date(b.lastCooked).getTime() : 0;
+        const da = recipeHistoryTime(a), db = recipeHistoryTime(b);
         if(da !== db) return da - db; // never-cooked (0) and oldest first
       }
       return a.name.localeCompare(b.name);
@@ -2880,6 +3153,12 @@ function openRecipeViewer(id){
   }
   cols.appendChild(ingCol); cols.appendChild(methodCol);
   body.appendChild(cols);
+  // Every recipe has carried a notes field since the Access DB import, and until v22.0
+  // nothing ever showed it or let anyone write one.
+  if(r.notes && String(r.notes).trim()){
+    body.appendChild(el('h4',{style:'margin-bottom:4px;'},['Notes']));
+    body.appendChild(el('div',{style:'white-space:pre-wrap;'},[String(r.notes)]));
+  }
   const btnRow = el('div',{class:'row',style:'margin-top:14px;'});
   const editBtn = el('button',{class:'btn'},['Edit']);
   editBtn.addEventListener('click', ()=>{ closeModal(); openRecipeEditor(r.id); });
@@ -2923,6 +3202,17 @@ function openRecipeEditor(id){
   body.appendChild(catField);
   const servingsInput = el('input',{type:'number', value:r.servings||4, min:'1'});
   body.appendChild(field('Default servings', servingsInput));
+  /* Both of these have been on every recipe since the Access DB import and both were
+     shown but uneditable — slowCooker was hardcoded false on save, so ticking one was
+     impossible, and inSeason was hardcoded true. */
+  const slowCb = el('input',{type:'checkbox'});
+  slowCb.checked = !!r.slowCooker;
+  const seasonCb = el('input',{type:'checkbox'});
+  seasonCb.checked = r.inSeason !== false;
+  const flagRow = el('div',{class:'field'});
+  flagRow.appendChild(el('label',{style:'display:flex;align-items:center;gap:6px;cursor:pointer;'},[slowCb, 'Slow cooker recipe']));
+  flagRow.appendChild(el('label',{style:'display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:4px;'},[seasonCb, 'In season']));
+  body.appendChild(flagRow);
 
   body.appendChild(el('h4',{},['Ingredients']));
   body.appendChild(el('p',{class:'muted', style:'margin-top:-6px;font-size:0.85em;'},['Start typing an ingredient name to reuse one already in your book — its usual unit fills in and it keeps its aisle on the shopping list. Typing something new adds it as a fresh ingredient (uncategorised until you use "Edit" on it later).']));
@@ -2972,6 +3262,11 @@ function openRecipeEditor(id){
   methodArea.value = (r.method||[]).join('\n');
   body.appendChild(methodArea);
 
+  body.appendChild(el('h4',{},['Notes']));
+  const notesArea = el('textarea',{rows:'3', placeholder:'Anything that is not a step — which tin to use, what the children will not eat, where it came from.'});
+  notesArea.value = r.notes || '';
+  body.appendChild(notesArea);
+
   const saveRow = el('div',{class:'row',style:'margin-top:16px;'});
   const saveBtn = el('button',{class:'btn'},['Save recipe']);
   saveBtn.addEventListener('click', ()=>{
@@ -2984,12 +3279,14 @@ function openRecipeEditor(id){
     const method = normalizeMethodLines(methodArea.value);
     if(isNew){
       const id = slugify(name);
-      recipesData.recipes.push({id, name, category:catInput.value.trim(), servings:parseInt(servingsInput.value,10)||4, slowCooker:false, inSeason:true, ingredients, method, images:[], notes:'', source:'manual'});
+      recipesData.recipes.push({id, name, category:catInput.value.trim(), servings:parseInt(servingsInput.value,10)||4, slowCooker:slowCb.checked, inSeason:seasonCb.checked, ingredients, method, images:[], notes:notesArea.value.trim(), source:'manual'});
     } else {
       const existing = recipesData.recipes.find(x=>x.id===id);
       existing.name = name; existing.category = catInput.value.trim();
       existing.servings = parseInt(servingsInput.value,10)||4;
       existing.ingredients = ingredients; existing.method = method;
+      existing.slowCooker = slowCb.checked; existing.inSeason = seasonCb.checked;
+      existing.notes = notesArea.value.trim();
     }
     persist('recipes');
     closeModal(); currentTab='recipes'; render();
@@ -3018,6 +3315,180 @@ function slugify(name){
   let slug = base, i = 2;
   while(recipesData.recipes.some(r=>r.id===slug)){ slug = base + '-' + (i++); }
   return slug;
+}
+
+/* v22.0: the week's picks were the one part of this app that started from nothing every
+   single time — with 635 recipes, "what did we have three weeks ago?" meant scrolling the
+   library until something looked familiar. The archive can simply answer it.
+   Deliberately the last few shops rather than a favourites list: what a family actually
+   ate is a better suggestion than what somebody once starred and forgot. */
+function buildPastWeeksCard(disabled, onChanged){
+  const trips = recentTrips(0)
+    .filter(t=> picksFromTrip(t, recipesData.recipes).length)
+    .slice(-8).reverse();
+  if(!trips.length) return null;
+  const card = el('div',{class:'card'});
+  card.appendChild(el('h3',{style:'margin:0 0 4px;'},['Weeks you have shopped before']));
+  card.appendChild(el('p',{class:'muted',style:'margin:0 0 10px;'},[
+    'Put a previous week back on the list without going through the whole book again.'
+  ]));
+  trips.forEach(t=>{
+    const picks = picksFromTrip(t, recipesData.recipes);
+    const row = el('div',{class:'picked-row'});
+    row.appendChild(el('div',{class:'picked-name'},[
+      el('strong',{},[tripDateLabel(t.doneAt)]),
+      el('span',{class:'muted'},[' · ' + picks.length + ' recipe(s): ' + summarisePickNames(picks)])
+    ]));
+    const btn = el('button',{class:'btn tap secondary'},['Use these again']);
+    btn.disabled = !!disabled;
+    btn.addEventListener('click', ()=>{
+      // Belt and braces over the disabled attribute: the v21.9 freeze is the rule, and a
+      // button drawn before a shop started must not be able to outlive it.
+      if(shoppingInProgress()) return;
+      if(!confirm('Pick these ' + picks.length + ' recipe(s) again?\n\n' + summarisePickNames(picks, 20)
+                  + '\n\nThis replaces the ' + shoppingData.weekPlan.selections.length
+                  + ' recipe(s) picked at the moment. Your Wait List is not touched.')) return;
+      // Only recipeId and servings: whether that week got cooked is history, not a plan.
+      shoppingData.weekPlan.selections = picks.map(p=>({ recipeId:p.recipeId, servings:p.servings }));
+      persist('shopping');
+      if(onChanged) onChanged();
+      setStatus('Picked the ' + picks.length + ' recipe(s) from ' + tripDateLabel(t.doneAt) + '.', 'ok');
+    });
+    row.appendChild(btn);
+    card.appendChild(row);
+  });
+  return card;
+}
+
+/* ---- v22.0: the route through the shop, learnt rather than configured ----
+
+   Aisles inside a shopping category have always sorted alphabetically, which is nobody's
+   walking order. The obvious fix is to let someone drag them into the right order, and
+   then keep it up to date forever as the shop rearranges itself. But the app has been
+   recording the answer all along: checkedAt on every ticked line is the order the trolley
+   was actually filled. This reads the route back out of that, and asks nobody anything. */
+
+const AISLE_ORDER_TRIPS = 6;          // how many recent shops the route is learnt from
+const AISLE_ORDER_MIN_SIGHTINGS = 3;  // below this an aisle keeps its alphabetical place
+
+/* Pure. For each trip: take the ticked lines in checkedAt order and note where each aisle
+   was FIRST reached, as a fraction from 0 (first into the trolley) to 1 (last). Average
+   those across recent trips.
+   First-reached, not average position, because doubling back for the thing you forgot
+   should not drag an aisle to the end of the shop. And an aisle seen fewer than
+   minSightings times gets no position at all — one visit is an anecdote, and shuffling
+   somebody's list on the strength of it is worse than leaving it alphabetical. */
+function aisleOrderFromHistory(trips, opts){
+  const o = opts || {};
+  const minSightings = o.minSightings || AISLE_ORDER_MIN_SIGHTINGS;
+  const window = o.trips || AISLE_ORDER_TRIPS;
+  const all = Array.isArray(trips) ? trips : [];
+  const recent = all.slice(Math.max(0, all.length - window));
+  const totals = {}, counts = {};
+  recent.forEach(trip=>{
+    const ticked = ((trip && trip.lines) || [])
+      .filter(l=> l && l.checked && l.checkedAt && l.aisle)
+      .sort((a,b)=> tsOf(a.checkedAt) - tsOf(b.checkedAt));
+    if(ticked.length < 2) return;   // a single tick says nothing about an order
+    const firstAt = {};
+    ticked.forEach((l, i)=>{ if(firstAt[l.aisle] === undefined) firstAt[l.aisle] = i; });
+    const span = ticked.length - 1;
+    Object.keys(firstAt).forEach(aisle=>{
+      totals[aisle] = (totals[aisle] || 0) + (firstAt[aisle] / span);
+      counts[aisle] = (counts[aisle] || 0) + 1;
+    });
+  });
+  const order = {};
+  Object.keys(totals).forEach(aisle=>{
+    if(counts[aisle] >= minSightings) order[aisle] = totals[aisle] / counts[aisle];
+  });
+  return order;
+}
+
+/* Pure. Learnt position first, then the alphabetical order the app has always used. An
+   aisle with no learnt position sorts after the ones that have one: it is somewhere we
+   have not reliably been, and the end of its category is a more honest place for it than
+   a guessed spot in the middle. With an empty order this is exactly localeCompare, which
+   is why every call site can use it unconditionally. */
+function compareAisles(order, a, b){
+  const va = (order && typeof order[a] === 'number') ? order[a] : null;
+  const vb = (order && typeof order[b] === 'number') ? order[b] : null;
+  if(va !== null && vb !== null && va !== vb) return va - vb;
+  if(va !== null && vb === null) return -1;
+  if(va === null && vb !== null) return 1;
+  return String(a).localeCompare(String(b));
+}
+
+/* Trips the route is allowed to learn from. "The shop was rearranged" sets
+   settings.aisleOrderSince rather than deleting anything — the archive is a record of
+   what happened and nothing gets to edit it after the fact. */
+function learnedRouteTrips(){
+  const since = recipesData.settings && recipesData.settings.aisleOrderSince;
+  const all = recentTrips(0);
+  return since ? all.filter(t=> tsOf(t.doneAt) >= tsOf(since)) : all;
+}
+
+// The route in force right now. Empty when the feature is off or the history is too thin,
+// and an empty order means every sort falls straight back to alphabetical.
+function activeAisleOrder(){
+  if(!featureOn('learnedAisleOrder')) return {};
+  return aisleOrderFromHistory(learnedRouteTrips());
+}
+
+/* Pure. How many of each shop's picks actually got cooked. Nothing is amended after the
+   fact — the trip records what was bought, the recipe records when it was cooked (since
+   v22.0, honestly), and the answer is the overlap: a cook stamp falling between this shop
+   and the next one.
+   It UNDERSTATES, and deliberately so. lastCooked is a single stamp, so a recipe cooked in
+   two different weeks only counts for the later one. Reporting "at least N" is the honest
+   way to say that, and erring downwards is the safe direction for a number whose whole
+   purpose is to ask whether the week is being over-planned. */
+function cookRateSummary(trips, recipes, n){
+  const all = Array.isArray(trips) ? trips : [];
+  const byId = {};
+  (recipes || []).forEach(r=>{ if(r && r.id) byId[r.id] = r; });
+  const window = (n && n > 0) ? all.slice(Math.max(0, all.length - n)) : all.slice();
+  let picked = 0, cooked = 0;
+  window.forEach(trip=>{
+    const from = tsOf(trip && trip.doneAt);
+    // The next shop in the WHOLE history, not just the window, or the oldest trip in view
+    // would be handed an open-ended claim on every cook since.
+    const idx = all.indexOf(trip);
+    const until = (idx >= 0 && all[idx + 1]) ? tsOf(all[idx + 1].doneAt) : Infinity;
+    (((trip && trip.selections) || [])).forEach(s=>{
+      if(!s || !s.recipeId) return;
+      picked++;
+      if(s.cooked){ cooked++; return; }   // already ticked before the shop was closed
+      const r = byId[s.recipeId];
+      const t = (r && r.lastCooked) ? tsOf(r.lastCooked) : 0;
+      if(t && t >= from && t < until) cooked++;
+    });
+  });
+  return { shops: window.length, picked: picked, cooked: cooked };
+}
+
+/* Pure. Things waved past as "we already have this" every single time they have come up
+   recently. Counted backwards from the most recent shop and stopped at the first time the
+   answer was different: an item that was at home three times and then genuinely needed is
+   not a pantry item, it is one you ran out of.
+   Only DELIBERATE at-home taps count — atHomeAt is present only when somebody pressed the
+   button, never when the pantry rule set the flag from a category. */
+function atHomeStreaks(trips, minRun){
+  const need = minRun || 3;
+  const all = Array.isArray(trips) ? trips : [];
+  const runs = {}, broken = {};
+  for(let i = all.length - 1; i >= 0; i--){
+    (((all[i] && all[i].lines) || [])).forEach(l=>{
+      if(!l || !l.name || l.removed) return;
+      if(broken[l.name]) return;
+      if(l.atHome && l.atHomeAt) runs[l.name] = (runs[l.name] || 0) + 1;
+      else broken[l.name] = true;
+    });
+  }
+  return Object.keys(runs)
+    .filter(k=> !broken[k] && runs[k] >= need)
+    .sort((a,b)=> runs[b] - runs[a] || a.localeCompare(b))
+    .map(k=>({ name: k, runs: runs[k] }));
 }
 
 /* ---- Start New Shopping List tab ---- */
@@ -3071,6 +3542,9 @@ function renderStartTab(){
      This card is the answer, and it is where the servings get adjusted. */
   const pickedCard = el('div',{class:'card picked-card'});
   container.appendChild(pickedCard);
+
+  const pastCard = buildPastWeeksCard(shopping, ()=>{ drawPicked(); draw(); updateCountLabel(); });
+  if(pastCard) container.appendChild(pastCard);
 
   const searchbar = el('div',{class:'searchbar'});
   const searchInput = el('input',{type:'search', placeholder:'Search recipes to add…'});
@@ -3420,8 +3894,11 @@ function renderReviewTab(){
   shownLines.forEach(line=>{ (groups[line.aisle||'Other'] = groups[line.aisle||'Other']||[]).push(line); });
   const aisleCategory = {};
   shownLines.forEach(line=>{ aisleCategory[line.aisle||'Other'] = line.shoppingCategory || 'Other'; });
+  // The shopping CATEGORY order is a household decision and stays exactly as it was; only
+  // the alphabetical tie-break inside a category becomes the learnt route.
+  const aisleOrder = activeAisleOrder();
   Object.keys(groups).sort((a,b)=>
-    catSortIndex(aisleCategory[a]) - catSortIndex(aisleCategory[b]) || a.localeCompare(b)
+    catSortIndex(aisleCategory[a]) - catSortIndex(aisleCategory[b]) || compareAisles(aisleOrder, a, b)
   ).forEach(aisle=>{
     const g = el('div',{class:'aisle-group card'});
     g.appendChild(el('h4',{},[aisle]));
@@ -3693,11 +4170,12 @@ function buildShoppingPrintSection(){
     catGroups[cat][aisle].push(line);
   });
   const shopColumns = el('div',{class:'shop-columns'});
+  const printAisleOrder = activeAisleOrder();   // the printed list walks the same route
   Object.keys(catGroups).sort((a,b)=> catSortIndex(a)-catSortIndex(b) || a.localeCompare(b)).forEach(cat=>{
     const catBlock = el('div',{class:'cat-block'});
     catBlock.appendChild(el('div',{class:'cat-header'},[el('span',{},[cat]), el('span',{class:'col-label'},['# Recipes'])]));
     const aisles = catGroups[cat];
-    Object.keys(aisles).sort().forEach(aisle=>{
+    Object.keys(aisles).sort((a,b)=> compareAisles(printAisleOrder, a, b)).forEach(aisle=>{
       const aisleBlock = el('div',{class:'aisle-block'});
       aisleBlock.appendChild(el('div',{class:'aisle-header'},[aisle]));
       aisles[aisle].sort((a,b)=>a.ingredientName.localeCompare(b.ingredientName)).forEach(line=>{
@@ -3751,12 +4229,33 @@ function renderMenuTab(){
     // Resolve by recipeId at tap time — a merge replaces the selection objects, and
     // mutating the one this row was drawn from would write into a discarded graph.
     const selId = sel.recipeId;
+    /* v22.0: this tick is the only place in the app where somebody states that a meal was
+       actually cooked, so it is the only place that writes recipe.lastCooked. Unticking is
+       a correction, not a new fact, so it puts back whatever the stamp was before —
+       cookedPrev, remembered on the selection. If a merge ever loses cookedPrev the
+       restore lands on null, which understates the history rather than inventing it.
+       This persists BOTH files, so a cook tick re-uploads the recipe file. That is the
+       thing v21.2 went out of its way to avoid for shopping ticks, and it is fine here:
+       this tick happens a few times a week, at home, not forty times over mobile data in
+       the middle of a shop. */
     cb.addEventListener('change', ()=>{
       const live = (shoppingData.weekPlan.selections || []).find(s=> s.recipeId === selId);
       if(!live){ render(); return; }
+      const recipe = recipesData.recipes.find(x=> x.id === selId);
+      const now = new Date().toISOString();
       live.cooked = cb.checked;
-      live.cookedChangedAt = new Date().toISOString();
-      persist('shopping');
+      live.cookedChangedAt = now;
+      if(recipe){
+        if(cb.checked){
+          live.cookedPrev = recipe.lastCooked || null;
+          recipe.lastCooked = now;
+        } else {
+          const prev = live.cookedPrev || null;
+          if(prev) recipe.lastCooked = prev; else delete recipe.lastCooked;
+          delete live.cookedPrev;
+        }
+      }
+      persist();
       row.classList.toggle('removed', cb.checked);
     });
     const label = el('label',{},[r.name + ' — serves ' + sel.servings + (r.category?'  ('+r.category+')':'')]);
@@ -3766,6 +4265,32 @@ function renderMenuTab(){
     menuCard.appendChild(row);
   });
   screen.appendChild(menuCard);
+
+  /* v22.0: the quietest number in the app. Ingredients for a meal nobody got round to
+     were bought all the same, and until there was a history nothing could say so. */
+  const rate = cookRateSummary(recentTrips(0), recipesData.recipes, 6);
+  if(rate.shops >= 2 && rate.picked){
+    const perPicked = rate.picked / rate.shops, perCooked = rate.cooked / rate.shops;
+    const rateCard = el('div',{class:'card'});
+    rateCard.appendChild(el('h4',{style:'margin-top:0;'},['How the last ' + rate.shops + ' shops went']));
+    rateCard.appendChild(el('p',{style:'margin:0 0 4px;'},[
+      rate.picked + ' meals planned, at least ' + rate.cooked + ' cooked'
+      + ' — about ' + Math.round(perPicked) + ' picked a shop and at least ' + Math.round(perCooked) + ' cooked.'
+    ]));
+    if(perCooked <= perPicked - 1.5){
+      rateCard.appendChild(el('p',{class:'muted', style:'margin:0;'},[
+        'The ones that do not get cooked are shopped for all the same. Picking nearer '
+        + Math.round(perCooked) + ' would be closer to what actually happens.'
+      ]));
+    }
+    rateCard.appendChild(el('p',{class:'muted', style:'margin:6px 0 0;font-size:.8rem;'},[
+      '"At least", because a recipe records only its most recent cook — one cooked twice in '
+      + 'different weeks is counted once. Ticking meals off above as you cook them is what '
+      + 'makes this accurate.'
+    ]));
+    screen.appendChild(rateCard);
+  }
+
   container.appendChild(screen);
 
   // ---- printable fridge-door menu (hidden on screen) ----
@@ -4091,6 +4616,7 @@ function renderSettingsTab(){
     ['staples',      'Staples list', 'Regular items (milk, bread…) automatically added to every generated shopping list.'],
     ['pantryAtHome', 'Pantry items start as "at home"', 'Pantry-category items on a new list start in an "At home already" group with one tap to add them if you\u2019re out. Wait List items and staples always stay on the buy list.'],
     ['recipeFinder', 'Recipe finder', 'Search recipes by category and the ingredients they contain (below on this tab).'],
+    ['learnedAisleOrder', 'Order aisles the way you walk the shop', 'Works out the route from the order things were ticked off on previous shops, and lists the aisles that way instead of alphabetically. Needs a few finished shops before it does anything — see below.'],
   ].forEach(([key, label, desc])=>{
     const cb = el('input',{type:'checkbox'});
     cb.checked = featureOn(key);
@@ -4243,6 +4769,102 @@ function renderSettingsTab(){
   });
 
   container.appendChild(prefCard);
+
+  /* -------- The route through the shop (v22.0) --------
+     Shown whenever there is any history at all, feature on or off. Seeing what it WOULD
+     do is how somebody decides whether to switch it on; "trust me, it has learnt
+     something" is not a reasonable thing to ask of a shopping list. */
+  {
+    const routeTrips = learnedRouteTrips();
+    const route = aisleOrderFromHistory(routeTrips);
+    const placed = Object.keys(route).sort((a,b)=> route[a] - route[b]);
+    if(routeTrips.length || featureOn('learnedAisleOrder')){
+      container.appendChild(el('h3',{},['The route through your shop']));
+      const routeCard = el('div',{class:'card'});
+      routeCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
+        'Worked out from the order things were ticked off on your last ' + AISLE_ORDER_TRIPS
+        + ' finished shops. There is nothing to fill in — it is read back out of the ticks. '
+        + 'The list is still grouped by the main sections first (fruit and vegetables, meat, '
+        + 'cold, pantry, toiletries); this order applies to the aisles inside each of those.'
+      ]));
+      if(!placed.length){
+        routeCard.appendChild(el('p',{},[
+          routeTrips.length
+            ? 'Not enough to go on yet — an aisle has to turn up on ' + AISLE_ORDER_MIN_SIGHTINGS
+              + ' shops before it gets a place. ' + routeTrips.length + ' finished shop(s) recorded so far.'
+            : 'No finished shops recorded yet. Tap "Shopping is done" at the end of a shop and this fills itself in.'
+        ]));
+      } else {
+        routeCard.appendChild(el('p',{style:'margin-bottom:4px;'},[
+          placed.length + ' aisle(s) placed, from ' + routeTrips.length + ' finished shop(s)'
+          + (featureOn('learnedAisleOrder') ? '' : ' — switch the feature on above to start using it') + ':'
+        ]));
+        const ol = el('ol',{style:'margin:0;padding-left:20px;'});
+        placed.forEach(n=> ol.appendChild(el('li',{},[n])));
+        routeCard.appendChild(ol);
+        const resetBtn = el('button',{class:'btn secondary', style:'margin-top:10px;'},['The shop was rearranged — start again']);
+        resetBtn.addEventListener('click', ()=>{
+          if(!confirm('Forget the route learnt so far?\n\nShops from here on will be used to work it out again. Nothing in your shopping history is deleted — the route simply stops reading the shops before today.')) return;
+          recipesData.settings.aisleOrderSince = new Date().toISOString();
+          persist('recipes');
+          render();
+        });
+        routeCard.appendChild(resetBtn);
+      }
+      container.appendChild(routeCard);
+    }
+  }
+
+  /* -------- Things you always have in (v22.0) -------- */
+  {
+    const athList = recipesData.settings.alwaysAtHome || [];
+    const known = {};
+    athList.forEach(n=>{ known[String(n).toLowerCase()] = true; });
+    const suggestions = atHomeStreaks(recentTrips(0), 3).filter(s=> !known[s.name.toLowerCase()]);
+    if(athList.length || suggestions.length){
+      container.appendChild(el('h3',{},['Things you always have in']));
+      const athCard = el('div',{class:'card'});
+      athCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
+        'These start a new list in the "At home already" group rather than on the buy list, '
+        + 'with one tap to say you are out. Anything on the Wait List, or in your staples, is '
+        + 'always bought whatever is here.'
+      ]));
+      athList.forEach(name=>{
+        const row = el('div',{class:'picked-row'});
+        row.appendChild(el('div',{class:'picked-name'},[name]));
+        const rm = el('button',{class:'btn tap secondary'},['Buy it again']);
+        rm.addEventListener('click', ()=>{
+          recipesData.settings.alwaysAtHome = (recipesData.settings.alwaysAtHome || [])
+            .filter(n=> String(n).toLowerCase() !== String(name).toLowerCase());
+          persist('recipes');
+          render();
+        });
+        row.appendChild(rm);
+        athCard.appendChild(row);
+      });
+      if(suggestions.length){
+        athCard.appendChild(el('p',{style:'margin:12px 0 0;'},[
+          el('strong',{},['Noticed on your recent shops'])
+        ]));
+        suggestions.slice(0, 8).forEach(s=>{
+          const row = el('div',{class:'picked-row'});
+          row.appendChild(el('div',{class:'picked-name'},[
+            s.name,
+            el('span',{class:'muted'},[' · already at home on the last ' + s.runs + ' shops it came up'])
+          ]));
+          const add = el('button',{class:'btn tap secondary'},['Start it at home']);
+          add.addEventListener('click', ()=>{
+            recipesData.settings.alwaysAtHome = (recipesData.settings.alwaysAtHome || []).concat([s.name]);
+            persist('recipes');
+            render();
+          });
+          row.appendChild(add);
+          athCard.appendChild(row);
+        });
+      }
+      container.appendChild(athCard);
+    }
+  }
 
   /* -------- Recipe finder (feature-gated) -------- */
   if(featureOn('recipeFinder')){

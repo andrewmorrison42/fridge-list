@@ -942,6 +942,152 @@ async function suiteLiveListNotWiped(browser) {
 
 /* ---------- run ---------- *//* ---------- run ---------- */
 
+/* ---------- v22.0: the memory ---------- */
+
+const readTrips = page => page.evaluate(() => {
+  const raw = localStorage.getItem('fma_trips_v1');
+  return raw ? JSON.parse(raw) : null;
+});
+
+async function suiteTripHistory(browser) {
+  group('finishing a shop leaves a record behind');
+  const srv = await serve(8181);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  page.on('dialog', d => d.accept());
+  try {
+    await page.goto('http://localhost:8181/', { waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+    await buildAList(page);
+
+    ok('nothing is archived before a shop is finished', (await readTrips(page)) === null);
+
+    // Tick three items, one at a time, so their checkedAt stamps are genuinely ordered —
+    // that order IS the walking route the archive exists to keep.
+    const rows = await page.$$('.shop-row');
+    const tickedNames = [];
+    for (let i = 0; i < 3; i++) {
+      tickedNames.push((await rows[i].$eval('.item-name, .shop-name, label', e => e.textContent) || '').trim());
+      await rows[i].$eval('input[type=checkbox]', c => c.click());
+      await page.waitForTimeout(150);
+    }
+    const live = await readShopping(page);
+    const liveTripId = live.weekPlan.tripId;
+    const picked = live.weekPlan.selections.map(s => s.recipeId);
+    ok('the live list has ticks to lose', live.shoppingList.filter(l => l.checked).length === 3);
+
+    await page.click('#app >> text="Shopping is done"');
+    await page.waitForTimeout(800);
+
+    const after = await readShopping(page);
+    ok('the shopping list is cleared, as it always was', after.shoppingList.length === 0);
+
+    const hist = await readTrips(page);
+    ok('but the shop itself is now kept', !!hist && hist.trips.length === 1, hist && hist.trips.length);
+    const trip = hist.trips[0];
+    ok('under the id of the trip it was', trip.tripId === liveTripId);
+    ok('with the lines the list had', trip.lines.length > 0, trip.lines.length);
+    ok('the ticks are in the record', trip.lines.filter(l => l.checked).length === 3);
+    ok('and so are their stamps — this is the walking order',
+       trip.lines.filter(l => l.checked && l.checkedAt).length === 3);
+    ok('the ticks are in the order they were made',
+       (() => {
+         const t = trip.lines.filter(l => l.checked).map(l => Date.parse(l.checkedAt));
+         return t.slice().sort((a, b) => a - b).join() === t.sort((a, b) => a - b).join() && t.length === 3;
+       })());
+    ok('the week the shop was for is in the record too',
+       trip.selections.length === picked.length && trip.selections.every(s => picked.includes(s.recipeId)),
+       trip.selections);
+    ok('and the record is lean — no bulk carried into the archive',
+       trip.lines.every(l => l.sources === undefined && l.textQtyParts === undefined));
+
+    /* Now the payoff: that week can be picked again without touching the library. */
+    await page.click('#mainNav button[data-tab="start"]');
+    await page.waitForSelector('#app input[type=checkbox]', { timeout: 15000 });
+    ok('the Start tab offers the week back',
+       await page.evaluate(() => /Weeks you have shopped before/i.test(document.getElementById('app').innerText)));
+
+    // Clear the picks first, so "use these again" has something to actually restore.
+    await page.click('#app >> text="Clear all selections"');
+    await page.waitForTimeout(500);
+    ok('picks cleared', (await readShopping(page)).weekPlan.selections.length === 0);
+
+    await page.click('#app >> text="Use these again"');
+    await page.waitForTimeout(600);
+    const restored = (await readShopping(page)).weekPlan.selections.map(s => s.recipeId);
+    ok('one tap puts the whole week back',
+       restored.length === picked.length && picked.every(id => restored.includes(id)),
+       { picked, restored });
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
+async function suiteLearnedAisleOrder(browser) {
+  group('the list is ordered by the route actually walked');
+  const srv = await serve(8182);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  page.on('dialog', d => d.accept());
+  try {
+    await page.goto('http://localhost:8182/', { waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+    await buildAList(page);
+
+    // The aisles this particular list actually has, in the order the app shows them now.
+    const alphabetical = await page.evaluate(() =>
+      [...document.querySelectorAll('.aisle-group h4')].map(h => h.textContent));
+    ok('the list has enough aisles to reorder', alphabetical.length >= 2, alphabetical);
+
+    /* Seed a history in which those aisles were walked in the REVERSE of the order the
+       app is using — six shops, so every aisle clears the three-sightings bar. */
+    const reversed = alphabetical.slice().reverse();
+    await page.evaluate((aisles) => {
+      const trips = [];
+      for (let t = 0; t < 6; t++) {
+        trips.push({
+          tripId: 'seed-' + t,
+          doneAt: new Date(Date.now() - (10 - t) * 86400000).toISOString(),
+          selections: [],
+          lines: aisles.map((a, i) => ({
+            name: a + ' item', aisle: a, checked: true,
+            checkedAt: new Date(Date.now() - (10 - t) * 86400000 + i * 60000).toISOString()
+          }))
+        });
+      }
+      localStorage.setItem('fma_trips_v1', JSON.stringify({ version: 1, trips: trips }));
+    }, reversed);
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+    await page.click('#mainNav button[data-tab="review"]');
+    await page.waitForTimeout(600);
+    const stillAlphabetical = await page.evaluate(() =>
+      [...document.querySelectorAll('.aisle-group h4')].map(h => h.textContent));
+    ok('a history alone changes nothing — the feature ships off',
+       stillAlphabetical.join('|') === alphabetical.join('|'), stillAlphabetical);
+
+    // Switch it on the way a person would: the Settings switchboard.
+    await page.click('#mainNav button[data-tab="settings"]');
+    await page.waitForTimeout(400);
+    ok('Settings shows the route it has worked out, so it can be read before it is used',
+       await page.evaluate(() => /route through your shop/i.test(document.getElementById('app').innerText)));
+    await page.click('#app label:has-text("Order aisles the way you walk the shop") input[type=checkbox]');
+    await page.waitForTimeout(500);
+
+    await page.click('#mainNav button[data-tab="review"]');
+    await page.waitForTimeout(600);
+    const learnt = await page.evaluate(() =>
+      [...document.querySelectorAll('.aisle-group h4')].map(h => h.textContent));
+    ok('now the aisles follow the walked route, not the alphabet',
+       learnt.join('|') !== alphabetical.join('|'), { alphabetical, learnt });
+    ok('and it is the same set of aisles, only reordered',
+       learnt.slice().sort().join('|') === alphabetical.slice().sort().join('|'), learnt);
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 (async () => {
   console.log('Chromium: ' + EXECUTABLE);
   const browser = await chromium.launch({ executablePath: EXECUTABLE, args: ['--no-sandbox'] });
@@ -951,6 +1097,7 @@ async function suiteLiveListNotWiped(browser) {
     for (const suite of [suiteTicksSurviveRebuild, suiteRemoteMergeKeepsTicks,
                          suiteWriteSplitting, suiteStapleQuantities, suiteTypingIsNotInterrupted,
                          suiteBulkDelete, suiteShareOneRecipe, suiteLiveListNotWiped,
+                         suiteTripHistory, suiteLearnedAisleOrder,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
       catch (e) {

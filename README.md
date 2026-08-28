@@ -13,6 +13,9 @@ your own OneDrive.
   seconds.
 - A Wait List anyone can add to the moment they notice you're low on something.
 - Print the shopping list, or a weekly menu for the fridge door.
+- Remembers each finished shop, so a previous week can be put back as this week's picks
+  with one tap instead of going through the whole book again — and so the Menu tab can
+  tell you how many of the meals you planned actually got cooked.
 - Copy one recipe to the clipboard, laid out and ready to paste into an email or a
   document — or send it as a file another copy of the app can import. One recipe,
   not the whole book.
@@ -27,6 +30,10 @@ Turn them on under **Settings → Features**:
   quantity you normally buy.
 - **Pantry items start as "at home"** — flour, oil and spices begin in an "already
   have this" group rather than on the buy list.
+- **Order aisles the way you walk the shop** — works the route out from the order things
+  were ticked off on previous shops, instead of listing the aisles alphabetically. It
+  needs a few finished shops first, and Settings shows you the route it has worked out
+  before you switch it on.
 
 Comes with a few hundred family recipes to start from. You can cook from them, add
 your own, or [clear them out](docs/SETUP-use-the-app.md#deleting-a-lot-of-recipes-at-once)
@@ -65,9 +72,10 @@ Guide 2 explains the trade-off in plain terms so you can decide.
 
 ## Is my data private?
 
-Your recipes and shopping list are stored as two files, `recipes-data.json` and
-`shopping-list.json`, inside a folder called **FridgeList** in the OneDrive of
-whoever sets it up. They are not sent anywhere else, and there is no server or
+Your recipes and shopping list are stored as three files — `recipes-data.json`,
+`shopping-list.json`, and `trip-history.json` (a short record of each finished shop,
+which is what the app remembers things from) — inside a folder called **FridgeList** in
+the OneDrive of whoever sets it up. They are not sent anywhere else, and there is no server or
 database behind this app.
 
 The one thing to understand before you start is what you are agreeing to when you
@@ -149,3 +157,6 @@ are best kept surgical rather than reformatting.
   recipes on two devices can lose one side. An ETag guard stops a stale copy silently
   overwriting a newer one, and reports the clash instead.
 - **Every open downloads the full recipe file**, whether or not anything changed.
+- **A shop finished on a phone running an older build is not recorded**, so it leaves a
+  gap in the history. Nothing breaks; the features that read it are written to be honest
+  about thin data.

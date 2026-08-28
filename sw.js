@@ -20,7 +20,7 @@
  *
  * Bump CACHE on every release. Old caches are deleted on activate.
  */
-const CACHE = 'fridge-list-v21.2';
+const CACHE = 'fridge-list-v22.0';
 
 // Same-origin assets worth having before the first offline launch. The page itself is
 // added on the fly by the fetch handler, so a failed precache can never block install.
