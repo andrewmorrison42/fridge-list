@@ -9,8 +9,8 @@ noticed mid-shop. They are worth reading before changing sync, rendering or stor
 ## Commands
 
 ```
-npm test                # 144 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 115 browser assertions — needs playwright-core + Chromium
+npm test                # 218 logic assertions — no dependencies, no browser, ~1s
+npm run test:browser    # 136 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -35,9 +35,12 @@ Consequences:
 
 - **No framework.** `el(tag, attrs, children)` builds DOM; `render()` rebuilds the
   current tab from scratch.
-- **Two data objects.** `recipesData` (recipes, ingredient master, settings) and
-  `shoppingData` (week's picks, generated list, Wait List). Each is persisted to
-  localStorage and to a JSON file in the OneDrive `FridgeList` folder.
+- **Two data objects, plus an archive.** `recipesData` (recipes, ingredient master,
+  settings) and `shoppingData` (week's picks, generated list, Wait List). Each is
+  persisted to localStorage and to a JSON file in the OneDrive `FridgeList` folder.
+  Since v22.0 there is a third file, `trip-history.json` — one record per finished shop,
+  written once, read lazily. It is not a third live object: nothing renders from it
+  directly, and it never touches the merge.
 - **Sync is polling, not push.** A 20s folder poll, plus a 5s poll while the Review
   tab is open. All writes are debounced 600 ms.
 - **Auth** is MSAL against a public client ID, redirect flow, scopes
@@ -111,6 +114,33 @@ the two can never disagree about what is about to happen. Since v21.9 froze the 
 reaching that state at all means another device changed them — an older build, or one
 that was offline — so the note explains and offers no button. *(v21.8, v21.9)*
 
+**The trip archive is append-only, and nothing edits a closed record.** `finishShopping`
+writes the trip to localStorage *before* clearing `shoppingList` — that clear is where a
+week of ticks used to go for good, so a failed archive must not be discovered afterwards.
+The remote copy is best-effort and owed. `mergeTripHistory` is a union keyed by `tripId`
+with the fuller record winning, which is total and conflict-free precisely because a trip
+is written once by the device that finished it; the moment something starts amending
+trips after the fact, that guarantee is gone and so is the reason this feature does not
+touch `mergeShoppingData`. *(v22.0)*
+
+**The archive does not go through `persist()`.** `which` is `'recipes' | 'shopping' |
+both, and squeezing a third value into those two `!==` tests is exactly how a tick starts
+re-uploading something it should not. `pushTripHistory` is its own writer. The archive is
+also never read at startup — the localStorage mirror is what every feature reads, and the
+remote copy is folded in on sign-in, on "Sync now", and after this device archives a shop
+of its own. *(v22.0)*
+
+**`lastCooked` means somebody said they cooked it.** It used to be stamped in
+`generateShoppingList`, so "not cooked recently" really meant "not shopped for recently".
+`lastPlanned` carries that meaning now; `lastCooked` is written only by the Menu tab's
+cooked tick. Anything derived from cooking — the badge, the history sort, `cookRateSummary`
+— must keep the two apart, and must not quietly present a plan as a meal. *(v22.0)*
+
+**`atHomeAt` is what separates a decision from an assumption.** The `pantryAtHome` rule
+sets `atHome` from a category and never stamps it; the "At home" button stamps. Anything
+learning from at-home behaviour (`atHomeStreaks`) must require the stamp, or it is
+learning from its own defaults. *(v22.0)*
+
 **Destructive actions must be recoverable, not merely confirmed.** A dialog is not a
 safety mechanism — v19.0 removed a bulk ingredient delete that had one. Bulk recipe
 delete writes a snapshot *first* and proceeds only if that write succeeded, keeps an
@@ -150,6 +180,8 @@ Shopping data merges per item; recipes do not.
   the list it was shopping from and wiped every tick.
 - **Recipes are last-save-wins** with an `If-Match` ETag guard: on a genuine conflict
   the write is refused and reported rather than clobbering.
+- **Trips are write-once**, so `trip-history.json` needs no conflict rule at all — see the
+  invariant above. It is capped at `TRIP_HISTORY_MAX` (52) and pruned on every merge.
 
 ## Testing
 
@@ -206,6 +238,18 @@ than working around it.
   Judged low value: the Wait List is filled in during the week, usually one person at a
   time, and the cost of the bug is a forgotten bottle of shampoo.
 
+- **A mixed fleet pollutes `lastCooked` for as long as it lasts.** A phone still on v21.9
+  goes on stamping `lastCooked` when it generates a list, so on a household running both
+  builds some recipes will claim to have been cooked when they were only planned. It
+  self-corrects as devices update, and the failure mode is the one the app had all along.
+  Not worth defending against: the fix costs a field on the synced file, which is exactly
+  the kind of shape change the invariants above exist to prevent.
+
+- **A shop finished on an older build is not archived at all.** v21.9 knows nothing about
+  `trip-history.json`, so that week is a gap in the history rather than a corruption of
+  it. Everything reading the archive is written to be honest about thin data — the route
+  needs three sightings of an aisle, the cook rate says "at least".
+
 - **Recipes have no per-item merge.** Concurrent edits to different recipes on two
   devices can lose one side. The ETag guard prevents silent clobbering but does not
   merge.
@@ -222,6 +266,12 @@ than working around it.
   from 1.3 MB to roughly 200 KB — the largest single win available on load time, and it
   narrows the sync window that caused the typing bug. The full collection would live in
   OneDrive like anyone else's data.
+
+- **The archive is written but barely read.** Four features come off it so far. The
+  obvious next ones, in rough order of value per line: a spend figure typed in at the
+  checkout (one number, no per-item prices, and the trend is the whole point — needs a
+  currency decision first); "you buy this every week, make it a staple"; and the
+  never-bought and never-cooked lists that would make a clear-out an informed one.
 
 - **`qty` in the recipe editor.** The shopping list no longer prints "1 qty Banana",
   but the editor still shows `qty` as a unit for the 120 ingredients that use it to
