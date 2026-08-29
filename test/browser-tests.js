@@ -1002,88 +1002,16 @@ async function suiteTripHistory(browser) {
     ok('and the record is lean — no bulk carried into the archive',
        trip.lines.every(l => l.sources === undefined && l.textQtyParts === undefined));
 
-    /* Now the payoff: that week can be picked again without touching the library. */
+    /* The archive is written but nothing replays it — the Start tab must NOT offer to
+       put a past week back. Removed in v23.0; the record is kept for the cook rate and
+       the at-home suggestions, and for looking a past week up. */
     await page.click('#mainNav button[data-tab="start"]');
     await page.waitForSelector('#app input[type=checkbox]', { timeout: 15000 });
-    ok('the Start tab offers the week back',
-       await page.evaluate(() => /Weeks you have shopped before/i.test(document.getElementById('app').innerText)));
-
-    // Clear the picks first, so "use these again" has something to actually restore.
-    await page.click('#app >> text="Clear all selections"');
-    await page.waitForTimeout(500);
-    ok('picks cleared', (await readShopping(page)).weekPlan.selections.length === 0);
-
-    await page.click('#app >> text="Use these again"');
-    await page.waitForTimeout(600);
-    const restored = (await readShopping(page)).weekPlan.selections.map(s => s.recipeId);
-    ok('one tap puts the whole week back',
-       restored.length === picked.length && picked.every(id => restored.includes(id)),
-       { picked, restored });
-    ok('no console errors', errs.length === 0, errs);
-  } finally { await ctx.close(); await srv.close(); }
-}
-
-async function suiteLearnedAisleOrder(browser) {
-  group('the list is ordered by the route actually walked');
-  const srv = await serve(8182);
-  const ctx = await browser.newContext();
-  const page = await ctx.newPage();
-  const errs = []; watchErrors(page, errs);
-  page.on('dialog', d => d.accept());
-  try {
-    await page.goto('http://localhost:8182/', { waitUntil: 'domcontentloaded' });
-    await waitForApp(page);
-    await buildAList(page);
-
-    // The aisles this particular list actually has, in the order the app shows them now.
-    const alphabetical = await page.evaluate(() =>
-      [...document.querySelectorAll('.aisle-group h4')].map(h => h.textContent));
-    ok('the list has enough aisles to reorder', alphabetical.length >= 2, alphabetical);
-
-    /* Seed a history in which those aisles were walked in the REVERSE of the order the
-       app is using — six shops, so every aisle clears the three-sightings bar. */
-    const reversed = alphabetical.slice().reverse();
-    await page.evaluate((aisles) => {
-      const trips = [];
-      for (let t = 0; t < 6; t++) {
-        trips.push({
-          tripId: 'seed-' + t,
-          doneAt: new Date(Date.now() - (10 - t) * 86400000).toISOString(),
-          selections: [],
-          lines: aisles.map((a, i) => ({
-            name: a + ' item', aisle: a, checked: true,
-            checkedAt: new Date(Date.now() - (10 - t) * 86400000 + i * 60000).toISOString()
-          }))
-        });
-      }
-      localStorage.setItem('fma_trips_v1', JSON.stringify({ version: 1, trips: trips }));
-    }, reversed);
-
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await waitForApp(page);
-    await page.click('#mainNav button[data-tab="review"]');
-    await page.waitForTimeout(600);
-    const stillAlphabetical = await page.evaluate(() =>
-      [...document.querySelectorAll('.aisle-group h4')].map(h => h.textContent));
-    ok('a history alone changes nothing — the feature ships off',
-       stillAlphabetical.join('|') === alphabetical.join('|'), stillAlphabetical);
-
-    // Switch it on the way a person would: the Settings switchboard.
-    await page.click('#mainNav button[data-tab="settings"]');
-    await page.waitForTimeout(400);
-    ok('Settings shows the route it has worked out, so it can be read before it is used',
-       await page.evaluate(() => /route through your shop/i.test(document.getElementById('app').innerText)));
-    await page.click('#app label:has-text("Order aisles the way you walk the shop") input[type=checkbox]');
-    await page.waitForTimeout(500);
-
-    await page.click('#mainNav button[data-tab="review"]');
-    await page.waitForTimeout(600);
-    const learnt = await page.evaluate(() =>
-      [...document.querySelectorAll('.aisle-group h4')].map(h => h.textContent));
-    ok('now the aisles follow the walked route, not the alphabet',
-       learnt.join('|') !== alphabetical.join('|'), { alphabetical, learnt });
-    ok('and it is the same set of aisles, only reordered',
-       learnt.slice().sort().join('|') === alphabetical.slice().sort().join('|'), learnt);
+    ok('the Start tab does not offer to replay a past week',
+       await page.evaluate(() => !/Weeks you have shopped before/i.test(document.getElementById('app').innerText)));
+    ok('and offers no way to reinstate one',
+       await page.evaluate(() => ![...document.querySelectorAll('#app button')]
+         .some(b => /use these again/i.test(b.textContent))));
     ok('no console errors', errs.length === 0, errs);
   } finally { await ctx.close(); await srv.close(); }
 }
@@ -1245,7 +1173,7 @@ async function suiteUnsyncedPhoneSaysSo(browser) {
     for (const suite of [suiteTicksSurviveRebuild, suiteRemoteMergeKeepsTicks,
                          suiteWriteSplitting, suiteStapleQuantities, suiteTypingIsNotInterrupted,
                          suiteBulkDelete, suiteShareOneRecipe, suiteLiveListNotWiped,
-                         suiteTripHistory, suiteLearnedAisleOrder, suiteClearSurvivesSync,
+                         suiteTripHistory, suiteClearSurvivesSync,
                          suiteUnsyncedPhoneSaysSo,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }

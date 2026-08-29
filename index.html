@@ -461,7 +461,7 @@ function defaultSettings(){
            // UI is entirely absent until switched on (Settings -> Features). Synced with
            // the family's data so all devices behave the same. recipeFinder defaults ON
            // because it was already in live use before the switchboard existed.
-           features: { staples: false, pantryAtHome: false, recipeFinder: true, learnedAisleOrder: false },
+           features: { staples: false, pantryAtHome: false, recipeFinder: true },
            staples: [],
            /* How much of each staple to buy, keyed by the staple's canonical name:
               { "Milk": 2000, "Eggs (whole)": 12 }. Deliberately held OUTSIDE the staples
@@ -2025,35 +2025,6 @@ async function fetchTripHistory(){
   }catch(e){ console.warn('could not read the trip history', e); }
 }
 
-/* Pure. What a past trip's picks would look like if you used them again: the recipes it
-   was built from, minus any since deleted from the book, with the servings that trip
-   actually used — so "the week we cooked for eight" comes back as it was. */
-function picksFromTrip(trip, recipes){
-  const byId = {};
-  (recipes || []).forEach(r=>{ if(r && r.id) byId[r.id] = r; });
-  return (((trip && trip.selections) || []))
-    .filter(s=> s && byId[s.recipeId])
-    .map(s=>({
-      recipeId: s.recipeId,
-      servings: s.servings || byId[s.recipeId].servings || 4,
-      name: byId[s.recipeId].name
-    }));
-}
-
-// Pure. Names for a row on a phone: a few, then a count, rather than a wall of text.
-function summarisePickNames(picks, max){
-  const cap = max || 5;
-  const names = (picks || []).map(p=> p.name);
-  if(names.length <= cap) return names.join(', ');
-  return names.slice(0, cap).join(', ') + ' and ' + (names.length - cap) + ' more';
-}
-
-function tripDateLabel(iso){
-  const d = iso ? new Date(iso) : null;
-  if(!d || isNaN(d.getTime())) return 'an earlier shop';
-  return d.toLocaleDateString(undefined, { day:'numeric', month:'short' });
-}
-
 /* ---------------- manual export / import (works in every browser) ---------------- */
 
 /* ---- v21.6: bulk recipe delete, and the safety net under it ----
@@ -3453,124 +3424,6 @@ function slugify(name){
   return slug;
 }
 
-/* v22.0: the week's picks were the one part of this app that started from nothing every
-   single time — with 635 recipes, "what did we have three weeks ago?" meant scrolling the
-   library until something looked familiar. The archive can simply answer it.
-   Deliberately the last few shops rather than a favourites list: what a family actually
-   ate is a better suggestion than what somebody once starred and forgot. */
-function buildPastWeeksCard(disabled, onChanged){
-  const trips = recentTrips(0)
-    .filter(t=> picksFromTrip(t, recipesData.recipes).length)
-    .slice(-8).reverse();
-  if(!trips.length) return null;
-  const card = el('div',{class:'card'});
-  card.appendChild(el('h3',{style:'margin:0 0 4px;'},['Weeks you have shopped before']));
-  card.appendChild(el('p',{class:'muted',style:'margin:0 0 10px;'},[
-    'Put a previous week back on the list without going through the whole book again.'
-  ]));
-  trips.forEach(t=>{
-    const picks = picksFromTrip(t, recipesData.recipes);
-    const row = el('div',{class:'picked-row'});
-    row.appendChild(el('div',{class:'picked-name'},[
-      el('strong',{},[tripDateLabel(t.doneAt)]),
-      el('span',{class:'muted'},[' · ' + picks.length + ' recipe(s): ' + summarisePickNames(picks)])
-    ]));
-    const btn = el('button',{class:'btn tap secondary'},['Use these again']);
-    btn.disabled = !!disabled;
-    btn.addEventListener('click', ()=>{
-      // Belt and braces over the disabled attribute: the v21.9 freeze is the rule, and a
-      // button drawn before a shop started must not be able to outlive it.
-      if(shoppingInProgress()) return;
-      if(!confirm('Pick these ' + picks.length + ' recipe(s) again?\n\n' + summarisePickNames(picks, 20)
-                  + '\n\nThis replaces the ' + shoppingData.weekPlan.selections.length
-                  + ' recipe(s) picked at the moment. Your Wait List is not touched.')) return;
-      // Only recipeId and servings: whether that week got cooked is history, not a plan.
-      shoppingData.weekPlan.selections = picks.map(p=>({ recipeId:p.recipeId, servings:p.servings }));
-      persist('shopping');
-      if(onChanged) onChanged();
-      setStatus('Picked the ' + picks.length + ' recipe(s) from ' + tripDateLabel(t.doneAt) + '.', 'ok');
-    });
-    row.appendChild(btn);
-    card.appendChild(row);
-  });
-  return card;
-}
-
-/* ---- v22.0: the route through the shop, learnt rather than configured ----
-
-   Aisles inside a shopping category have always sorted alphabetically, which is nobody's
-   walking order. The obvious fix is to let someone drag them into the right order, and
-   then keep it up to date forever as the shop rearranges itself. But the app has been
-   recording the answer all along: checkedAt on every ticked line is the order the trolley
-   was actually filled. This reads the route back out of that, and asks nobody anything. */
-
-const AISLE_ORDER_TRIPS = 6;          // how many recent shops the route is learnt from
-const AISLE_ORDER_MIN_SIGHTINGS = 3;  // below this an aisle keeps its alphabetical place
-
-/* Pure. For each trip: take the ticked lines in checkedAt order and note where each aisle
-   was FIRST reached, as a fraction from 0 (first into the trolley) to 1 (last). Average
-   those across recent trips.
-   First-reached, not average position, because doubling back for the thing you forgot
-   should not drag an aisle to the end of the shop. And an aisle seen fewer than
-   minSightings times gets no position at all — one visit is an anecdote, and shuffling
-   somebody's list on the strength of it is worse than leaving it alphabetical. */
-function aisleOrderFromHistory(trips, opts){
-  const o = opts || {};
-  const minSightings = o.minSightings || AISLE_ORDER_MIN_SIGHTINGS;
-  const window = o.trips || AISLE_ORDER_TRIPS;
-  const all = Array.isArray(trips) ? trips : [];
-  const recent = all.slice(Math.max(0, all.length - window));
-  const totals = {}, counts = {};
-  recent.forEach(trip=>{
-    const ticked = ((trip && trip.lines) || [])
-      .filter(l=> l && l.checked && l.checkedAt && l.aisle)
-      .sort((a,b)=> tsOf(a.checkedAt) - tsOf(b.checkedAt));
-    if(ticked.length < 2) return;   // a single tick says nothing about an order
-    const firstAt = {};
-    ticked.forEach((l, i)=>{ if(firstAt[l.aisle] === undefined) firstAt[l.aisle] = i; });
-    const span = ticked.length - 1;
-    Object.keys(firstAt).forEach(aisle=>{
-      totals[aisle] = (totals[aisle] || 0) + (firstAt[aisle] / span);
-      counts[aisle] = (counts[aisle] || 0) + 1;
-    });
-  });
-  const order = {};
-  Object.keys(totals).forEach(aisle=>{
-    if(counts[aisle] >= minSightings) order[aisle] = totals[aisle] / counts[aisle];
-  });
-  return order;
-}
-
-/* Pure. Learnt position first, then the alphabetical order the app has always used. An
-   aisle with no learnt position sorts after the ones that have one: it is somewhere we
-   have not reliably been, and the end of its category is a more honest place for it than
-   a guessed spot in the middle. With an empty order this is exactly localeCompare, which
-   is why every call site can use it unconditionally. */
-function compareAisles(order, a, b){
-  const va = (order && typeof order[a] === 'number') ? order[a] : null;
-  const vb = (order && typeof order[b] === 'number') ? order[b] : null;
-  if(va !== null && vb !== null && va !== vb) return va - vb;
-  if(va !== null && vb === null) return -1;
-  if(va === null && vb !== null) return 1;
-  return String(a).localeCompare(String(b));
-}
-
-/* Trips the route is allowed to learn from. "The shop was rearranged" sets
-   settings.aisleOrderSince rather than deleting anything — the archive is a record of
-   what happened and nothing gets to edit it after the fact. */
-function learnedRouteTrips(){
-  const since = recipesData.settings && recipesData.settings.aisleOrderSince;
-  const all = recentTrips(0);
-  return since ? all.filter(t=> tsOf(t.doneAt) >= tsOf(since)) : all;
-}
-
-// The route in force right now. Empty when the feature is off or the history is too thin,
-// and an empty order means every sort falls straight back to alphabetical.
-function activeAisleOrder(){
-  if(!featureOn('learnedAisleOrder')) return {};
-  return aisleOrderFromHistory(learnedRouteTrips());
-}
-
 /* Pure. How many of each shop's picks actually got cooked. Nothing is amended after the
    fact — the trip records what was bought, the recipe records when it was cooked (since
    v22.0, honestly), and the answer is the overlap: a cook stamp falling between this shop
@@ -3684,9 +3537,6 @@ function renderStartTab(){
      This card is the answer, and it is where the servings get adjusted. */
   const pickedCard = el('div',{class:'card picked-card'});
   container.appendChild(pickedCard);
-
-  const pastCard = buildPastWeeksCard(shopping, ()=>{ drawPicked(); draw(); updateCountLabel(); });
-  if(pastCard) container.appendChild(pastCard);
 
   const searchbar = el('div',{class:'searchbar'});
   const searchInput = el('input',{type:'search', placeholder:'Search recipes to add…'});
@@ -4036,11 +3886,8 @@ function renderReviewTab(){
   shownLines.forEach(line=>{ (groups[line.aisle||'Other'] = groups[line.aisle||'Other']||[]).push(line); });
   const aisleCategory = {};
   shownLines.forEach(line=>{ aisleCategory[line.aisle||'Other'] = line.shoppingCategory || 'Other'; });
-  // The shopping CATEGORY order is a household decision and stays exactly as it was; only
-  // the alphabetical tie-break inside a category becomes the learnt route.
-  const aisleOrder = activeAisleOrder();
   Object.keys(groups).sort((a,b)=>
-    catSortIndex(aisleCategory[a]) - catSortIndex(aisleCategory[b]) || compareAisles(aisleOrder, a, b)
+    catSortIndex(aisleCategory[a]) - catSortIndex(aisleCategory[b]) || a.localeCompare(b)
   ).forEach(aisle=>{
     const g = el('div',{class:'aisle-group card'});
     g.appendChild(el('h4',{},[aisle]));
@@ -4312,12 +4159,11 @@ function buildShoppingPrintSection(){
     catGroups[cat][aisle].push(line);
   });
   const shopColumns = el('div',{class:'shop-columns'});
-  const printAisleOrder = activeAisleOrder();   // the printed list walks the same route
   Object.keys(catGroups).sort((a,b)=> catSortIndex(a)-catSortIndex(b) || a.localeCompare(b)).forEach(cat=>{
     const catBlock = el('div',{class:'cat-block'});
     catBlock.appendChild(el('div',{class:'cat-header'},[el('span',{},[cat]), el('span',{class:'col-label'},['# Recipes'])]));
     const aisles = catGroups[cat];
-    Object.keys(aisles).sort((a,b)=> compareAisles(printAisleOrder, a, b)).forEach(aisle=>{
+    Object.keys(aisles).sort().forEach(aisle=>{
       const aisleBlock = el('div',{class:'aisle-block'});
       aisleBlock.appendChild(el('div',{class:'aisle-header'},[aisle]));
       aisles[aisle].sort((a,b)=>a.ingredientName.localeCompare(b.ingredientName)).forEach(line=>{
@@ -4758,7 +4604,6 @@ function renderSettingsTab(){
     ['staples',      'Staples list', 'Regular items (milk, bread…) automatically added to every generated shopping list.'],
     ['pantryAtHome', 'Pantry items start as "at home"', 'Pantry-category items on a new list start in an "At home already" group with one tap to add them if you\u2019re out. Wait List items and staples always stay on the buy list.'],
     ['recipeFinder', 'Recipe finder', 'Search recipes by category and the ingredients they contain (below on this tab).'],
-    ['learnedAisleOrder', 'Order aisles the way you walk the shop', 'Works out the route from the order things were ticked off on previous shops, and lists the aisles that way instead of alphabetically. Needs a few finished shops before it does anything — see below.'],
   ].forEach(([key, label, desc])=>{
     const cb = el('input',{type:'checkbox'});
     cb.checked = featureOn(key);
@@ -4911,51 +4756,6 @@ function renderSettingsTab(){
   });
 
   container.appendChild(prefCard);
-
-  /* -------- The route through the shop (v22.0) --------
-     Shown whenever there is any history at all, feature on or off. Seeing what it WOULD
-     do is how somebody decides whether to switch it on; "trust me, it has learnt
-     something" is not a reasonable thing to ask of a shopping list. */
-  {
-    const routeTrips = learnedRouteTrips();
-    const route = aisleOrderFromHistory(routeTrips);
-    const placed = Object.keys(route).sort((a,b)=> route[a] - route[b]);
-    if(routeTrips.length || featureOn('learnedAisleOrder')){
-      container.appendChild(el('h3',{},['The route through your shop']));
-      const routeCard = el('div',{class:'card'});
-      routeCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
-        'Worked out from the order things were ticked off on your last ' + AISLE_ORDER_TRIPS
-        + ' finished shops. There is nothing to fill in — it is read back out of the ticks. '
-        + 'The list is still grouped by the main sections first (fruit and vegetables, meat, '
-        + 'cold, pantry, toiletries); this order applies to the aisles inside each of those.'
-      ]));
-      if(!placed.length){
-        routeCard.appendChild(el('p',{},[
-          routeTrips.length
-            ? 'Not enough to go on yet — an aisle has to turn up on ' + AISLE_ORDER_MIN_SIGHTINGS
-              + ' shops before it gets a place. ' + routeTrips.length + ' finished shop(s) recorded so far.'
-            : 'No finished shops recorded yet. Tap "Shopping is done" at the end of a shop and this fills itself in.'
-        ]));
-      } else {
-        routeCard.appendChild(el('p',{style:'margin-bottom:4px;'},[
-          placed.length + ' aisle(s) placed, from ' + routeTrips.length + ' finished shop(s)'
-          + (featureOn('learnedAisleOrder') ? '' : ' — switch the feature on above to start using it') + ':'
-        ]));
-        const ol = el('ol',{style:'margin:0;padding-left:20px;'});
-        placed.forEach(n=> ol.appendChild(el('li',{},[n])));
-        routeCard.appendChild(ol);
-        const resetBtn = el('button',{class:'btn secondary', style:'margin-top:10px;'},['The shop was rearranged — start again']);
-        resetBtn.addEventListener('click', ()=>{
-          if(!confirm('Forget the route learnt so far?\n\nShops from here on will be used to work it out again. Nothing in your shopping history is deleted — the route simply stops reading the shops before today.')) return;
-          recipesData.settings.aisleOrderSince = new Date().toISOString();
-          persist('recipes');
-          render();
-        });
-        routeCard.appendChild(resetBtn);
-      }
-      container.appendChild(routeCard);
-    }
-  }
 
   /* -------- Things you always have in (v22.0) -------- */
   {
