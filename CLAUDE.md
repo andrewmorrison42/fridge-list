@@ -9,8 +9,8 @@ noticed mid-shop. They are worth reading before changing sync, rendering or stor
 ## Commands
 
 ```
-npm test                # 254 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 161 browser assertions — needs playwright-core + Chromium
+npm test                # 253 logic assertions — no dependencies, no browser, ~1s
+npm run test:browser    # 164 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -50,6 +50,42 @@ Consequences:
 ## Invariants
 
 Each of these has a bug behind it.
+
+**One rule for every collection a person authors.** Union by id; each field resolved by
+its own stamp; an item on only one side is KEPT unless the other side demonstrably saw it
+and no longer has it. `mergeAuthored` is that rule, and `weekPlan.selections` and
+`neededList` both go through it. Before v23.0 there were seven different answers — lines
+unioned, picks taken wholesale from the newer file, Wait List membership from the newer
+file — and two of the three silently threw away things people had added. Nobody could
+predict which applied to what they had just tapped. If you add a collection, it goes
+through this function or it is derived; there is no third option. *(v23.0)*
+
+**"Demonstrably saw it" is `seenRemoteAt`, and it has to be in the file.** It records how
+far into the shared folder's history this device had read when it wrote its copy, and it
+is the only thing that separates "you added that while I was away" from "I deleted it
+while you were away". It lived in memory until v23.0 and was lost on every reload, which
+is why every release from v21.8 on had to invent another tiebreaker — `generatedAt`, then
+`basedOn`, then `supersedes`, then a live-trip bias — to guess around a fact the app was
+throwing away. A device with no horizon can delete nothing: it cannot prove it ever saw
+what it is removing. *(v23.0)*
+
+**Items from before v23.0 are bounded by their file's `lastUpdated`.** They carry no
+`addedAt`, and with no creation time at all they could never be shown to have been seen,
+so they would be immortal and clearing the week would quietly stop working against any
+phone on an older build. A file written at T proves everything in it existed by T at the
+latest — `effectiveAddedAt` — which is the bound needed and never invents a time earlier
+than the truth. *(v23.0)*
+
+**Shopping list lines are DERIVED, and that is why they do not go through `mergeAuthored`.**
+They are regenerated from the picks, the staples and the Wait List; the authored part of a
+line is its flags, which `mergeShoppingLine` already resolves per flag by its own stamp.
+That is the same rule specialised, not an exception to it — and it is the one part of the
+merge nobody has ever lost work to. *(v23.0)*
+
+**`chooseTripWinner` governs `shoppingList` and nothing else.** It used to drag the week's
+picks along with whichever list won, which is how a superseding clear could delete recipes
+added on a phone that had not caught up. Which generation of the LIST won says nothing
+about whose recipes are right. *(v23.0)*
 
 **Never call `render()` from a background path.** Use `repaintWhenSafe()`, which
 refuses while a field is focused, a modal is open, or a print is being captured, and
@@ -179,7 +215,9 @@ the next poll. *(v21.8)*
 
 ## The sync model
 
-Shopping data merges per item; recipes do not.
+Shopping data merges per item; recipes do not. Since v23.0 there is one rule for the
+collections a person authors — see the invariant above — and the notes below are the
+details that rule is built on.
 
 - **Trip id** (`weekPlan.tripId`) distinguishes "the same list edited by two people"
   from "a genuinely newer list". Same trip → union of both line sets. Different trip →
@@ -205,7 +243,14 @@ Shopping data merges per item; recipes do not.
   keyed off the Wait List `done` flags, which ticking sets — so shopping invalidated
   the list it was shopping from and wiped every tick.
 - **Recipes are last-save-wins** with an `If-Match` ETag guard: on a genuine conflict
-  the write is refused and reported rather than clobbering.
+  the write is refused and reported rather than clobbering. **This is the one collection
+  the single rule does not cover** — recipes are large documents rather than small stamped
+  items, and folding them in would double the diff in the most delicate function in the
+  app. The boundary is deliberate; do not assume the model is uniform.
+- **A merge that changes anything says so.** `describeMerge` and `mergeReport` are pure and
+  produce the line a phone shows when it catches up. The point of one rule is that the
+  outcome is predictable; the point of the sentence is that nobody has to take that on
+  trust.
 - **Trips are write-once**, so `trip-history.json` needs no conflict rule at all — see the
   invariant above. It is capped at `TRIP_HISTORY_MAX` (52) and pruned on every merge.
 
@@ -250,32 +295,13 @@ than working around it.
 
 ## Known limitations, deliberately left
 
-- **The week's picks are last-writer-wins, with no merge at all.** `mergeShoppingData`
-  takes the winning side's `selections` array wholesale and reads the other side only to
-  resolve `cooked` flags, so two people picking recipes at the same time loses one side's
-  choices. Worse, `primary` is decided by `lastUpdated`, which `saveShoppingLocal` bumps on
-  *every* shopping save — so ticking a Wait List item on one phone can discard recipes just
-  picked on another.
-
-  The fix is the one already sketched for the Wait List below: give each selection an
-  `addedAt`, union by `recipeId` on a same-trip merge, and use that stamp against the other
-  file's `lastUpdated` to tell "not seen yet" from "deliberately removed". Additive, no shape
-  hazard. Not done yet because it lands in the most delicate function in the app and wants
-  its own release rather than riding along with a banner.
-
-- **Wait List membership is last-writer-wins.** An addition that has not yet reached
-  OneDrive can be lost if someone else's addition lands first — the merge takes the
-  newer file's list wholesale and drops entries only present in the older one.
-
-  Considered and **declined**: tombstones. They change the file shape (breaking older
-  devices), need a purge window that resurrects entries when a device is offline longer
-  than it, and add code to the most delicate function in the app. If it ever becomes a
-  nuisance, the cheap fix is to union the lists and use each entry's existing `addedAt`
-  against the other file's `lastUpdated` to tell "not seen yet" from "deliberately
-  deleted" — no new fields, no growth, no version hazard.
-
-  Judged low value: the Wait List is filled in during the week, usually one person at a
-  time, and the cost of the bug is a forgotten bottle of shampoo.
+- **A mixed fleet is the transition cost of v23.0, and it is bounded.** A phone on v22.2
+  or earlier writes picks with no `addedAt` and a file with no `seenRemoteAt`. Both are
+  handled — such items are bounded by the file's `lastUpdated`, and a device with no
+  horizon simply cannot delete anything — so the failure mode is that an old phone's
+  deletions do not propagate until it updates. It keeps rather than loses, which is the
+  side to err on. This replaces the two entries that used to sit here, which recorded that
+  the picks and the Wait List were last-writer-wins; they no longer are.
 
 - **A mixed fleet pollutes `lastCooked` for as long as it lasts.** A phone still on v21.9
   goes on stamping `lastCooked` when it generates a list, so on a household running both

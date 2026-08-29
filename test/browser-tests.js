@@ -1002,88 +1002,16 @@ async function suiteTripHistory(browser) {
     ok('and the record is lean — no bulk carried into the archive',
        trip.lines.every(l => l.sources === undefined && l.textQtyParts === undefined));
 
-    /* Now the payoff: that week can be picked again without touching the library. */
+    /* The archive is written but nothing replays it — the Start tab must NOT offer to
+       put a past week back. Removed in v23.0; the record is kept for the cook rate and
+       the at-home suggestions, and for looking a past week up. */
     await page.click('#mainNav button[data-tab="start"]');
     await page.waitForSelector('#app input[type=checkbox]', { timeout: 15000 });
-    ok('the Start tab offers the week back',
-       await page.evaluate(() => /Weeks you have shopped before/i.test(document.getElementById('app').innerText)));
-
-    // Clear the picks first, so "use these again" has something to actually restore.
-    await page.click('#app >> text="Clear all selections"');
-    await page.waitForTimeout(500);
-    ok('picks cleared', (await readShopping(page)).weekPlan.selections.length === 0);
-
-    await page.click('#app >> text="Use these again"');
-    await page.waitForTimeout(600);
-    const restored = (await readShopping(page)).weekPlan.selections.map(s => s.recipeId);
-    ok('one tap puts the whole week back',
-       restored.length === picked.length && picked.every(id => restored.includes(id)),
-       { picked, restored });
-    ok('no console errors', errs.length === 0, errs);
-  } finally { await ctx.close(); await srv.close(); }
-}
-
-async function suiteLearnedAisleOrder(browser) {
-  group('the list is ordered by the route actually walked');
-  const srv = await serve(8182);
-  const ctx = await browser.newContext();
-  const page = await ctx.newPage();
-  const errs = []; watchErrors(page, errs);
-  page.on('dialog', d => d.accept());
-  try {
-    await page.goto('http://localhost:8182/', { waitUntil: 'domcontentloaded' });
-    await waitForApp(page);
-    await buildAList(page);
-
-    // The aisles this particular list actually has, in the order the app shows them now.
-    const alphabetical = await page.evaluate(() =>
-      [...document.querySelectorAll('.aisle-group h4')].map(h => h.textContent));
-    ok('the list has enough aisles to reorder', alphabetical.length >= 2, alphabetical);
-
-    /* Seed a history in which those aisles were walked in the REVERSE of the order the
-       app is using — six shops, so every aisle clears the three-sightings bar. */
-    const reversed = alphabetical.slice().reverse();
-    await page.evaluate((aisles) => {
-      const trips = [];
-      for (let t = 0; t < 6; t++) {
-        trips.push({
-          tripId: 'seed-' + t,
-          doneAt: new Date(Date.now() - (10 - t) * 86400000).toISOString(),
-          selections: [],
-          lines: aisles.map((a, i) => ({
-            name: a + ' item', aisle: a, checked: true,
-            checkedAt: new Date(Date.now() - (10 - t) * 86400000 + i * 60000).toISOString()
-          }))
-        });
-      }
-      localStorage.setItem('fma_trips_v1', JSON.stringify({ version: 1, trips: trips }));
-    }, reversed);
-
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await waitForApp(page);
-    await page.click('#mainNav button[data-tab="review"]');
-    await page.waitForTimeout(600);
-    const stillAlphabetical = await page.evaluate(() =>
-      [...document.querySelectorAll('.aisle-group h4')].map(h => h.textContent));
-    ok('a history alone changes nothing — the feature ships off',
-       stillAlphabetical.join('|') === alphabetical.join('|'), stillAlphabetical);
-
-    // Switch it on the way a person would: the Settings switchboard.
-    await page.click('#mainNav button[data-tab="settings"]');
-    await page.waitForTimeout(400);
-    ok('Settings shows the route it has worked out, so it can be read before it is used',
-       await page.evaluate(() => /route through your shop/i.test(document.getElementById('app').innerText)));
-    await page.click('#app label:has-text("Order aisles the way you walk the shop") input[type=checkbox]');
-    await page.waitForTimeout(500);
-
-    await page.click('#mainNav button[data-tab="review"]');
-    await page.waitForTimeout(600);
-    const learnt = await page.evaluate(() =>
-      [...document.querySelectorAll('.aisle-group h4')].map(h => h.textContent));
-    ok('now the aisles follow the walked route, not the alphabet',
-       learnt.join('|') !== alphabetical.join('|'), { alphabetical, learnt });
-    ok('and it is the same set of aisles, only reordered',
-       learnt.slice().sort().join('|') === alphabetical.slice().sort().join('|'), learnt);
+    ok('the Start tab does not offer to replay a past week',
+       await page.evaluate(() => !/Weeks you have shopped before/i.test(document.getElementById('app').innerText)));
+    ok('and offers no way to reinstate one',
+       await page.evaluate(() => ![...document.querySelectorAll('#app button')]
+         .some(b => /use these again/i.test(b.textContent))));
     ok('no console errors', errs.length === 0, errs);
   } finally { await ctx.close(); await srv.close(); }
 }
@@ -1095,7 +1023,8 @@ async function suiteClearSurvivesSync(browser) {
      chooseTripWinner could rule for. Any phone still holding the old week won outright
      and the recipes came back on the next poll. */
   const file = instrument('clear-hook.html',
-    'window.__t = { apply: applyMergedShopping, merge: mergeShoppingData, sd: () => shoppingData };');
+    'window.__t = { apply: applyMergedShopping, merge: mergeShoppingData, sd: () => shoppingData,'
+    + ' remote: mergeRemoteShopping };');
   const srv = await serve(8184, file);
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
@@ -1116,7 +1045,29 @@ async function suiteClearSurvivesSync(browser) {
       const remote = JSON.parse(JSON.stringify(sd));
       const now = new Date().toISOString();
       remote.shoppingList.slice(0, 2).forEach(l => { l.checked = true; l.checkedAt = now; });
+      /* Backdate the held picks by two hours. MERGE_GRACE_MS is 90 seconds and this whole
+         suite runs in about three, so nothing picked during the test can ever be shown to
+         have been SEEN by the other side — every deletion would fall inside the grace
+         window and be kept. That grace exists for real clock skew and the write debounce,
+         and shrinking it for the test would be testing different code. The backdating is
+         what the fixture actually represents anyway: another phone still holding a week
+         that was picked hours ago. */
+      const hoursAgo = new Date(Date.now() - 2*60*60*1000).toISOString();
+      remote.weekPlan.selections.forEach(x => { x.addedAt = hoursAgo; x.changedAt = hoursAgo; });
       window.__held = remote;
+      /* v23.0: this phone has to have actually READ the shared copy before it can delete
+         anybody's work — a device with no knowledge horizon cannot prove it ever saw what
+         it is removing, and is not allowed to. So take one real read first, of the week as
+         it stands with nothing ticked. mergeRemoteShopping is the single entry point that
+         advances the horizon; going through merge+apply directly would bypass it, which is
+         the whole reason that entry point exists.
+         The read is of the UNTICKED copy on purpose: feeding in the ticked one would put
+         this phone into a live shop and v21.9 would rightly disable the very button under
+         test. The ticked copy arrives afterwards, which is the real sequence — you clear a
+         week you have seen, and the other phone's shopping copy turns up late. */
+      const seenCopy = JSON.parse(JSON.stringify(sd));
+      seenCopy.weekPlan.selections.forEach(x => { x.addedAt = hoursAgo; x.changedAt = hoursAgo; });
+      window.__t.remote(seenCopy);
       return { trip: sd.weekPlan.tripId, picks: sd.weekPlan.selections.length,
                lines: sd.shoppingList.length,
                remoteTicks: remote.shoppingList.filter(l => l.checked).length };
@@ -1124,6 +1075,8 @@ async function suiteClearSurvivesSync(browser) {
     ok('the other phone is mid-shop, which normally wins outright',
        held.remoteTicks === 2, held);
     ok('there is a week to clear', held.picks === 2 && held.lines > 0 && !!held.trip, held);
+    ok('and this phone has actually read the shared copy, so it has a horizon',
+       !!(await readShopping(page)).seenRemoteAt, (await readShopping(page)).seenRemoteAt);
 
     await page.click('#mainNav button[data-tab="start"]');
     await page.waitForSelector('#app input[type=checkbox]', { timeout: 15000 });
@@ -1236,6 +1189,91 @@ async function suiteUnsyncedPhoneSaysSo(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+async function suiteTwoPhonesBothKeepTheirWork(browser) {
+  group('two phones, each adding something, and neither loses it');
+  /* The report that started v23.0: two people picked recipes and one lot never arrived.
+     Against v22.2 this scenario loses a pick AND a Wait List entry — the merge took the
+     newer file's arrays wholesale. The point of one rule is that a recipe, a Wait List
+     item and a tick all now answer the same way, so this asserts all three together. */
+  const file = instrument('twophone-hook.html',
+    'window.__t = { remote: mergeRemoteShopping, sd: () => shoppingData };');
+  const srv = await serve(8186, file);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  page.on('dialog', d => d.accept());
+  try {
+    await page.goto('http://localhost:8186/', { waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+    await buildAList(page);
+
+    // This phone ticks something off, then adds a Wait List item of its own.
+    const rows = await page.$$('.shop-row');
+    await rows[0].$eval('input[type=checkbox]', c => c.click());
+    await page.waitForTimeout(200);
+    await page.click('#mainNav button[data-tab="needed"]');
+    await page.waitForTimeout(300);
+    await page.fill('#app input[type=text]', 'shampoo');
+    await page.click('#app >> text="Add to wait list"');
+    await page.waitForTimeout(400);
+
+    const mine = await readShopping(page);
+    ok('this phone has a pick, a tick and a Wait List item',
+       mine.weekPlan.selections.length === 2
+       && mine.shoppingList.filter(l => l.checked).length === 1
+       && mine.neededList.some(n => /shampoo/i.test(n.text)), {
+         picks: mine.weekPlan.selections.length,
+         ticks: mine.shoppingList.filter(l => l.checked).length,
+         wait: mine.neededList.map(n => n.text) });
+
+    /* The other phone's copy: same trip, but it picked a DIFFERENT recipe, added a
+       DIFFERENT Wait List item, and ticked a DIFFERENT line. Nothing here overlaps, so
+       under one rule every single thing should survive. */
+    const outcome = await page.evaluate(() => {
+      const sd = JSON.parse(localStorage.getItem('fma_shopping_v4'));
+      const other = JSON.parse(JSON.stringify(sd));
+      const now = new Date().toISOString();
+      other.lastUpdated = new Date(Date.now() + 60000).toISOString();
+      other.seenRemoteAt = sd.lastUpdated;
+
+      // their pick, which this phone has never seen
+      other.weekPlan.selections.push({ recipeId: 'their-only-recipe', servings: 4,
+                                       addedAt: now, changedAt: now });
+      // their Wait List entry
+      other.neededList.push({ id: 'n-theirs', text: 'birthday candles', addedAt: now, done: false });
+      // their tick, on a line this phone left alone
+      const spare = other.shoppingList.find(l => !l.checked && !l.removed && !l.atHome);
+      if (spare) { spare.checked = true; spare.checkedAt = now; }
+      const theirTicked = spare ? spare.ingredientName : null;
+
+      window.__t.remote(other);
+      const after = window.__t.sd();
+      return {
+        picks: after.weekPlan.selections.map(s => s.recipeId),
+        wait: after.neededList.map(n => n.text),
+        ticks: after.shoppingList.filter(l => l.checked).length,
+        theirTicked: theirTicked,
+        status: document.getElementById('statusBar').textContent
+      };
+    });
+
+    ok('their recipe arrives', outcome.picks.includes('their-only-recipe'), outcome.picks);
+    ok('and this phone keeps its own picks', outcome.picks.length === 3, outcome.picks);
+    ok('their Wait List item arrives',
+       outcome.wait.some(t => /birthday candles/i.test(t)), outcome.wait);
+    ok('and this phone keeps its own', outcome.wait.some(t => /shampoo/i.test(t)), outcome.wait);
+    ok('both ticks are kept', outcome.ticks === 2, outcome);
+
+    // The visible half: the phone says what turned up, rather than rearranging in silence.
+    ok('and it reports what changed',
+       /Caught up with the family list/i.test(outcome.status), outcome.status);
+    ok('naming the recipe and the Wait List item',
+       /recipe added to the week/i.test(outcome.status)
+       && /Wait List item added/i.test(outcome.status), outcome.status);
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 (async () => {
   console.log('Chromium: ' + EXECUTABLE);
   const browser = await chromium.launch({ executablePath: EXECUTABLE, args: ['--no-sandbox'] });
@@ -1245,7 +1283,8 @@ async function suiteUnsyncedPhoneSaysSo(browser) {
     for (const suite of [suiteTicksSurviveRebuild, suiteRemoteMergeKeepsTicks,
                          suiteWriteSplitting, suiteStapleQuantities, suiteTypingIsNotInterrupted,
                          suiteBulkDelete, suiteShareOneRecipe, suiteLiveListNotWiped,
-                         suiteTripHistory, suiteLearnedAisleOrder, suiteClearSurvivesSync,
+                         suiteTripHistory, suiteClearSurvivesSync,
+                         suiteTwoPhonesBothKeepTheirWork,
                          suiteUnsyncedPhoneSaysSo,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }

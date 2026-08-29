@@ -91,6 +91,15 @@ version history**, which covers every change the app has ever saved — not only
 deletions. See
 [Getting things back when something goes wrong](docs/SETUP-use-the-app.md#getting-things-back-when-something-goes-wrong).
 
+## What happens when a phone has been out of contact?
+
+Everything it added arrives when it reconnects, everything it deleted stays deleted, and
+where two people changed the same thing the later change wins. That is the same answer
+whether you picked a recipe, added something to the Wait List, or ticked an item off — from
+**v23.0** there is one rule rather than a different one per screen. When a phone does catch
+up it says what changed, e.g. *"Caught up with the family list — 2 recipes added to the
+week, 1 Wait List item added."*
+
 ## Why can't the others see what I added?
 
 Almost always because that phone is not connected to the shared folder. From **v22.2** it
@@ -155,11 +164,11 @@ are best kept surgical rather than reformatting.
 
 ### Known limitations
 
-- **Wait List membership is last-writer-wins.** If an addition has not yet reached
-  OneDrive and someone else adds something in the meantime, the unsynced one can be
-  lost. Rare in practice — the Wait List is filled in during the week, usually by one
-  person at a time — and deliberately left alone; see `CLAUDE.md` for the reasoning and
-  the cheaper fix if it ever becomes a nuisance.
+- **A phone still on an older build cannot have its deletions honoured** until it
+  updates. From v23.0 the app can tell "you added that while I was away" from "I deleted
+  it while you were away", but only for devices that record what they have read. An older
+  phone's additions still arrive; only its removals wait. It keeps rather than loses,
+  which is the side to err on.
 - **Recipes are last-save-wins**, with no per-item merge. Concurrent edits to *different*
   recipes on two devices can lose one side. An ETag guard stops a stale copy silently
   overwriting a newer one, and reports the clash instead.

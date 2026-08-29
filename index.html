@@ -340,7 +340,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v22.2';
+const APP_VERSION = 'v23.0';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -448,7 +448,8 @@ function loadSeed(){
 }
 
 function defaultShoppingData(){
-  return { weekPlan: { selections: [], generatedAt: null, tripId: null }, shoppingList: [], neededList: [], lastUpdated: null, updatedBy: '' };
+  return { weekPlan: { selections: [], generatedAt: null, tripId: null }, shoppingList: [], neededList: [],
+           lastUpdated: null, updatedBy: '', seenRemoteAt: null };
 }
 
 // Refreshes the ingredient master's category/aisle/unit data from the bundled seed
@@ -461,7 +462,7 @@ function defaultSettings(){
            // UI is entirely absent until switched on (Settings -> Features). Synced with
            // the family's data so all devices behave the same. recipeFinder defaults ON
            // because it was already in live use before the switchboard existed.
-           features: { staples: false, pantryAtHome: false, recipeFinder: true, learnedAisleOrder: false },
+           features: { staples: false, pantryAtHome: false, recipeFinder: true },
            staples: [],
            /* How much of each staple to buy, keyed by the staple's canonical name:
               { "Milk": 2000, "Eggs (whole)": 12 }. Deliberately held OUTSIDE the staples
@@ -670,6 +671,8 @@ function init(){
   recipesData = migrateIngredientsIfStale(recipesData, seedRecipes);
   imagesData = seedImages || {};
   shoppingData = lsS ? JSON.parse(lsS) : defaultShoppingData();
+  // Pick the horizon back up from the saved copy — this is the point of persisting it.
+  shoppingSeenRemoteAt = shoppingData.seenRemoteAt || null;
   saveRecipesLocal();
   if(!lsS){ saveShoppingLocal(); }
   loadUiState(); // restore the tab/toggles before the first render
@@ -708,6 +711,14 @@ function saveRecipesLocal(){
 }
 function saveShoppingLocal(){
   shoppingData.lastUpdated = new Date().toISOString();
+  /* v23.0: the knowledge horizon travels WITH the copy. This is how far into the shared
+     folder's history this device had read when it wrote this file, and it is the only
+     thing that lets a merge tell "you added that while I was away" from "I deleted it
+     while you were away". It lived in memory until now and was lost on every reload,
+     which is why every release since v21.8 had to invent another tiebreaker to guess
+     around it. Additive: an older build ignores the field and is read as having seen
+     nothing, which keeps its items rather than dropping them. */
+  shoppingData.seenRemoteAt = shoppingSeenRemoteAt || shoppingData.seenRemoteAt || null;
   try{ localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData)); }
   catch(e){ storageBlockedReason = 'Could not save locally (' + ((e && e.message) || e) + ').'; setStatus(storageBlockedReason, 'warn'); }
 }
@@ -1553,6 +1564,120 @@ function mergeShoppingLine(x, y){
    line the other shopper had added (a manual extra, say) was silently dropped if your
    save happened to land second. Across different trips the newer trip wins outright —
    its list is the real one, and last trip's ticks must not leak into it. */
+/* ================= the one rule for authored collections =================
+
+   v23.0. Nine releases had attacked sync, each adding a rule rather than changing the
+   model, and the app ended up with a different answer for every kind of edit: shopping
+   lines were unioned, the week's picks were taken wholesale from whichever file was
+   newer, and the Wait List followed the newer file's membership. Two of those three
+   silently threw away things people had added, and nobody could predict which applied to
+   what they had just tapped.
+
+   The rule now, once, for every collection a person AUTHORS:
+
+     union by id; each field resolved by its own stamp; an item on only one side is KEPT
+     unless the other side demonstrably saw it and no longer has it.
+
+   "Demonstrably saw it" is the part that was impossible before seenRemoteAt was
+   persisted. An item added at T is one the other device can only have deleted if that
+   device had read the shared copy past T. Without that fact, "you added it while I was
+   away" and "I deleted it while you were away" are the same picture, which is what every
+   previous tiebreaker was guessing at.
+
+   Shopping list LINES deliberately do not come through here. They are derived — regenerated
+   from the picks, the staples and the Wait List — and the authored part of a line is its
+   flags, which mergeShoppingLine already resolves by per-flag stamp. That is the one piece
+   of the merge nobody has ever lost work to, and it is the same rule specialised, not an
+   exception to it. */
+
+const MERGE_GRACE_MS = 90*1000;   // covers the 600ms write debounce and modest clock skew
+
+/* Pure. Did `theirHorizon` prove that side had read past this item's creation? Only then
+   can its absence be read as a deletion. No horizon, or a horizon inside the grace window,
+   is treated as "not seen yet", so the item survives. Erring toward keeping is deliberate:
+   a Wait List entry that comes back is a nuisance, one that vanishes means nobody buys the
+   shampoo.
+
+   `fileAt` is the lastUpdated of the file the item came in, and it is what makes items
+   written by builds older than v23.0 tractable. They carry no addedAt, and with no
+   creation time at all they could never be shown to have been seen — so they would be
+   immortal, and clearing the week would silently stop working against any phone still on
+   an older build. A file written at T proves everything in it existed by T at the latest,
+   which is exactly the bound needed and never invents a time earlier than the truth. */
+function effectiveAddedAt(item, fileAt){
+  return tsOf(item && item.addedAt) || tsOf(fileAt);
+}
+
+function otherSideDropped(item, fileAt, theirHorizon, graceMs){
+  const added = effectiveAddedAt(item, fileAt);
+  const seen = tsOf(theirHorizon);
+  if(!added || !seen) return false;
+  return added < (seen - (graceMs === undefined ? MERGE_GRACE_MS : graceMs));
+}
+
+/* Pure. Resolve one item that both sides hold, field by field, each on its own stamp. */
+function resolveAuthoredItem(x, y, fields){
+  // Deterministic base: the side that was edited more recently supplies any key the field
+  // rules do not name, so merge(a,b) and merge(b,a) agree.
+  const stampOf = it => fields.reduce((best,f)=> Math.max(best, tsOf(it[f.stamp])), 0);
+  const primary = stampOf(y) > stampOf(x) ? y : x;
+  const other   = primary === x ? y : x;
+  const m = Object.assign({}, other, primary);
+
+  fields.forEach(f=>{
+    const xs = tsOf(x[f.stamp]), ys = tsOf(y[f.stamp]);
+    if(ys > xs){ m[f.name] = y[f.name]; m[f.stamp] = y[f.stamp]; }
+    else if(xs > ys){ m[f.name] = x[f.name]; m[f.stamp] = x[f.stamp]; }
+    else if(f.whenUnstamped) m[f.name] = f.whenUnstamped(x[f.name], y[f.name]);
+  });
+
+  // Creation is the earlier of the two: an item exists from when it was first made.
+  const ax = tsOf(x.addedAt), ay = tsOf(y.addedAt);
+  if(ax && ay) m.addedAt = ax <= ay ? x.addedAt : y.addedAt;
+  else m.addedAt = x.addedAt || y.addedAt || m.addedAt;
+  return m;
+}
+
+function mergeAuthored(mine, theirs, opts){
+  const o = opts || {};
+  const idOf = o.id || (x=> x && x.id);
+  const fields = o.fields || [];
+  const byId = list => { const m = {}; (list||[]).forEach(x=>{ const k = idOf(x); if(k != null) m[k] = x; }); return m; };
+  const A = byId(mine), B = byId(theirs);
+
+  const out = [];
+  const seen = {};
+  (mine||[]).concat(theirs||[]).forEach(item=>{
+    const k = idOf(item);
+    if(k == null || seen[k]) return;
+    seen[k] = true;
+    const x = A[k], y = B[k];
+    if(x && y) out.push(resolveAuthoredItem(x, y, fields));
+    else if(x){ if(!otherSideDropped(x, o.myFileAt,    o.theirHorizon, o.graceMs)) out.push(Object.assign({}, x)); }
+    else       { if(!otherSideDropped(y, o.theirFileAt, o.myHorizon,    o.graceMs)) out.push(Object.assign({}, y)); }
+  });
+
+  // Stable, order-independent: oldest first, ties broken by id.
+  return out.sort((p,q)=> (tsOf(p.addedAt) - tsOf(q.addedAt))
+                       || String(idOf(p)).localeCompare(String(idOf(q))));
+}
+
+// Both authored collections travel in the same file, so they share its horizons.
+function authoredHorizons(a, b){
+  return { myHorizon: a && a.seenRemoteAt, theirHorizon: b && b.seenRemoteAt,
+           myFileAt:  a && a.lastUpdated,  theirFileAt:  b && b.lastUpdated };
+}
+
+// The two authored collections, described once so the call sites cannot drift apart.
+const SELECTION_FIELDS = [
+  { name:'cooked',   stamp:'cookedChangedAt', whenUnstamped:(a,b)=> !!(a || b) },
+  { name:'servings', stamp:'changedAt' }
+];
+const WAITLIST_FIELDS = [
+  { name:'done', stamp:'changedAt', whenUnstamped:(a,b)=> !!(a || b) },
+  { name:'text', stamp:'changedAt' }
+];
+
 function mergeShoppingData(a, b){
   if(!a) return b;
   if(!b) return a;
@@ -1568,18 +1693,12 @@ function mergeShoppingData(a, b){
   const out = Object.assign({}, secondary, primary);
   out.weekPlan = Object.assign({}, secondary.weekPlan, primary.weekPlan);
 
-  /* Which side the week's recipe picks are read from. In a same-trip merge that's
-     simply the newer file; across trips it has to be the winning trip, or the merged
-     selections would describe a different week from the merged line set. */
-  let selSource = primary, selOther = secondary;
-
   if(!sameTrip){
     // Different trips: one of them is authoritative, wholesale. Which one is no
     // longer a matter of whose clock ran fastest — see chooseTripWinner.
     const winner = chooseTripWinner(a, b, aGen, bGen, primary);
     out.shoppingList = (winner.shoppingList || []).map(l=> Object.assign({}, l));
     out.weekPlan = Object.assign({}, winner.weekPlan);
-    selSource = winner; selOther = (winner === a ? b : a);
   } else {
     const byKey = new Map();
     const order = [];
@@ -1604,32 +1723,19 @@ function mergeShoppingData(a, b){
     out.weekPlan.tripId = aTrip;
   }
 
-  // menu-tab cooked flags: merge per selection by recipeId, same latest-wins rule
-  const secSel = {};
-  ((selOther.weekPlan && selOther.weekPlan.selections) || []).forEach(s => { secSel[s.recipeId] = s; });
-  out.weekPlan.selections = ((selSource.weekPlan && selSource.weekPlan.selections) || []).map(s=>{
-    const o = secSel[s.recipeId];
-    if(!o) return Object.assign({}, s);
-    const st = tsOf(s.cookedChangedAt), ot = tsOf(o.cookedChangedAt);
-    const m = Object.assign({}, s);
-    if(ot > st){ m.cooked = o.cooked; m.cookedChangedAt = o.cookedChangedAt; }
-    else if(st === 0 && ot === 0){ m.cooked = s.cooked || o.cooked; }
-    return m;
-  });
+  /* The week's picks and the Wait List go through the same rule, and deliberately do NOT
+     follow the trip winner. Which shopping LIST won says nothing about whose recipes are
+     right: coupling them is how a superseding clear could delete picks made on a phone
+     that had not caught up. chooseTripWinner governs shoppingList, which is what it was
+     always for. */
+  const horizons = authoredHorizons(a, b);
+  out.weekPlan.selections = mergeAuthored(
+    (a.weekPlan && a.weekPlan.selections) || [],
+    (b.weekPlan && b.weekPlan.selections) || [],
+    Object.assign({ id: s=> s && s.recipeId, fields: SELECTION_FIELDS }, horizons));
 
-  // Wait List: membership follows the newer file (a deletion there is deliberate and
-  // has no tombstone to merge against), but each entry's done flag resolves by stamp.
-  const secNeeded = {};
-  (secondary.neededList || []).forEach(n => { secNeeded[n.id] = n; });
-  out.neededList = (primary.neededList || []).map(n=>{
-    const o = secNeeded[n.id];
-    if(!o) return Object.assign({}, n);
-    const nt = tsOf(n.changedAt), ot = tsOf(o.changedAt);
-    const m = Object.assign({}, n);
-    if(ot > nt){ m.done = o.done; m.changedAt = o.changedAt; }
-    else if(nt === 0 && ot === 0){ m.done = n.done || o.done; }
-    return m;
-  });
+  out.neededList = mergeAuthored(a.neededList || [], b.neededList || [],
+    Object.assign({ id: n=> n && n.id, fields: WAITLIST_FIELDS }, horizons));
 
   return out;
 }
@@ -1682,11 +1788,55 @@ document.addEventListener('focusout', ()=> setTimeout(flushDeferredRepaint, 0));
 
 /* Every remote copy of the shopping file comes in through here, so that "how caught-up
    is this device" is recorded in exactly one place rather than at each merge site. */
+/* ---- v23.0: say what a sync actually did ----
+
+   The point of one merge rule is that the outcome is predictable; the point of saying it
+   out loud is that nobody has to take that on trust. A phone that has been out of contact
+   and comes back now reports what changed, rather than silently rearranging the week while
+   somebody is looking at it. Pure, so the sentences are testable without a browser. */
+function describeMerge(before, after){
+  const idsOf = (list, f) => { const s = {}; (list||[]).forEach(x=>{ const k=f(x); if(k!=null) s[k]=true; }); return s; };
+  const sel = d => (d && d.weekPlan && d.weekPlan.selections) || [];
+  const ticks = d => ((d && d.shoppingList) || []).filter(l=> l.checked && !l.removed).length;
+  const count = (from, to) => Object.keys(to).filter(k=> !from[k]).length;
+
+  const bSel = idsOf(sel(before), s=> s && s.recipeId), aSel = idsOf(sel(after), s=> s && s.recipeId);
+  const bNeed = idsOf(before && before.neededList, n=> n && n.id);
+  const aNeed = idsOf(after && after.neededList, n=> n && n.id);
+
+  const d = {
+    picksArrived: count(bSel, aSel),   picksRemoved: count(aSel, bSel),
+    waitArrived:  count(bNeed, aNeed), waitRemoved:  count(aNeed, bNeed),
+    ticksArrived: Math.max(0, ticks(after) - ticks(before))
+  };
+  d.changed = !!(d.picksArrived || d.picksRemoved || d.waitArrived || d.waitRemoved || d.ticksArrived);
+  return d;
+}
+
+// Pure. One plain sentence, or null when nothing happened worth interrupting anyone for.
+function mergeReport(d){
+  if(!d || !d.changed) return null;
+  const n = (count, one, many) => count + ' ' + (count === 1 ? one : (many || one + 's'));
+  const bits = [];
+  if(d.picksArrived) bits.push(n(d.picksArrived, 'recipe') + ' added to the week');
+  if(d.picksRemoved) bits.push(n(d.picksRemoved, 'recipe') + ' taken off the week');
+  if(d.waitArrived)  bits.push(n(d.waitArrived, 'Wait List item') + ' added');
+  if(d.waitRemoved)  bits.push(n(d.waitRemoved, 'Wait List item') + ' cleared');
+  if(d.ticksArrived) bits.push(n(d.ticksArrived, 'item') + ' ticked off');
+  return 'Caught up with the family list — ' + bits.join(', ') + '.';
+}
+
 function mergeRemoteShopping(remote){
   if(remote && remote.lastUpdated && tsOf(remote.lastUpdated) > tsOf(shoppingSeenRemoteAt)){
     shoppingSeenRemoteAt = remote.lastUpdated;
+    if(shoppingData) shoppingData.seenRemoteAt = shoppingSeenRemoteAt;
   }
-  return applyMergedShopping(mergeShoppingData(shoppingData, remote));
+  const merged = mergeShoppingData(shoppingData, remote);
+  const what = describeMerge(shoppingData, merged);
+  const applied = applyMergedShopping(merged);
+  // Only speak when the merge actually moved something, and only after it landed.
+  if(applied){ const line = mergeReport(what); if(line) setStatus(line, 'ok'); }
+  return applied;
 }
 
 /* v21.8: the list someone was shopping from, kept aside when something replaced it.
@@ -2023,35 +2173,6 @@ async function fetchTripHistory(){
     tripHistory = mergeTripHistory(tripHistory, JSON.parse(text));
     if(JSON.stringify(tripHistory) !== before){ saveTripHistoryLocal(); repaintWhenSafe(); }
   }catch(e){ console.warn('could not read the trip history', e); }
-}
-
-/* Pure. What a past trip's picks would look like if you used them again: the recipes it
-   was built from, minus any since deleted from the book, with the servings that trip
-   actually used — so "the week we cooked for eight" comes back as it was. */
-function picksFromTrip(trip, recipes){
-  const byId = {};
-  (recipes || []).forEach(r=>{ if(r && r.id) byId[r.id] = r; });
-  return (((trip && trip.selections) || []))
-    .filter(s=> s && byId[s.recipeId])
-    .map(s=>({
-      recipeId: s.recipeId,
-      servings: s.servings || byId[s.recipeId].servings || 4,
-      name: byId[s.recipeId].name
-    }));
-}
-
-// Pure. Names for a row on a phone: a few, then a count, rather than a wall of text.
-function summarisePickNames(picks, max){
-  const cap = max || 5;
-  const names = (picks || []).map(p=> p.name);
-  if(names.length <= cap) return names.join(', ');
-  return names.slice(0, cap).join(', ') + ' and ' + (names.length - cap) + ' more';
-}
-
-function tripDateLabel(iso){
-  const d = iso ? new Date(iso) : null;
-  if(!d || isNaN(d.getTime())) return 'an earlier shop';
-  return d.toLocaleDateString(undefined, { day:'numeric', month:'short' });
 }
 
 /* ---------------- manual export / import (works in every browser) ---------------- */
@@ -3453,124 +3574,6 @@ function slugify(name){
   return slug;
 }
 
-/* v22.0: the week's picks were the one part of this app that started from nothing every
-   single time — with 635 recipes, "what did we have three weeks ago?" meant scrolling the
-   library until something looked familiar. The archive can simply answer it.
-   Deliberately the last few shops rather than a favourites list: what a family actually
-   ate is a better suggestion than what somebody once starred and forgot. */
-function buildPastWeeksCard(disabled, onChanged){
-  const trips = recentTrips(0)
-    .filter(t=> picksFromTrip(t, recipesData.recipes).length)
-    .slice(-8).reverse();
-  if(!trips.length) return null;
-  const card = el('div',{class:'card'});
-  card.appendChild(el('h3',{style:'margin:0 0 4px;'},['Weeks you have shopped before']));
-  card.appendChild(el('p',{class:'muted',style:'margin:0 0 10px;'},[
-    'Put a previous week back on the list without going through the whole book again.'
-  ]));
-  trips.forEach(t=>{
-    const picks = picksFromTrip(t, recipesData.recipes);
-    const row = el('div',{class:'picked-row'});
-    row.appendChild(el('div',{class:'picked-name'},[
-      el('strong',{},[tripDateLabel(t.doneAt)]),
-      el('span',{class:'muted'},[' · ' + picks.length + ' recipe(s): ' + summarisePickNames(picks)])
-    ]));
-    const btn = el('button',{class:'btn tap secondary'},['Use these again']);
-    btn.disabled = !!disabled;
-    btn.addEventListener('click', ()=>{
-      // Belt and braces over the disabled attribute: the v21.9 freeze is the rule, and a
-      // button drawn before a shop started must not be able to outlive it.
-      if(shoppingInProgress()) return;
-      if(!confirm('Pick these ' + picks.length + ' recipe(s) again?\n\n' + summarisePickNames(picks, 20)
-                  + '\n\nThis replaces the ' + shoppingData.weekPlan.selections.length
-                  + ' recipe(s) picked at the moment. Your Wait List is not touched.')) return;
-      // Only recipeId and servings: whether that week got cooked is history, not a plan.
-      shoppingData.weekPlan.selections = picks.map(p=>({ recipeId:p.recipeId, servings:p.servings }));
-      persist('shopping');
-      if(onChanged) onChanged();
-      setStatus('Picked the ' + picks.length + ' recipe(s) from ' + tripDateLabel(t.doneAt) + '.', 'ok');
-    });
-    row.appendChild(btn);
-    card.appendChild(row);
-  });
-  return card;
-}
-
-/* ---- v22.0: the route through the shop, learnt rather than configured ----
-
-   Aisles inside a shopping category have always sorted alphabetically, which is nobody's
-   walking order. The obvious fix is to let someone drag them into the right order, and
-   then keep it up to date forever as the shop rearranges itself. But the app has been
-   recording the answer all along: checkedAt on every ticked line is the order the trolley
-   was actually filled. This reads the route back out of that, and asks nobody anything. */
-
-const AISLE_ORDER_TRIPS = 6;          // how many recent shops the route is learnt from
-const AISLE_ORDER_MIN_SIGHTINGS = 3;  // below this an aisle keeps its alphabetical place
-
-/* Pure. For each trip: take the ticked lines in checkedAt order and note where each aisle
-   was FIRST reached, as a fraction from 0 (first into the trolley) to 1 (last). Average
-   those across recent trips.
-   First-reached, not average position, because doubling back for the thing you forgot
-   should not drag an aisle to the end of the shop. And an aisle seen fewer than
-   minSightings times gets no position at all — one visit is an anecdote, and shuffling
-   somebody's list on the strength of it is worse than leaving it alphabetical. */
-function aisleOrderFromHistory(trips, opts){
-  const o = opts || {};
-  const minSightings = o.minSightings || AISLE_ORDER_MIN_SIGHTINGS;
-  const window = o.trips || AISLE_ORDER_TRIPS;
-  const all = Array.isArray(trips) ? trips : [];
-  const recent = all.slice(Math.max(0, all.length - window));
-  const totals = {}, counts = {};
-  recent.forEach(trip=>{
-    const ticked = ((trip && trip.lines) || [])
-      .filter(l=> l && l.checked && l.checkedAt && l.aisle)
-      .sort((a,b)=> tsOf(a.checkedAt) - tsOf(b.checkedAt));
-    if(ticked.length < 2) return;   // a single tick says nothing about an order
-    const firstAt = {};
-    ticked.forEach((l, i)=>{ if(firstAt[l.aisle] === undefined) firstAt[l.aisle] = i; });
-    const span = ticked.length - 1;
-    Object.keys(firstAt).forEach(aisle=>{
-      totals[aisle] = (totals[aisle] || 0) + (firstAt[aisle] / span);
-      counts[aisle] = (counts[aisle] || 0) + 1;
-    });
-  });
-  const order = {};
-  Object.keys(totals).forEach(aisle=>{
-    if(counts[aisle] >= minSightings) order[aisle] = totals[aisle] / counts[aisle];
-  });
-  return order;
-}
-
-/* Pure. Learnt position first, then the alphabetical order the app has always used. An
-   aisle with no learnt position sorts after the ones that have one: it is somewhere we
-   have not reliably been, and the end of its category is a more honest place for it than
-   a guessed spot in the middle. With an empty order this is exactly localeCompare, which
-   is why every call site can use it unconditionally. */
-function compareAisles(order, a, b){
-  const va = (order && typeof order[a] === 'number') ? order[a] : null;
-  const vb = (order && typeof order[b] === 'number') ? order[b] : null;
-  if(va !== null && vb !== null && va !== vb) return va - vb;
-  if(va !== null && vb === null) return -1;
-  if(va === null && vb !== null) return 1;
-  return String(a).localeCompare(String(b));
-}
-
-/* Trips the route is allowed to learn from. "The shop was rearranged" sets
-   settings.aisleOrderSince rather than deleting anything — the archive is a record of
-   what happened and nothing gets to edit it after the fact. */
-function learnedRouteTrips(){
-  const since = recipesData.settings && recipesData.settings.aisleOrderSince;
-  const all = recentTrips(0);
-  return since ? all.filter(t=> tsOf(t.doneAt) >= tsOf(since)) : all;
-}
-
-// The route in force right now. Empty when the feature is off or the history is too thin,
-// and an empty order means every sort falls straight back to alphabetical.
-function activeAisleOrder(){
-  if(!featureOn('learnedAisleOrder')) return {};
-  return aisleOrderFromHistory(learnedRouteTrips());
-}
-
 /* Pure. How many of each shop's picks actually got cooked. Nothing is amended after the
    fact — the trip records what was bought, the recipe records when it was cooked (since
    v22.0, honestly), and the answer is the overlap: a cook stamp falling between this shop
@@ -3625,6 +3628,18 @@ function atHomeStreaks(trips, minRun){
     .filter(k=> !broken[k] && runs[k] >= need)
     .sort((a,b)=> runs[b] - runs[a] || a.localeCompare(b))
     .map(k=>({ name: k, runs: runs[k] }));
+}
+
+/* v23.0: a pick is an AUTHORED item, so it carries the stamps the merge needs — when it
+   came into existence, and when it was last edited. Without addedAt the merge cannot tell
+   a recipe somebody just chose on a phone that was out of contact from one everybody has
+   already seen and dropped, which is why the picks used to be taken wholesale from
+   whichever file happened to be newer. Both fields are additive; an older build reads and
+   writes the selection without them and simply loses this device's ability to be precise
+   about it, never the pick itself. */
+function newSelection(recipeId, servings, now){
+  const at = now || new Date().toISOString();
+  return { recipeId: recipeId, servings: servings, addedAt: at, changedAt: at };
 }
 
 /* ---- Start New Shopping List tab ---- */
@@ -3685,9 +3700,6 @@ function renderStartTab(){
   const pickedCard = el('div',{class:'card picked-card'});
   container.appendChild(pickedCard);
 
-  const pastCard = buildPastWeeksCard(shopping, ()=>{ drawPicked(); draw(); updateCountLabel(); });
-  if(pastCard) container.appendChild(pastCard);
-
   const searchbar = el('div',{class:'searchbar'});
   const searchInput = el('input',{type:'search', placeholder:'Search recipes to add…'});
   const catSelect = el('select',{});
@@ -3723,6 +3735,7 @@ function renderStartTab(){
       serv.disabled = shopping;
       serv.addEventListener('change', ()=>{
         sel.servings = parseInt(serv.value,10) || (r && r.servings) || 4;
+        sel.changedAt = new Date().toISOString();
         persist('shopping');
         draw();
       });
@@ -3761,7 +3774,7 @@ function renderStartTab(){
       servInput.disabled = shopping || !selected;
       cb.addEventListener('change', ()=>{
         if(cb.checked){
-          shoppingData.weekPlan.selections.push({recipeId:r.id, servings: parseInt(servInput.value,10)||defaultShoppingServings(r)});
+          shoppingData.weekPlan.selections.push(newSelection(r.id, parseInt(servInput.value,10)||defaultShoppingServings(r)));
         } else {
           shoppingData.weekPlan.selections = shoppingData.weekPlan.selections.filter(s=>s.recipeId!==r.id);
         }
@@ -3772,7 +3785,7 @@ function renderStartTab(){
       });
       servInput.addEventListener('change', ()=>{
         const s = shoppingData.weekPlan.selections.find(s=>s.recipeId===r.id);
-        if(s){ s.servings = parseInt(servInput.value,10)||r.servings||4; persist('shopping'); drawPicked(); }
+        if(s){ s.servings = parseInt(servInput.value,10)||r.servings||4; s.changedAt = new Date().toISOString(); persist('shopping'); drawPicked(); }
       });
       const top = el('div',{class:'row'},[cb, el('span',{},['serves']), servInput]);
       card.appendChild(el('h3',{},[r.name]));
@@ -4036,11 +4049,8 @@ function renderReviewTab(){
   shownLines.forEach(line=>{ (groups[line.aisle||'Other'] = groups[line.aisle||'Other']||[]).push(line); });
   const aisleCategory = {};
   shownLines.forEach(line=>{ aisleCategory[line.aisle||'Other'] = line.shoppingCategory || 'Other'; });
-  // The shopping CATEGORY order is a household decision and stays exactly as it was; only
-  // the alphabetical tie-break inside a category becomes the learnt route.
-  const aisleOrder = activeAisleOrder();
   Object.keys(groups).sort((a,b)=>
-    catSortIndex(aisleCategory[a]) - catSortIndex(aisleCategory[b]) || compareAisles(aisleOrder, a, b)
+    catSortIndex(aisleCategory[a]) - catSortIndex(aisleCategory[b]) || a.localeCompare(b)
   ).forEach(aisle=>{
     const g = el('div',{class:'aisle-group card'});
     g.appendChild(el('h4',{},[aisle]));
@@ -4312,12 +4322,11 @@ function buildShoppingPrintSection(){
     catGroups[cat][aisle].push(line);
   });
   const shopColumns = el('div',{class:'shop-columns'});
-  const printAisleOrder = activeAisleOrder();   // the printed list walks the same route
   Object.keys(catGroups).sort((a,b)=> catSortIndex(a)-catSortIndex(b) || a.localeCompare(b)).forEach(cat=>{
     const catBlock = el('div',{class:'cat-block'});
     catBlock.appendChild(el('div',{class:'cat-header'},[el('span',{},[cat]), el('span',{class:'col-label'},['# Recipes'])]));
     const aisles = catGroups[cat];
-    Object.keys(aisles).sort((a,b)=> compareAisles(printAisleOrder, a, b)).forEach(aisle=>{
+    Object.keys(aisles).sort().forEach(aisle=>{
       const aisleBlock = el('div',{class:'aisle-block'});
       aisleBlock.appendChild(el('div',{class:'aisle-header'},[aisle]));
       aisles[aisle].sort((a,b)=>a.ingredientName.localeCompare(b.ingredientName)).forEach(line=>{
@@ -4758,7 +4767,6 @@ function renderSettingsTab(){
     ['staples',      'Staples list', 'Regular items (milk, bread…) automatically added to every generated shopping list.'],
     ['pantryAtHome', 'Pantry items start as "at home"', 'Pantry-category items on a new list start in an "At home already" group with one tap to add them if you\u2019re out. Wait List items and staples always stay on the buy list.'],
     ['recipeFinder', 'Recipe finder', 'Search recipes by category and the ingredients they contain (below on this tab).'],
-    ['learnedAisleOrder', 'Order aisles the way you walk the shop', 'Works out the route from the order things were ticked off on previous shops, and lists the aisles that way instead of alphabetically. Needs a few finished shops before it does anything — see below.'],
   ].forEach(([key, label, desc])=>{
     const cb = el('input',{type:'checkbox'});
     cb.checked = featureOn(key);
@@ -4911,51 +4919,6 @@ function renderSettingsTab(){
   });
 
   container.appendChild(prefCard);
-
-  /* -------- The route through the shop (v22.0) --------
-     Shown whenever there is any history at all, feature on or off. Seeing what it WOULD
-     do is how somebody decides whether to switch it on; "trust me, it has learnt
-     something" is not a reasonable thing to ask of a shopping list. */
-  {
-    const routeTrips = learnedRouteTrips();
-    const route = aisleOrderFromHistory(routeTrips);
-    const placed = Object.keys(route).sort((a,b)=> route[a] - route[b]);
-    if(routeTrips.length || featureOn('learnedAisleOrder')){
-      container.appendChild(el('h3',{},['The route through your shop']));
-      const routeCard = el('div',{class:'card'});
-      routeCard.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
-        'Worked out from the order things were ticked off on your last ' + AISLE_ORDER_TRIPS
-        + ' finished shops. There is nothing to fill in — it is read back out of the ticks. '
-        + 'The list is still grouped by the main sections first (fruit and vegetables, meat, '
-        + 'cold, pantry, toiletries); this order applies to the aisles inside each of those.'
-      ]));
-      if(!placed.length){
-        routeCard.appendChild(el('p',{},[
-          routeTrips.length
-            ? 'Not enough to go on yet — an aisle has to turn up on ' + AISLE_ORDER_MIN_SIGHTINGS
-              + ' shops before it gets a place. ' + routeTrips.length + ' finished shop(s) recorded so far.'
-            : 'No finished shops recorded yet. Tap "Shopping is done" at the end of a shop and this fills itself in.'
-        ]));
-      } else {
-        routeCard.appendChild(el('p',{style:'margin-bottom:4px;'},[
-          placed.length + ' aisle(s) placed, from ' + routeTrips.length + ' finished shop(s)'
-          + (featureOn('learnedAisleOrder') ? '' : ' — switch the feature on above to start using it') + ':'
-        ]));
-        const ol = el('ol',{style:'margin:0;padding-left:20px;'});
-        placed.forEach(n=> ol.appendChild(el('li',{},[n])));
-        routeCard.appendChild(ol);
-        const resetBtn = el('button',{class:'btn secondary', style:'margin-top:10px;'},['The shop was rearranged — start again']);
-        resetBtn.addEventListener('click', ()=>{
-          if(!confirm('Forget the route learnt so far?\n\nShops from here on will be used to work it out again. Nothing in your shopping history is deleted — the route simply stops reading the shops before today.')) return;
-          recipesData.settings.aisleOrderSince = new Date().toISOString();
-          persist('recipes');
-          render();
-        });
-        routeCard.appendChild(resetBtn);
-      }
-      container.appendChild(routeCard);
-    }
-  }
 
   /* -------- Things you always have in (v22.0) -------- */
   {
