@@ -9,8 +9,8 @@ noticed mid-shop. They are worth reading before changing sync, rendering or stor
 ## Commands
 
 ```
-npm test                # 218 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 136 browser assertions — needs playwright-core + Chromium
+npm test                # 235 logic assertions — no dependencies, no browser, ~1s
+npm run test:browser    # 148 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -113,6 +113,22 @@ the list alone and says so. `sameTripRebuild()` is shared with `generateShopping
 the two can never disagree about what is about to happen. Since v21.9 froze the picks,
 reaching that state at all means another device changed them — an older build, or one
 that was offline — so the note explains and offers no button. *(v21.8, v21.9)*
+
+**Never replace `weekPlan` with a bare object.** Emptying the week is not the same as
+erasing it. `{ selections: [], generatedAt: null }` discards `tripId`, `supersedes`,
+`basedOn` and `generatedAt` — the four fields `chooseTripWinner` decides on — so the
+cleared week reached the merge with no claim to make and any surviving copy of the old
+one won outright and put the recipes back on the next poll. It survived four releases
+because a single device settles: both sides of that merge are the cleared state. A
+household with two phones does not. Clearing the week is a deliberate replacement and is
+expressed like every other one — `clearedWeekPlan` mints a new trip naming the one it
+supersedes, the same shape `putBackReplacedList` uses. *(v22.1)*
+
+**A deliberate clear outranks a live trip, and that is rule 1 doing its job.** Superseding
+sits above "somebody is shopping from this" on purpose. v21.9's freeze closes the ordinary
+case — the button is disabled as soon as this device has seen the live trip — and
+`stashReplacedTrip` covers the 20-second window where it has not. Don't add a second
+mechanism for that race; it is the one `generateShoppingList` already carries. *(v22.1)*
 
 **The trip archive is append-only, and nothing edits a closed record.** `finishShopping`
 writes the trip to localStorage *before* clearing `shoppingList` — that clear is where a

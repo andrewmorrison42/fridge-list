@@ -335,7 +335,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v22.0';
+const APP_VERSION = 'v22.1';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -2840,6 +2840,39 @@ function finishShopping(){
   setStatus('Shopping marked as done — list cleared, menu kept.', 'ok');
 }
 
+/* Pure. The weekPlan that deliberately replaces `sd`'s week with an empty one.
+
+   v22.1. "Clear all selections" used to assign `{ selections: [], generatedAt: null }`,
+   which threw away the whole weekPlan — tripId, supersedes, basedOn, generatedAt — and
+   those are exactly the four fields chooseTripWinner decides on. So a cleared week
+   reached the merge with no argument to make: it could not claim to supersede anything
+   (tripIdOf returned null, since generatedAt was nulled too and that is the fallback),
+   it was never live, its basedOn was 0 and its generatedAt was 0. Every rule tied or
+   went the other way, so any surviving copy of the old week won outright and put the
+   recipes straight back on the next poll. One phone with a healthy upload settled, which
+   is why it survived four releases; a household with two did not.
+
+   Clearing the week is the same act as replacing a list — a person deciding this week is
+   finished with — so it is expressed the same way, exactly as putBackReplacedList does:
+   a new trip that names the one it replaces. Rule 1 of chooseTripWinner then carries it
+   on every device. Older phones honour it too: chooseTripWinner is unchanged since
+   v21.8, and builds older than that took the later generatedAt, which this now sets to
+   the newest possible value rather than null. */
+function clearedWeekPlan(sd, now, byDevice, seenRemoteAt){
+  return {
+    selections: [],
+    generatedAt: now,
+    tripId: 'trip:' + now + ':' + byDevice,
+    supersedes: tripIdOf(sd),
+    basedOn: seenRemoteAt || (sd && sd.lastUpdated) || null,
+    shoppingDoneAt: null,
+    // An empty week is not stale — shoppingListIsStale returns false with no selections —
+    // so nothing regenerates off these, and the next real generate mints its own trip.
+    lastGeneratedRecipeSignature: null,
+    lastGeneratedSignature: null
+  };
+}
+
 /* Undo for a superseded trip. The restored list has to WIN once it goes back, or the
    copy that displaced it simply arrives again on the next poll — so it goes back as a
    deliberate replacement of that copy: a new trip id, superseding the one on screen,
@@ -3527,7 +3560,13 @@ function renderStartTab(){
       btn.addEventListener('click', ()=>{
         if(shoppingData.weekPlan.selections.length===0 && shoppingData.shoppingList.length===0) return;
         if(!confirm('Clear this week’s selected recipes and shopping list? Your Wait List will not be affected.')) return;
-        shoppingData.weekPlan = { selections: [], generatedAt: null };
+        // Stash first, while the list still exists: clearing a week somebody has ticked
+        // is destructive, and v21.6's rule is that destructive actions are recoverable
+        // rather than merely confirmed. No-ops unless the trip had progress, and the
+        // Review tab's "Put back the list that was replaced" is then the way back.
+        stashReplacedTrip(shoppingData);
+        shoppingData.weekPlan = clearedWeekPlan(
+          shoppingData, new Date().toISOString(), deviceId(), shoppingSeenRemoteAt);
         shoppingData.shoppingList = [];
         persist('shopping');
         render();
