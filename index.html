@@ -340,7 +340,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v23.0';
+const APP_VERSION = 'v23.1';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -1692,6 +1692,15 @@ function mergeShoppingData(a, b){
 
   const out = Object.assign({}, secondary, primary);
   out.weekPlan = Object.assign({}, secondary.weekPlan, primary.weekPlan);
+  /* seenRemoteAt is per-DEVICE state, not a field the newer file wins. Object.assign would
+     otherwise hand back whichever side is `primary` — normally the remote copy, since that
+     is usually why a merge is happening — and that value is the OTHER device's record of
+     how far IT had read, which is always behind what this device has just read. The
+     horizon would then silently regress on the most common path in the app, and this
+     device would go on to under-claim what it had seen, so its deletions would not be
+     honoured by anyone else. `a` is the local side at the only call site; the value is
+     owned by mergeRemoteShopping, which sets it again after this returns. */
+  out.seenRemoteAt = (a && a.seenRemoteAt) || null;
 
   if(!sameTrip){
     // Different trips: one of them is authoritative, wholesale. Which one is no
@@ -1827,11 +1836,15 @@ function mergeReport(d){
 }
 
 function mergeRemoteShopping(remote){
-  if(remote && remote.lastUpdated && tsOf(remote.lastUpdated) > tsOf(shoppingSeenRemoteAt)){
-    shoppingSeenRemoteAt = remote.lastUpdated;
-    if(shoppingData) shoppingData.seenRemoteAt = shoppingSeenRemoteAt;
-  }
+  /* Reading a copy written at T proves this device has now seen the shared state up to T.
+     Work the new horizon out first, merge without touching the inputs, then stamp it onto
+     the result — rather than mutating shoppingData on the way into an otherwise pure
+     merge, which is what let the value be overwritten by the other side's. */
+  const advanced = (remote && remote.lastUpdated && tsOf(remote.lastUpdated) > tsOf(shoppingSeenRemoteAt))
+    ? remote.lastUpdated : shoppingSeenRemoteAt;
   const merged = mergeShoppingData(shoppingData, remote);
+  shoppingSeenRemoteAt = advanced;
+  if(merged) merged.seenRemoteAt = advanced || null;
   const what = describeMerge(shoppingData, merged);
   const applied = applyMergedShopping(merged);
   // Only speak when the merge actually moved something, and only after it landed.
@@ -2320,6 +2333,48 @@ function downloadFile(name, text){
   document.body.appendChild(a); a.click(); a.remove();
   URL.revokeObjectURL(url);
 }
+/* An import replaces the week wholesale, which makes it the one place besides the merge
+   that decides what shoppingData is — and until now it just assigned the parsed file
+   straight over the top. Two things follow from that.
+
+   It has to be a DELIBERATE replacement, with lineage, like every other one in the app.
+   Without a trip id naming what it supersedes, the copy it replaced simply wins the next
+   poll and the import quietly undoes itself — the same failure clearedWeekPlan was written
+   for in v22.1.
+
+   And it has to be recoverable. v21.6's rule is that destructive actions are recoverable
+   rather than merely confirmed, and an import over a live trolley destroys ticks nobody
+   can get back. Going through applyMergedShopping is what buys that: it stashes the
+   displaced trip on the way past, so "Put back the list that was replaced" on the Review
+   tab is there afterwards.
+
+   Deliberately NOT blocked while a shop is live, unlike every control on the Start tab.
+   Import is the recovery tool of last resort, and a family whose data has gone wrong
+   mid-shop is exactly who needs it. The confirmation names what it will cost instead. */
+function adoptImportedShopping(parsed){
+  if(!parsed) return false;
+  const progress = tripProgress(shoppingData);
+  if(tripIsLive(shoppingData) && progress.ticks > 0
+     && !confirm('Importing replaces this week, including the ' + progress.ticks
+        + ' item(s) already ticked off on this device.\n\n'
+        + 'The list being replaced is kept for this session — "Put back the list that was '
+        + 'replaced" on the Review tab brings it back.\n\nImport anyway?')) return false;
+
+  const now = new Date().toISOString();
+  const imported = Object.assign({}, parsed);
+  imported.weekPlan = Object.assign({ selections: [], generatedAt: null },
+                                    parsed.weekPlan || {}, {
+    tripId: 'trip:' + now + ':' + deviceId(),
+    supersedes: tripIdOf(shoppingData),
+    basedOn: shoppingSeenRemoteAt || shoppingData.lastUpdated || null,
+    generatedAt: now
+  });
+  // The horizon is this device's, never the imported file's — same rule as the merge.
+  imported.seenRemoteAt = shoppingSeenRemoteAt || null;
+  applyMergedShopping(imported);   // the one sanctioned way shoppingData changes hands
+  return true;
+}
+
 function importData(){
   const input = document.createElement('input');
   input.type = 'file'; input.accept = '.json'; input.multiple = true;
@@ -2329,7 +2384,7 @@ function importData(){
       try{
         const parsed = JSON.parse(text);
         if(f.name.includes('shopping') || (parsed.shoppingList && parsed.neededList)){
-          shoppingData = parsed; saveShoppingLocal();
+          if(!adoptImportedShopping(parsed)) continue;   // declined at the confirmation
         } else {
           recipesData = migrateIngredientsIfStale(parsed, window.__fmaSeedRecipes);
           saveRecipesLocal();
@@ -2950,6 +3005,9 @@ function generateShoppingList(){
     });
   }
   const arr = Object.values(lines).sort((a,b)=> (a.aisle||'').localeCompare(b.aisle||'') || a.ingredientName.localeCompare(b.ingredientName));
+  // Render bookkeeping only. The identity the MERGE and tap-time row lookup use is
+  // lineMergeKey(line), which is content-based; this one is positional and changes
+  // whenever the list is regenerated. Never use it to match lines across devices.
   arr.forEach((l,idx)=> l.key = 'line-' + idx);
   // Pantry-at-home (feature-gated): recipe-derived Pantry-category lines start in the
   // "at home" group — the usual case is you already have flour/oil/spices — with a
@@ -3014,7 +3072,8 @@ function generateShoppingList(){
   shoppingData.weekPlan.lastGeneratedRecipeSignature = recipeSelectionsSignature();
   shoppingData.weekPlan.lastGeneratedSignature = selectionsSignature();
   persist('shopping');
-  persist('recipes'); // saves the lastCooked stamps set above
+  persist('recipes'); // saves the lastPlanned stamps set above — NOT lastCooked, which
+                      // only the Menu tab's cooked tick writes
 }
 
 // The recipe picks alone, ignoring the Wait List — used to decide whether a
@@ -5610,11 +5669,12 @@ document.addEventListener('DOMContentLoaded', function(){
    and never reload mid-shop: a phone screen locks constantly in a supermarket, so the
    refocus reload fired all the time, and a reload throws away scroll position and any
    in-flight save for no benefit (the 5s poll already keeps the list current). */
+/* Everything that makes a repaint rude makes a reload ruder, so this builds on that
+   predicate rather than restating it. The two were copies of the same three checks, and a
+   check added to one but not the other is how a reload starts throwing away what somebody
+   is typing — the v21.5 bug, with a bigger hammer. */
 function safeToReload(){
-  if(document.getElementById('modalRoot').innerHTML !== '') return false;
-  const ae = document.activeElement;
-  if(ae && (ae.tagName==='INPUT' || ae.tagName==='TEXTAREA' || ae.tagName==='SELECT')) return false;
-  if(isPrinting()) return false;
+  if(!safeToRepaint()) return false;
   if(currentTab === 'review' && shoppingInProgress()) return false;
   if(pendingSaveRecipes || pendingSaveShopping) return false;
   return true;

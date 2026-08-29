@@ -1229,6 +1229,58 @@ group('a phone that reconnects is told what changed');
      /1 recipe taken off the week/.test(mergeReport({changed:true, picksRemoved:1})));
 }
 
+group('the knowledge horizon is this device’s, and the merge never adopts another’s');
+{
+  /* Found by adversarial review of v23.0. mergeShoppingData builds its result with
+     Object.assign({}, secondary, primary), so seenRemoteAt was taken from whichever file
+     was NEWER — normally the remote copy, since that is usually why a merge is running.
+     That value is the other device's record of how far IT had read, always behind what
+     this device has just read, so the horizon silently regressed on the commonest path in
+     the app. A device that under-claims what it has seen cannot have its deletions
+     honoured by anyone else. Nothing asserted this before: the existing tests fed
+     seenRemoteAt in as input and checked deletion outcomes, never what came back out. */
+  const MIN = 60*1000;
+  const remote = { weekPlan:{tripId:'t', generatedAt:T(0), selections:[]},
+                   shoppingList:[], neededList:[],
+                   lastUpdated: T(10*MIN), seenRemoteAt: T(5*MIN) };   // newer file, older horizon
+  const local  = { weekPlan:{tripId:'t', generatedAt:T(0), selections:[]},
+                   shoppingList:[], neededList:[],
+                   lastUpdated: T(2*MIN), seenRemoteAt: T(10*MIN) };   // just advanced by the read
+
+  const merged = mergeShoppingData(local, remote);
+  ok('the local horizon survives a merge with a newer remote file',
+     merged.seenRemoteAt === T(10*MIN), merged.seenRemoteAt);
+  ok('and is not the other device’s record of what IT had read',
+     merged.seenRemoteAt !== remote.seenRemoteAt);
+
+  // The same when the local file happens to be the newer one — the answer must not depend
+  // on whose clock ran fastest.
+  const localNewer = Object.assign({}, local, { lastUpdated: T(20*MIN) });
+  ok('and it survives when the local file is the newer one too',
+     mergeShoppingData(localNewer, remote).seenRemoteAt === T(10*MIN));
+
+  // A device that has never read anything still reports never having read anything.
+  const virgin = Object.assign({}, local, { seenRemoteAt: null });
+  ok('a device with no horizon does not inherit one from the file it merges',
+     mergeShoppingData(virgin, remote).seenRemoteAt === null,
+     mergeShoppingData(virgin, remote).seenRemoteAt);
+
+  /* And the consequence the bug actually had: a device whose horizon regressed would fail
+     to have its deletions honoured. This is the same scenario one step on. */
+  const deleter = { weekPlan:{tripId:'t', generatedAt:T(0), selections:[]},
+                    shoppingList:[], neededList:[],          // it deleted the entry
+                    lastUpdated: T(11*MIN), seenRemoteAt: T(10*MIN) };
+  const holder  = { weekPlan:{tripId:'t', generatedAt:T(0), selections:[]},
+                    shoppingList:[],
+                    neededList:[{id:'n1', text:'shampoo', addedAt:T(1*MIN), done:false}],
+                    lastUpdated: T(10*MIN), seenRemoteAt: T(0) };
+  ok('a deletion made by a device with a true horizon is honoured',
+     mergeShoppingData(deleter, holder).neededList.length === 0);
+  ok('but the same deletion is NOT honoured once that horizon has regressed',
+     mergeShoppingData(Object.assign({}, deleter, { seenRemoteAt: T(0) }), holder)
+       .neededList.length === 1);
+}
+
 /* ---------- result ---------- */
 
 console.log('\n' + '-'.repeat(48));
