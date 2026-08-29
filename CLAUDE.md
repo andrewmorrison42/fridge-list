@@ -9,8 +9,8 @@ noticed mid-shop. They are worth reading before changing sync, rendering or stor
 ## Commands
 
 ```
-npm test                # 235 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 148 browser assertions — needs playwright-core + Chromium
+npm test                # 254 logic assertions — no dependencies, no browser, ~1s
+npm run test:browser    # 161 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -113,6 +113,16 @@ the list alone and says so. `sameTripRebuild()` is shared with `generateShopping
 the two can never disagree about what is about to happen. Since v21.9 froze the picks,
 reaching that state at all means another device changed them — an older build, or one
 that was offline — so the note explains and offers no button. *(v21.8, v21.9)*
+
+**A device that cannot reach the folder has to say so, and the wording is the feature.**
+The sync banner covered a sync that *broke* and could not cover one that was never there:
+its pending case runs off `syncPendingSince`, which `persist()` sets only when the OneDrive
+flag is on, so a phone that had never signed in never marked anything pending and was never
+warned — while the startup line told it, in green, that it was "working from this device's
+local copy". Two people planned a week nobody else ever saw. `syncAlertState` is pure so
+the sentences can be asserted without a browser; if you reword them, the tests are asserting
+the wording on purpose. `lastContactText` reads `shoppingSeenRemoteAt`, which advances only
+on a real remote read, so "never" cannot be flattered into something softer. *(v22.2)*
 
 **Never replace `weekPlan` with a bare object.** Emptying the week is not the same as
 erasing it. `{ selections: [], generatedAt: null }` discards `tripId`, `supersedes`,
@@ -239,6 +249,19 @@ If tooling starts calling a text file binary, look for stray control characters 
 than working around it.
 
 ## Known limitations, deliberately left
+
+- **The week's picks are last-writer-wins, with no merge at all.** `mergeShoppingData`
+  takes the winning side's `selections` array wholesale and reads the other side only to
+  resolve `cooked` flags, so two people picking recipes at the same time loses one side's
+  choices. Worse, `primary` is decided by `lastUpdated`, which `saveShoppingLocal` bumps on
+  *every* shopping save — so ticking a Wait List item on one phone can discard recipes just
+  picked on another.
+
+  The fix is the one already sketched for the Wait List below: give each selection an
+  `addedAt`, union by `recipeId` on a same-trip merge, and use that stamp against the other
+  file's `lastUpdated` to tell "not seen yet" from "deliberately removed". Additive, no shape
+  hazard. Not done yet because it lands in the most delicate function in the app and wants
+  its own release rather than riding along with a banner.
 
 - **Wait List membership is last-writer-wins.** An addition that has not yet reached
   OneDrive can be lost if someone else's addition lands first — the merge takes the

@@ -1162,6 +1162,80 @@ async function suiteClearSurvivesSync(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+async function suiteUnsyncedPhoneSaysSo(browser) {
+  group('a phone with nowhere to sync to says so, on screen');
+  /* The reported failure: two people picked a week on a phone that was never signed in.
+     Everything they did was local, and the app's only comment was a green line reading
+     "Working from this device's local copy". The banner could not help — its pending
+     case runs off syncPendingSince, which persist() sets only when the OneDrive flag is
+     on, so the one device that needed telling was the only one that could not be told.
+     The harness is itself an unsynced device, which is what makes this testable. */
+  const srv = await serve(8185);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  try {
+    await page.goto('http://localhost:8185/', { waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+
+    ok('the startup line no longer calls it good news',
+       /not connected/i.test(await page.textContent('#statusBar')),
+       await page.textContent('#statusBar'));
+    ok('and it is styled as a warning, not as ok',
+       (await page.getAttribute('#statusBar', 'class') || '').includes('warn'));
+
+    // Nothing while startup might still be connecting.
+    ok('the banner holds off while startup could still succeed',
+       await page.evaluate(() => document.getElementById('syncAlert').hidden));
+
+    // Past the grace period, it has to speak up. The app schedules its own repaint;
+    // wait for the outcome rather than for a duration.
+    await page.waitForFunction(
+      () => !document.getElementById('syncAlert').hidden, null, { timeout: 30000 });
+
+    const banner = await page.evaluate(() => {
+      const b = document.getElementById('syncAlert');
+      return { text: b.innerText, cls: b.className,
+               buttons: [...b.querySelectorAll('button')].map(x => x.textContent) };
+    });
+    ok('the banner appears once startup has had its chance', !!banner.text, banner);
+    ok('it names the phone as disconnected',
+       /not connected to the family/i.test(banner.text), banner.text);
+    ok('it says what that costs — the sentence is the feature',
+       /stays on this phone/i.test(banner.text) && /nobody else will see it/i.test(banner.text),
+       banner.text);
+    ok('it says the folder has never been reached',
+       /never/i.test(banner.text), banner.text);
+    ok('it is styled as a problem, not as a note', /\berr\b/.test(banner.cls), banner.cls);
+    ok('and it offers the way out in one tap',
+       banner.buttons.some(t => /connect this phone/i.test(t)), banner.buttons);
+
+    // It is sticky, so it cannot be scrolled away from while somebody picks a week.
+    await page.click('#mainNav button[data-tab="start"]');
+    await page.waitForSelector('#app input[type=checkbox]', { timeout: 15000 });
+    await page.evaluate(() => window.scrollTo(0, 1200));
+    await page.waitForTimeout(250);
+    ok('it survives changing tab and scrolling down the recipe grid',
+       await page.evaluate(() => {
+         const b = document.getElementById('syncAlert');
+         return !b.hidden && b.getBoundingClientRect().top < 80;
+       }));
+
+    // "Not now" is for this session only.
+    await page.click('#syncAlert button:has-text("Not now")');
+    await page.waitForTimeout(250);
+    ok('it can be put aside', await page.evaluate(() => document.getElementById('syncAlert').hidden));
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+    await page.waitForFunction(
+      () => !document.getElementById('syncAlert').hidden, null, { timeout: 30000 });
+    ok('but it comes back on the next open — the mute is never persisted',
+       await page.evaluate(() => !document.getElementById('syncAlert').hidden));
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 (async () => {
   console.log('Chromium: ' + EXECUTABLE);
   const browser = await chromium.launch({ executablePath: EXECUTABLE, args: ['--no-sandbox'] });
@@ -1172,6 +1246,7 @@ async function suiteClearSurvivesSync(browser) {
                          suiteWriteSplitting, suiteStapleQuantities, suiteTypingIsNotInterrupted,
                          suiteBulkDelete, suiteShareOneRecipe, suiteLiveListNotWiped,
                          suiteTripHistory, suiteLearnedAisleOrder, suiteClearSurvivesSync,
+                         suiteUnsyncedPhoneSaysSo,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
       catch (e) {
