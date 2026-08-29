@@ -75,7 +75,7 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripHasProgress', 'tripIsLiv
                'daysSincePlanned', 'migrateCookedStamps',
                'picksFromTrip', 'summarisePickNames',
                'aisleOrderFromHistory', 'compareAisles',
-               'cookRateSummary', 'atHomeStreaks'];
+               'cookRateSummary', 'atHomeStreaks', 'clearedWeekPlan'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -101,7 +101,7 @@ vm.runInContext(
   '             recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,' +
   '             picksFromTrip, summarisePickNames,' +
   '             aisleOrderFromHistory, compareAisles, AISLE_ORDER_MIN_SIGHTINGS, AISLE_ORDER_TRIPS,' +
-  '             cookRateSummary, atHomeStreaks,' +
+  '             cookRateSummary, atHomeStreaks, clearedWeekPlan,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -114,7 +114,7 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,
         picksFromTrip, summarisePickNames,
         aisleOrderFromHistory, compareAisles, AISLE_ORDER_MIN_SIGHTINGS, AISLE_ORDER_TRIPS,
-        cookRateSummary, atHomeStreaks,
+        cookRateSummary, atHomeStreaks, clearedWeekPlan,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -1021,6 +1021,117 @@ group('what the family already has in is learnt from the times they said so');
 
   ok('an empty history suggests nothing',
      atHomeStreaks([], 3).length === 0 && atHomeStreaks(null, 3).length === 0);
+}
+
+/* ---------- v22.1: clearing the week has to survive the sync ---------- */
+
+group('a cleared week beats a copy that still holds the old one');
+{
+  // The week as another phone still has it: a real trip, generated an hour ago.
+  const oldWeek = () => ({
+    weekPlan: { tripId: 'trip:old', generatedAt: T(0), basedOn: T(0),
+                selections: [{recipeId:'a'},{recipeId:'b'},{recipeId:'c'},
+                             {recipeId:'d'},{recipeId:'e'},{recipeId:'f'}] },
+    shoppingList: [line('Milk'), line('Rice')],
+    neededList: [], lastUpdated: T(0)
+  });
+
+  // What this phone holds after tapping "Clear all selections".
+  const cleared = () => {
+    const before = oldWeek();
+    return { weekPlan: clearedWeekPlan(before, T(60000), 'phone-1', T(0)),
+             shoppingList: [], neededList: [], lastUpdated: T(60000) };
+  };
+
+  ok('the cleared week keeps an identity of its own', !!tripIdOf(cleared()));
+  ok('and names the week it is replacing',
+     cleared().weekPlan.supersedes === 'trip:old');
+  ok('and carries a real generatedAt, not null',
+     cleared().weekPlan.generatedAt === T(60000));
+  ok('a finished shop does not come back with it',
+     cleared().weekPlan.shoppingDoneAt === null);
+
+  const both = (a, b) => [mergeShoppingData(a, b), mergeShoppingData(b, a)];
+
+  both(cleared(), oldWeek()).forEach((m, i) => {
+    ok('the week stays cleared, whichever way round the merge runs [' + i + ']',
+       m.weekPlan.selections.length === 0, m.weekPlan.selections);
+    ok('and the old list does not come back with it [' + i + ']',
+       m.shoppingList.length === 0, m.shoppingList.length);
+    ok('the merged trip is the cleared one [' + i + ']',
+       tripIdOf(m) === tripIdOf(cleared()), tripIdOf(m));
+  });
+}
+
+group('and it beats every shape of copy the household can be holding');
+{
+  const clearedAgainst = other => {
+    const c = { weekPlan: clearedWeekPlan(other, T(60000), 'phone-1', T(0)),
+                shoppingList: [], neededList: [], lastUpdated: T(60000) };
+    return [mergeShoppingData(c, other), mergeShoppingData(other, c)];
+  };
+
+  // 1. Someone had already ticked things off — a LIVE trip, which normally wins
+  //    outright and is exactly what rule 2 exists to protect.
+  const live = {
+    weekPlan: { tripId: 'trip:live', generatedAt: T(0), basedOn: T(0),
+                selections: [{recipeId:'a'},{recipeId:'b'}] },
+    shoppingList: [line('Milk', {checked:true, checkedAt: new Date().toISOString()})],
+    neededList: [], lastUpdated: T(0)
+  };
+  ok('a deliberate clear outranks even a live trip — rule 1 is above rule 2',
+     clearedAgainst(live).every(m => m.weekPlan.selections.length === 0));
+
+  // 2. A phone on v21.8+ whose copy carries basedOn.
+  const based = {
+    weekPlan: { tripId: 'trip:based', generatedAt: T(0), basedOn: T(50000),
+                selections: [{recipeId:'a'}] },
+    shoppingList: [line('Rice')], neededList: [], lastUpdated: T(0)
+  };
+  ok('a fresher basedOn on the other side does not resurrect it',
+     clearedAgainst(based).every(m => m.weekPlan.selections.length === 0));
+
+  // 3. A phone on a build old enough to have neither supersedes nor basedOn, where the
+  //    only rule is "later generatedAt wins". The clear now has one, so it still wins.
+  const ancient = {
+    weekPlan: { tripId: 'trip:ancient', generatedAt: T(30000),
+                selections: [{recipeId:'a'}] },
+    shoppingList: [line('Flour')], neededList: [], lastUpdated: T(30000)
+  };
+  ok('nor does an older build with no lineage fields at all',
+     clearedAgainst(ancient).every(m => m.weekPlan.selections.length === 0));
+
+  // 4. Picks made but never generated, so there was no trip to supersede.
+  const never = {
+    weekPlan: { selections: [{recipeId:'a'}] },
+    shoppingList: [], neededList: [], lastUpdated: T(0)
+  };
+  ok('a week that was never generated has nothing to supersede',
+     clearedWeekPlan(never, T(60000), 'phone-1', null).supersedes === null);
+  ok('and the clear still wins, on generatedAt alone',
+     clearedAgainst(never).every(m => m.weekPlan.selections.length === 0));
+}
+
+group('the clear does not disturb anything it was not asked to');
+{
+  const other = {
+    weekPlan: { tripId: 'trip:old', generatedAt: T(0), selections: [{recipeId:'a'}] },
+    shoppingList: [line('Milk')],
+    neededList: [{id:'n1', text:'shampoo', addedAt: T(0), done:false}],
+    lastUpdated: T(0)
+  };
+  const c = { weekPlan: clearedWeekPlan(other, T(60000), 'phone-1', T(0)),
+              shoppingList: [],
+              neededList: [{id:'n1', text:'shampoo', addedAt: T(0), done:false}],
+              lastUpdated: T(60000) };
+  const m = mergeShoppingData(c, other);
+  ok('the Wait List survives a clear, as the dialog promises',
+     m.neededList.length === 1 && m.neededList[0].text === 'shampoo', m.neededList);
+
+  const before = JSON.stringify(other);
+  clearedWeekPlan(other, T(60000), 'phone-1', T(0));
+  ok('and building the replacement mutates nothing',
+     JSON.stringify(other) === before);
 }
 
 /* ---------- result ---------- */

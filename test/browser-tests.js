@@ -1088,6 +1088,80 @@ async function suiteLearnedAisleOrder(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+async function suiteClearSurvivesSync(browser) {
+  group('a cleared week is not put back by the other phone');
+  /* The reported bug: "Clear all selections" wiped the whole weekPlan, so the cleared
+     week had no tripId, no supersedes, no basedOn and generatedAt: null — nothing
+     chooseTripWinner could rule for. Any phone still holding the old week won outright
+     and the recipes came back on the next poll. */
+  const file = instrument('clear-hook.html',
+    'window.__t = { apply: applyMergedShopping, merge: mergeShoppingData, sd: () => shoppingData };');
+  const srv = await serve(8184, file);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  page.on('dialog', d => d.accept());
+  try {
+    await page.goto('http://localhost:8184/', { waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+    await buildAList(page);   // picks two recipes and generates the list
+
+    /* Snapshot the week as the OTHER phone holds it, and put the ticks only on that
+       copy — that phone has started shopping, this one has not polled yet. Ticking here
+       instead would freeze this device's own Start tab (v21.9 disables every control on
+       it during a live shop), so the clear could not be reached at all. The scenario
+       under test is the one that can actually happen. */
+    const held = await page.evaluate(() => {
+      const sd = JSON.parse(localStorage.getItem('fma_shopping_v4'));
+      const remote = JSON.parse(JSON.stringify(sd));
+      const now = new Date().toISOString();
+      remote.shoppingList.slice(0, 2).forEach(l => { l.checked = true; l.checkedAt = now; });
+      window.__held = remote;
+      return { trip: sd.weekPlan.tripId, picks: sd.weekPlan.selections.length,
+               lines: sd.shoppingList.length,
+               remoteTicks: remote.shoppingList.filter(l => l.checked).length };
+    });
+    ok('the other phone is mid-shop, which normally wins outright',
+       held.remoteTicks === 2, held);
+    ok('there is a week to clear', held.picks === 2 && held.lines > 0 && !!held.trip, held);
+
+    await page.click('#mainNav button[data-tab="start"]');
+    await page.waitForSelector('#app input[type=checkbox]', { timeout: 15000 });
+    await page.click('#app >> text="Clear all selections"');
+    await page.waitForTimeout(500);
+
+    const cleared = await readShopping(page);
+    ok('the clear empties the week', cleared.weekPlan.selections.length === 0);
+    ok('and the list with it', cleared.shoppingList.length === 0);
+    ok('but the week keeps an identity, rather than being erased',
+       !!cleared.weekPlan.tripId && cleared.weekPlan.tripId !== held.trip,
+       cleared.weekPlan.tripId);
+    ok('and it names the week it replaced',
+       cleared.weekPlan.supersedes === held.trip, cleared.weekPlan);
+
+    // The other phone's copy arrives, exactly as a poll would deliver it.
+    const after = await page.evaluate(() => {
+      const remote = window.__held;
+      remote.lastUpdated = new Date(Date.now() + 60000).toISOString();  // and it is "newer"
+      window.__t.apply(window.__t.merge(window.__t.sd(), remote));
+      return { picks: window.__t.sd().weekPlan.selections.length,
+               lines: window.__t.sd().shoppingList.length,
+               trip: window.__t.sd().weekPlan.tripId };
+    });
+    ok('the recipes do NOT come back', after.picks === 0, after);
+    ok('nor does the shopping list', after.lines === 0, after);
+    ok('the cleared week is what survives the merge',
+       after.trip === cleared.weekPlan.tripId, after);
+    ok('a deliberate clear outranks a live trip — rule 1 sits above rule 2',
+       after.picks === 0 && after.lines === 0);
+
+    await page.waitForTimeout(300);
+    ok('and the Start tab agrees with the saved state',
+       await page.evaluate(() => /Nothing picked yet/i.test(document.getElementById('app').innerText)));
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 (async () => {
   console.log('Chromium: ' + EXECUTABLE);
   const browser = await chromium.launch({ executablePath: EXECUTABLE, args: ['--no-sandbox'] });
@@ -1097,7 +1171,7 @@ async function suiteLearnedAisleOrder(browser) {
     for (const suite of [suiteTicksSurviveRebuild, suiteRemoteMergeKeepsTicks,
                          suiteWriteSplitting, suiteStapleQuantities, suiteTypingIsNotInterrupted,
                          suiteBulkDelete, suiteShareOneRecipe, suiteLiveListNotWiped,
-                         suiteTripHistory, suiteLearnedAisleOrder,
+                         suiteTripHistory, suiteLearnedAisleOrder, suiteClearSurvivesSync,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
       catch (e) {
