@@ -1274,6 +1274,99 @@ async function suiteTwoPhonesBothKeepTheirWork(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+async function suiteImportRespectsTheMerge(browser) {
+  group('importing a shopping file is a deliberate replacement, not a reassignment');
+  /* Adversarial review of v23.0 found importData() assigning `shoppingData = parsed`
+     directly — the one thing the project's own invariant list forbids by name. It set no
+     trip lineage, so the copy it replaced would win the next poll and undo the import;
+     and it never stashed, so importing over a live trolley destroyed ticks with no way
+     back. Neither suite referenced importData at all. */
+  const file = instrument('import-hook.html',
+    'window.__t = { adopt: adoptImportedShopping, sd: () => shoppingData,'
+    + ' replaced: () => replacedTrip, merge: mergeShoppingData };');
+  const srv = await serve(8187, file);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  page.on('dialog', d => d.accept());
+  try {
+    await page.goto('http://localhost:8187/', { waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+    await buildAList(page);
+
+    // Tick something, so there is real progress for an import to endanger.
+    const rows = await page.$$('.shop-row');
+    await rows[0].$eval('input[type=checkbox]', c => c.click());
+    await page.waitForTimeout(250);
+
+    const before = await readShopping(page);
+    ok('there is a live trip with a tick on it',
+       before.shoppingList.filter(l => l.checked).length === 1 && !!before.weekPlan.tripId);
+
+    /* Import from Settings, which is where it actually lives. Doing it from the Review tab
+       muddies the assertion: applyMergedShopping repaints, renderReviewTab regenerates the
+       list for the newly imported picks, and THAT mints a further trip superseding the
+       imported one. That chain is correct — the list has to be rebuilt for the week that
+       just arrived — but it is two steps past what this suite is checking. */
+    await page.click('#mainNav button[data-tab="settings"]');
+    await page.waitForTimeout(400);
+
+    const out = await page.evaluate(() => {
+      /* Read the trip id in the SAME turn as the import. Capturing it from an earlier
+         readShopping() raced the Review tab's own regeneration, which mints a new trip —
+         the assertion below is about what supersedes points at, not about how long the
+         trip happened to live. */
+      const tripBefore = window.__t.sd().weekPlan.tripId;
+      // A plausible exported file from another household copy: its own trip, its own week.
+      const imported = {
+        weekPlan: { tripId: 'trip:imported', generatedAt: new Date(Date.now() - 864e5).toISOString(),
+                    selections: [{ recipeId: 'imported-recipe', servings: 4,
+                                   addedAt: new Date(Date.now() - 864e5).toISOString() }] },
+        shoppingList: [], neededList: [{ id: 'n-imported', text: 'from the file',
+                                         addedAt: new Date(Date.now() - 864e5).toISOString(), done: false }],
+        lastUpdated: new Date(Date.now() - 864e5).toISOString(),
+        seenRemoteAt: new Date(Date.now() - 2*864e5).toISOString()
+      };
+      const okd = window.__t.adopt(imported);
+      const sd = window.__t.sd();
+      const stashed = window.__t.replaced();
+      return {
+        accepted: okd,
+        tripBefore: tripBefore,
+        trip: sd.weekPlan.tripId,
+        supersedes: sd.weekPlan.supersedes,
+        picks: sd.weekPlan.selections.map(s => s.recipeId),
+        horizon: sd.seenRemoteAt,
+        importedHorizon: imported.seenRemoteAt,
+        stashedTicks: stashed ? stashed.ticks : 0,
+        stashedTrip: stashed ? stashed.tripId : null
+      };
+    });
+
+    ok('the import is accepted', out.accepted === true, out);
+    ok('it mints a trip of its own rather than adopting the file’s',
+       !!out.trip && out.trip !== 'trip:imported', out.trip);
+    ok('and names the week it replaces, so it wins the next poll instead of being undone',
+       out.supersedes === out.tripBefore, { got: out.supersedes, expected: out.tripBefore });
+    ok('which is a real trip, not an empty claim', !!out.tripBefore && out.supersedes !== out.trip);
+    ok('the imported week is what is now picked', out.picks.includes('imported-recipe'), out.picks);
+    ok('the horizon stays this device’s, not the imported file’s',
+       out.horizon !== out.importedHorizon, out);
+    ok('the displaced trip is stashed, so the ticks are recoverable',
+       out.stashedTicks === 1 && out.stashedTrip === out.tripBefore, out);
+
+    /* And the recovery path the stash exists for is actually offered. Landing on Review
+       now also lets the list regenerate for the imported week, which is what should
+       happen — the assertion is only that the way back is on offer. */
+    await page.click('#mainNav button[data-tab="review"]');
+    await page.waitForTimeout(600);
+    ok('and the Review tab offers to put the replaced list back',
+       await page.evaluate(() => /put back the list that was replaced/i.test(
+         document.getElementById('app').innerText)));
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 (async () => {
   console.log('Chromium: ' + EXECUTABLE);
   const browser = await chromium.launch({ executablePath: EXECUTABLE, args: ['--no-sandbox'] });
@@ -1285,6 +1378,7 @@ async function suiteTwoPhonesBothKeepTheirWork(browser) {
                          suiteBulkDelete, suiteShareOneRecipe, suiteLiveListNotWiped,
                          suiteTripHistory, suiteClearSurvivesSync,
                          suiteTwoPhonesBothKeepTheirWork,
+                         suiteImportRespectsTheMerge,
                          suiteUnsyncedPhoneSaysSo,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }

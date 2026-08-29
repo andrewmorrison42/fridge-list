@@ -9,8 +9,8 @@ noticed mid-shop. They are worth reading before changing sync, rendering or stor
 ## Commands
 
 ```
-npm test                # 253 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 164 browser assertions — needs playwright-core + Chromium
+npm test                # 259 logic assertions — no dependencies, no browser, ~1s
+npm run test:browser    # 174 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -50,6 +50,25 @@ Consequences:
 ## Invariants
 
 Each of these has a bug behind it.
+
+**`seenRemoteAt` is per-device state and the merge must never adopt the other side's.**
+`mergeShoppingData` builds its result with `Object.assign({}, secondary, primary)`, so the
+horizon was silently taken from whichever file was newer — normally the remote copy, since
+that is usually why a merge is running. That value is the other device's record of how far
+IT had read, always behind what this device has just read, so the horizon regressed on the
+commonest path in the app and this device then under-claimed what it had seen, meaning its
+deletions went unhonoured elsewhere. `mergeRemoteShopping` owns the value: it works the new
+horizon out, merges without touching its inputs, and stamps the result. Found by adversarial
+review of v23.0, a week after v23.0 was built entirely around this field. *(v23.1)*
+
+**Import is a deliberate replacement, and goes through `applyMergedShopping` like every
+other one.** `importData` used to do `shoppingData = parsed`, the one thing the invariant
+above forbids by name: no trip lineage, so the copy it replaced won the next poll and the
+import undid itself; and no stash, so importing over a live trolley destroyed ticks with no
+way back. It is deliberately NOT blocked while a shop is live, unlike the Start tab's
+controls — import is the recovery tool of last resort and a household whose data has gone
+wrong mid-shop is exactly who needs it. The confirmation names the cost instead, and the
+stash makes it recoverable. *(v23.1)*
 
 **One rule for every collection a person authors.** Union by id; each field resolved by
 its own stamp; an item on only one side is KEPT unless the other side demonstrably saw it
@@ -314,6 +333,17 @@ than working around it.
   `trip-history.json`, so that week is a gap in the history rather than a corruption of
   it. Everything reading the archive is written to be honest about thin data — the route
   needs three sightings of an aisle, the cook rate says "at least".
+
+- **The recipe load-and-swap logic is duplicated, and the poll's guard is checked early.**
+  `loadFromFolderOrSeed` and `loadFromOneDriveOrSeed` each implement "stringify-compare,
+  swap `recipesData`, save, conditionally repaint" independently — the same shape of
+  duplication that gave the shopping side two divergent copies and two bugs before
+  `applyMergedShopping` became its one chokepoint. Related: `pollOneDriveForChanges` checks
+  `document.hidden` and the modal/typing guards at entry, then awaits several round-trips
+  before assigning, so the window is wider than the guard implies. Both raised by
+  adversarial review of v23.0 and deliberately left for the change that gives recipes a
+  proper merge, rather than being half-done alongside a sync fix. Recipes are the one
+  collection the single rule does not cover, so this is the same boundary.
 
 - **Recipes have no per-item merge.** Concurrent edits to different recipes on two
   devices can lose one side. The ETag guard prevents silent clobbering but does not
