@@ -74,6 +74,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripHasProgress', 'tripIsLiv
                'recipeHistoryLabel', 'recipeHistoryTime', 'daysSinceStamp', 'daysSinceCooked',
                'daysSincePlanned', 'migrateCookedStamps',
                'cookRateSummary', 'atHomeStreaks', 'clearedWeekPlan',
+               'mergeAuthored', 'resolveAuthoredItem', 'otherSideDropped',
+               'effectiveAddedAt', 'authoredHorizons', 'describeMerge', 'mergeReport',
                'syncAlertState', 'lastContactText'];
 
 const sandbox = { console };
@@ -90,6 +92,9 @@ vm.runInContext(
   extractConst('APP_VERSION') + '\n' +
   extractConst('TRIP_HISTORY_MAX') + '\n' +
   extractConst('SYNC_STALE_MS') + '\n' +
+  extractConst('MERGE_GRACE_MS') + '\n' +
+  extractConst('SELECTION_FIELDS') + '\n' +
+  extractConst('WAITLIST_FIELDS') + '\n' +
   extractConst('SYNC_UNLINKED_GRACE_MS') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
@@ -99,6 +104,8 @@ vm.runInContext(
   '             tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,' +
   '             recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,' +
   '             cookRateSummary, atHomeStreaks, clearedWeekPlan,' +
+  '             mergeAuthored, otherSideDropped, MERGE_GRACE_MS, SELECTION_FIELDS, WAITLIST_FIELDS,' +
+  '             describeMerge, mergeReport,' +
   '             syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
@@ -111,6 +118,8 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,
         recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,
         cookRateSummary, atHomeStreaks, clearedWeekPlan,
+        mergeAuthored, otherSideDropped, MERGE_GRACE_MS, SELECTION_FIELDS, WAITLIST_FIELDS,
+        describeMerge, mergeReport,
         syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,
         setShoppingData, setRecipesData } = sandbox.api;
 
@@ -218,23 +227,41 @@ group('a genuinely new trip');
   ok('the trip id follows the winner', r.weekPlan.tripId === 'trip:newer', r.weekPlan.tripId);
 }
 
-group('selections follow the winning trip');
+group('the list follows the winning trip; the picks are not thrown away with it');
 {
-  // v21.2: the different-trip branch took the winner's line set but the *other* side's
-  // recipe picks, so the merged menu could describe a different week from the list.
+  /* v21.2 fixed a genuine incoherence here — the different-trip branch took the winner's
+     lines but the OTHER side's picks, so the menu described a different week from the
+     list. Its fix was to take the winner's picks, which cured the mismatch by deleting
+     somebody's choices.
+     v23.0 keeps the winner's LIST, because a trip is a generation of the list, and keeps
+     BOTH sides' picks, because a pick is authored and nobody's should vanish. The pairing
+     is then a superset rather than a mismatch, and the app reconciles it the way it
+     already reconciles any other edit to the picks: the list reads as stale and is
+     regenerated. The assertion at the end is the one that makes this coherent rather
+     than merely permissive. */
   const older = {
-    weekPlan: { selections: [{ recipeId: 'stale' }], generatedAt: T(1000), tripId: 'trip:old' },
+    weekPlan: { selections: [{ recipeId: 'stale', addedAt: T(900) }], generatedAt: T(1000), tripId: 'trip:old' },
     shoppingList: [line('milk')], neededList: [], lastUpdated: T(9000)   // newer lastUpdated
   };
   const newer = {
-    weekPlan: { selections: [{ recipeId: 'current' }], generatedAt: T(5000), tripId: 'trip:new' },
+    weekPlan: { selections: [{ recipeId: 'current', addedAt: T(4900) }], generatedAt: T(5000), tripId: 'trip:new' },
     shoppingList: [line('jam')], neededList: [], lastUpdated: T(2000)
   };
   const r = mergeShoppingData(older, newer);
-  ok('list comes from the newer trip', names(r).join() === 'jam', names(r));
-  ok('selections come from the same trip as the list',
-     r.weekPlan.selections.map(s => s.recipeId).join() === 'current',
+  ok('list comes from the newer trip, as it always did', names(r).join() === 'jam', names(r));
+  ok('but neither side loses the recipes it picked',
+     r.weekPlan.selections.map(s => s.recipeId).sort().join() === 'current,stale',
      r.weekPlan.selections.map(s => s.recipeId));
+
+  // And the mismatch does not just sit there: the list no longer matches the picks, so
+  // the app's existing staleness path takes over and regenerates.
+  setShoppingData(newer);
+  const signatureWhenGenerated = selectionsSignature();
+  const merged = Object.assign({}, r);
+  merged.weekPlan = Object.assign({}, r.weekPlan, { lastGeneratedSignature: signatureWhenGenerated });
+  setShoppingData(merged);
+  ok('and the list is marked stale, so the app reconciles instead of leaving a mismatch',
+     shoppingListIsStale() === true);
 }
 
 group('purity and convergence');
@@ -823,9 +850,12 @@ group('a recipe history badge does not call a plan a meal');
   ok('a recent plan is not stale',
      recipeHistoryLabel({lastPlanned: daysAgo(2)}).stale === false);
 
+  // daysAgo() reads the clock, so the two stamps must be the SAME value, not two calls
+  // that happen to land in the same millisecond. This passed by luck until it didn't.
+  const oneDayAgo = daysAgo(1);
   ok('the sort reads whichever stamp is fresher',
-     recipeHistoryTime({lastCooked: daysAgo(9), lastPlanned: daysAgo(1)}) ===
-     recipeHistoryTime({lastPlanned: daysAgo(1)}));
+     recipeHistoryTime({lastCooked: daysAgo(9), lastPlanned: oneDayAgo}) ===
+     recipeHistoryTime({lastPlanned: oneDayAgo}));
   ok('and a recipe with neither sorts first',
      recipeHistoryTime({}) === 0);
 }
@@ -928,18 +958,22 @@ group('a cleared week beats a copy that still holds the old one');
     neededList: [], lastUpdated: T(0)
   });
 
-  // What this phone holds after tapping "Clear all selections".
+  /* What this phone holds after tapping "Clear all selections". seenRemoteAt is how far
+     it had read the shared copy — v23.0 persists it into the file, and it is what proves
+     this device had actually seen the week it is clearing. */
   const cleared = () => {
     const before = oldWeek();
-    return { weekPlan: clearedWeekPlan(before, T(60000), 'phone-1', T(0)),
-             shoppingList: [], neededList: [], lastUpdated: T(60000) };
+    // Read the shared copy 5 minutes after that week was written, then cleared a minute
+    // later. Comfortably outside MERGE_GRACE_MS, which is what a real gap looks like.
+    return { weekPlan: clearedWeekPlan(before, T(6*60*1000), 'phone-1', T(5*60*1000)),
+             shoppingList: [], neededList: [], lastUpdated: T(6*60*1000), seenRemoteAt: T(5*60*1000) };
   };
 
   ok('the cleared week keeps an identity of its own', !!tripIdOf(cleared()));
   ok('and names the week it is replacing',
      cleared().weekPlan.supersedes === 'trip:old');
   ok('and carries a real generatedAt, not null',
-     cleared().weekPlan.generatedAt === T(60000));
+     cleared().weekPlan.generatedAt === T(6*60*1000));
   ok('a finished shop does not come back with it',
      cleared().weekPlan.shoppingDoneAt === null);
 
@@ -958,8 +992,8 @@ group('a cleared week beats a copy that still holds the old one');
 group('and it beats every shape of copy the household can be holding');
 {
   const clearedAgainst = other => {
-    const c = { weekPlan: clearedWeekPlan(other, T(60000), 'phone-1', T(0)),
-                shoppingList: [], neededList: [], lastUpdated: T(60000) };
+    const c = { weekPlan: clearedWeekPlan(other, T(6*60*1000), 'phone-1', T(5*60*1000)),
+                shoppingList: [], neededList: [], lastUpdated: T(6*60*1000), seenRemoteAt: T(5*60*1000) };
     return [mergeShoppingData(c, other), mergeShoppingData(other, c)];
   };
 
@@ -1095,6 +1129,104 @@ group('the last-contact line reports what actually happened');
      /3 days ago/.test(lastContactText(at(3*24*60*60*1000), NOW)), lastContactText(at(3*24*60*60*1000), NOW));
   ok('and rubbish in does not produce a confident answer',
      /never/.test(lastContactText('not a date', NOW)));
+}
+
+group('the grace window is what stops a fresh addition being read as a deletion');
+{
+  const NOW = 10*60*1000;
+  const other = { weekPlan:{ tripId:'t', generatedAt:T(0), selections:[] },
+                  shoppingList:[], neededList:[], lastUpdated:T(NOW), seenRemoteAt:T(NOW) };
+  const mineWith = addedAt => ({
+    weekPlan:{ tripId:'t', generatedAt:T(0), selections:[] },
+    shoppingList:[], neededList:[{id:'n1', text:'shampoo', addedAt: addedAt, done:false}],
+    lastUpdated:T(NOW+1000), seenRemoteAt:T(0) });
+
+  ok('an entry added well before the other side last read is a deletion',
+     mergeShoppingData(mineWith(T(NOW - 5*60*1000)), other).neededList.length === 0);
+  ok('an entry added inside the grace window is kept — they may not have seen it yet',
+     mergeShoppingData(mineWith(T(NOW - 10*1000)), other).neededList.length === 1);
+  ok('and one added after they last read is certainly kept',
+     mergeShoppingData(mineWith(T(NOW + 500)), other).neededList.length === 1);
+  ok('a device that has never read the shared copy cannot delete anything',
+     mergeShoppingData(Object.assign({}, other, { seenRemoteAt: null }),
+                       mineWith(T(NOW - 5*60*1000))).neededList.length === 1);
+}
+
+group('one rule, the same answer whichever collection you touched');
+{
+  /* The whole point of v23.0: a person cannot be expected to know which of seven merge
+     rules applied to the thing they just tapped. These assert the SAME outcomes for a
+     recipe pick and a Wait List entry, side by side, because that is the contract. */
+  const HOUR = 60*60*1000;
+  const away = { weekPlan:{ tripId:'t', generatedAt:T(0),
+                   selections:[{recipeId:'mine', addedAt:T(3*HOUR), changedAt:T(3*HOUR)}] },
+                 shoppingList:[], neededList:[{id:'n-mine', text:'shampoo', addedAt:T(3*HOUR), done:false}],
+                 lastUpdated:T(3*HOUR), seenRemoteAt:T(0) };            // last read hours ago
+  const home = { weekPlan:{ tripId:'t', generatedAt:T(0),
+                   selections:[{recipeId:'theirs', addedAt:T(2*HOUR), changedAt:T(2*HOUR)}] },
+                 shoppingList:[], neededList:[{id:'n-theirs', text:'bread', addedAt:T(2*HOUR), done:false}],
+                 lastUpdated:T(2*HOUR), seenRemoteAt:T(HOUR) };
+
+  [ ['a recipe picked on a phone that was out of contact', away, home],
+    ['the same, merged the other way round',                home, away] ].forEach(([what, x, y])=>{
+    const r = mergeShoppingData(x, y);
+    const picks = r.weekPlan.selections.map(s=>s.recipeId).sort().join();
+    const wait  = r.neededList.map(n=>n.id).sort().join();
+    ok(what + ': both picks survive', picks === 'mine,theirs', picks);
+    ok(what + ': and both Wait List items survive', wait === 'n-mine,n-theirs', wait);
+  });
+
+  // A deletion the other side demonstrably saw is honoured, in both collections alike.
+  const sawEverything = Object.assign({}, home, { seenRemoteAt: T(5*HOUR), lastUpdated: T(5*HOUR) });
+  const r2 = mergeShoppingData(away, sawEverything);
+  ok('a pick the other side saw and dropped stays dropped',
+     r2.weekPlan.selections.map(s=>s.recipeId).join() === 'theirs',
+     r2.weekPlan.selections.map(s=>s.recipeId));
+  ok('and a Wait List item behaves identically',
+     r2.neededList.map(n=>n.id).join() === 'n-theirs', r2.neededList.map(n=>n.id));
+
+  // Same item edited on both sides: the later edit wins, per field, in both collections.
+  const mk = (servings, at, done) => ({
+    weekPlan:{ tripId:'t', generatedAt:T(0),
+               selections:[{recipeId:'r', servings:servings, addedAt:T(0), changedAt:at}] },
+    shoppingList:[], neededList:[{id:'n', text:'x', addedAt:T(0), done:done, changedAt:at}],
+    lastUpdated:at, seenRemoteAt:T(0) });
+  const later = mergeShoppingData(mk(4, T(HOUR), false), mk(8, T(2*HOUR), true));
+  ok('the later edit to a pick wins', later.weekPlan.selections[0].servings === 8);
+  ok('and the later edit to a Wait List entry wins', later.neededList[0].done === true);
+  ok('whichever way round it merges',
+     mergeShoppingData(mk(8, T(2*HOUR), true), mk(4, T(HOUR), false)).weekPlan.selections[0].servings === 8);
+
+  // Purity and convergence, which the old wholesale rules could not offer.
+  const a1 = JSON.stringify(away), h1 = JSON.stringify(home);
+  const ab = mergeShoppingData(away, home), ba = mergeShoppingData(home, away);
+  ok('the merge mutates neither input',
+     JSON.stringify(away) === a1 && JSON.stringify(home) === h1);
+  ok('and the two orders agree exactly',
+     JSON.stringify(ab.weekPlan.selections) === JSON.stringify(ba.weekPlan.selections)
+     && JSON.stringify(ab.neededList) === JSON.stringify(ba.neededList));
+}
+
+group('a phone that reconnects is told what changed');
+{
+  const before = { weekPlan:{ selections:[{recipeId:'a'}] }, shoppingList:[], neededList:[] };
+  const after  = { weekPlan:{ selections:[{recipeId:'a'},{recipeId:'b'}] },
+                   shoppingList:[{ingredientName:'Milk', checked:true}],
+                   neededList:[{id:'n1'}] };
+  const d = describeMerge(before, after);
+  ok('it counts what arrived', d.picksArrived === 1 && d.waitArrived === 1 && d.ticksArrived === 1, d);
+  ok('and knows something happened', d.changed === true);
+  const line = mergeReport(d);
+  ok('and says so in one sentence',
+     /1 recipe added to the week/.test(line) && /1 Wait List item added/.test(line)
+     && /1 item ticked off/.test(line), line);
+
+  const quiet = describeMerge(before, before);
+  ok('an unchanged merge reports nothing', quiet.changed === false && mergeReport(quiet) === null);
+  ok('plurals read properly',
+     /2 recipes added/.test(mergeReport({changed:true, picksArrived:2})), mergeReport({changed:true, picksArrived:2}));
+  ok('and a removal is reported as a removal',
+     /1 recipe taken off the week/.test(mergeReport({changed:true, picksRemoved:1})));
 }
 
 /* ---------- result ---------- */
