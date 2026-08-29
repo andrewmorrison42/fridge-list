@@ -75,7 +75,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripHasProgress', 'tripIsLiv
                'daysSincePlanned', 'migrateCookedStamps',
                'picksFromTrip', 'summarisePickNames',
                'aisleOrderFromHistory', 'compareAisles',
-               'cookRateSummary', 'atHomeStreaks', 'clearedWeekPlan'];
+               'cookRateSummary', 'atHomeStreaks', 'clearedWeekPlan',
+               'syncAlertState', 'lastContactText'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -90,6 +91,8 @@ vm.runInContext(
   extractConst('SHARE_MARKER') + '\n' +
   extractConst('APP_VERSION') + '\n' +
   extractConst('TRIP_HISTORY_MAX') + '\n' +
+  extractConst('SYNC_STALE_MS') + '\n' +
+  extractConst('SYNC_UNLINKED_GRACE_MS') + '\n' +
   extractConst('AISLE_ORDER_TRIPS') + '\n' +
   extractConst('AISLE_ORDER_MIN_SIGHTINGS') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
@@ -102,6 +105,7 @@ vm.runInContext(
   '             picksFromTrip, summarisePickNames,' +
   '             aisleOrderFromHistory, compareAisles, AISLE_ORDER_MIN_SIGHTINGS, AISLE_ORDER_TRIPS,' +
   '             cookRateSummary, atHomeStreaks, clearedWeekPlan,' +
+  '             syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -115,6 +119,7 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         picksFromTrip, summarisePickNames,
         aisleOrderFromHistory, compareAisles, AISLE_ORDER_MIN_SIGHTINGS, AISLE_ORDER_TRIPS,
         cookRateSummary, atHomeStreaks, clearedWeekPlan,
+        syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -1132,6 +1137,77 @@ group('the clear does not disturb anything it was not asked to');
   clearedWeekPlan(other, T(60000), 'phone-1', T(0));
   ok('and building the replacement mutates nothing',
      JSON.stringify(other) === before);
+}
+
+/* ---------- v22.2: a phone that is not synced has to say so ---------- */
+
+group('a phone with nowhere to sync to is told, in as many words');
+{
+  const NOW = Date.parse('2026-08-29T12:00:00Z');
+  const state = o => syncAlertState(Object.assign(
+    { backend: null, signedIn: false, lastWriteError: null, pendingSince: null,
+      seenRemoteAt: null, startedAt: NOW - 60000, now: NOW }, o || {}));
+
+  const unlinked = state();
+  ok('an unconnected phone raises the alarm', unlinked && unlinked.kind === 'unlinked', unlinked);
+  ok('and says what it costs, which is the whole point',
+     /stays on this phone/i.test(unlinked.hint) && /nobody else will see it/i.test(unlinked.hint),
+     unlinked.hint);
+  ok('and says it has never reached the folder',
+     /never/i.test(unlinked.last), unlinked.last);
+  ok('and offers the way out', !!unlinked.action, unlinked);
+
+  ok('a phone still starting up is not accused',
+     state({ startedAt: NOW - 1000 }) === null);
+  ok('but it is, once startup has had its chance',
+     state({ startedAt: NOW - SYNC_UNLINKED_GRACE_MS - 1 }).kind === 'unlinked');
+
+  ok('a healthy OneDrive phone is left alone',
+     state({ backend: 'onedrive', signedIn: true }) === null);
+  ok('and so is a desktop on a shared folder',
+     state({ backend: 'folder' }) === null);
+}
+
+group('signed in once, signed out now, and idle, is not silent either');
+{
+  const NOW = Date.parse('2026-08-29T12:00:00Z');
+  const st = syncAlertState({ backend: 'onedrive', signedIn: false, lastWriteError: null,
+                              pendingSince: null, seenRemoteAt: null,
+                              startedAt: NOW - 60000, now: NOW });
+  ok('an expired sign-in is reported with nothing pending', st && st.kind === 'signedout', st);
+  ok('and carries the same consequence', /stays on this phone/i.test(st.hint));
+}
+
+group('the more serious problem is the one that gets shown');
+{
+  const NOW = Date.parse('2026-08-29T12:00:00Z');
+  const base = { backend: null, signedIn: false, lastWriteError: null, pendingSince: null,
+                 seenRemoteAt: null, startedAt: NOW - 60000, now: NOW };
+  const with_ = o => syncAlertState(Object.assign({}, base, o));
+
+  ok('a failed write outranks everything, and is never delayed by the grace period',
+     with_({ lastWriteError: {status:507, name:'x'}, startedAt: NOW }).kind === 'error');
+  ok('being unconnected outranks having changes pending',
+     with_({ pendingSince: NOW - SYNC_STALE_MS - 1 }).kind === 'unlinked');
+  ok('and a connected phone with stale changes still gets the old warning',
+     with_({ backend:'onedrive', signedIn:true, pendingSince: NOW - SYNC_STALE_MS - 1 }).kind === 'pending');
+  ok('a connected phone with recent changes gets nothing',
+     with_({ backend:'onedrive', signedIn:true, pendingSince: NOW - 1000 }) === null);
+}
+
+group('the last-contact line reports what actually happened');
+{
+  const NOW = Date.parse('2026-08-29T12:00:00Z');
+  const at = ms => new Date(NOW - ms).toISOString();
+  ok('never is said plainly', /never/.test(lastContactText(null, NOW)));
+  ok('and a device that has reached it says when',
+     /2 hours ago/.test(lastContactText(at(2*60*60*1000), NOW)), lastContactText(at(2*60*60*1000), NOW));
+  ok('minutes are singular where they should be',
+     /1 minute ago/.test(lastContactText(at(60000), NOW)), lastContactText(at(60000), NOW));
+  ok('a long gap rolls up to days',
+     /3 days ago/.test(lastContactText(at(3*24*60*60*1000), NOW)), lastContactText(at(3*24*60*60*1000), NOW));
+  ok('and rubbish in does not produce a confident answer',
+     /never/.test(lastContactText('not a date', NOW)));
 }
 
 /* ---------- result ---------- */

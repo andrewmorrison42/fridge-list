@@ -210,6 +210,11 @@ footer.actions{position:sticky;bottom:0;background:var(--bg);border-top:1px soli
 .sync-alert.pending{background:#f0c98a;color:#4a3208;}
 .sync-alert strong{display:block;font-size:.95rem;margin-bottom:2px;}
 .sync-alert .hint{opacity:.9;font-size:.82rem;}
+.sync-alert .hint.last{display:block;margin-top:3px;opacity:1;font-weight:600;}
+.sync-alert .alert-actions{display:flex;gap:8px;margin-top:9px;flex-wrap:wrap;}
+.sync-alert .alert-btn{font:inherit;font-size:.82rem;font-weight:600;padding:7px 13px;min-height:34px;
+   border:none;border-radius:7px;cursor:pointer;background:#fff;color:#7d2b2b;}
+.sync-alert .alert-btn.quiet{background:transparent;color:#fff;font-weight:500;border:1px solid rgba(255,255,255,.55);}
 /* A card that is telling you something has happened, or is about to. */
 .notice-card{border-left:4px solid var(--warn);}
 /* Anything switched off has to LOOK switched off, or the app just seems broken —
@@ -335,7 +340,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v22.1';
+const APP_VERSION = 'v22.2';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -400,6 +405,12 @@ let syncPendingSince = null;        // ms timestamp of the oldest unsaved local 
 let lastSyncOkAt = null;            // ms timestamp of the last successful write
 let syncAlertTimer = null;
 const SYNC_STALE_MS = 5*60*1000;    // unsaved for this long with no error = amber warning
+/* How long to let startup settle before accusing a device of being disconnected.
+   tryReconnectFolder() and initMsal() are both async, so a phone that is a second away
+   from connecting must not be told it is on its own. */
+const SYNC_UNLINKED_GRACE_MS = 12000;
+let appStartedAt = Date.now();
+let syncAlertMuted = null;          // "Not now", for this session only — never persisted
 
 /* ---- v20 trolley-screen state ---- */
 let hideTickedItems = false;
@@ -674,7 +685,19 @@ function init(){
     initMsal();
   }
   render();
-  setStatus('Loaded ' + recipesData.recipes.length + ' recipes (app ' + APP_VERSION + '). Working from this device’s local copy.', 'ok');
+  /* "Working from this device's local copy" was said in green whether or not the device
+     had anywhere to sync to. On a connected phone OneDrive overwrites it seconds later;
+     on an unconnected one it just sits there looking like good news. Same sentence, two
+     opposite meanings, told apart only by waiting. */
+  const backend = syncBackend();
+  setStatus('Loaded ' + recipesData.recipes.length + ' recipes (app ' + APP_VERSION + '). '
+    + (backend ? 'Checking the family folder…'
+              : 'Not connected — anything you add stays on this phone.'),
+    backend ? 'ok' : 'warn');
+  renderSyncAlert();
+  // One shot once startup has had its chance, so an unconnected phone is told without
+  // having to wait for the 60-second sweep.
+  setTimeout(renderSyncAlert, SYNC_UNLINKED_GRACE_MS + 500);
 }
 
 // A failed local save must never abort whatever the user was doing. Report it
@@ -732,28 +755,108 @@ function writeErrorMessage(status, name){
   }
 }
 
+/* What this device is CONFIGURED to sync through — not the same question as whether it
+   has managed to reach it. A folder handle resolves asynchronously at startup, so the
+   stored flag is what separates "never set up" from "still connecting". */
+function syncBackend(){
+  if(localStorage.getItem(LS_ONEDRIVE_FLAG) === '1') return 'onedrive';
+  if(dirHandle || localStorage.getItem(LS_HANDLE_FLAG) === '1') return 'folder';
+  return null;
+}
+
+/* Pure. Reads only what it is handed, so the wording — which is the entire feature here —
+   can be asserted without a browser.
+
+   v22.2. Until now this banner had two cases, a failed write and changes pending too
+   long, and the pending one runs off syncPendingSince, which persist() sets only when
+   the OneDrive flag is on. So a phone that had never signed in never set the flag, never
+   marked anything pending, and got no warning at all — ever. The one device that most
+   needed telling was the only one that could not be told, which is how two people spent
+   an evening picking a week that reached nobody. */
+function syncAlertState(s){
+  const now = s.now || Date.now();
+  if(s.lastWriteError) return { kind: 'error', writeError: s.lastWriteError };
+
+  // Don't accuse a device that is still starting up.
+  const settled = (now - (s.startedAt || 0)) > (s.graceMs || SYNC_UNLINKED_GRACE_MS);
+  const consequence = 'Anything you add here stays on this phone. Nobody else will see it, '
+                    + 'and what they add will not reach you.';
+  if(settled && !s.backend){
+    return { kind: 'unlinked',
+             head: 'This phone is not connected to the family’s list.',
+             hint: consequence,
+             last: lastContactText(s.seenRemoteAt, now),
+             action: 'Connect this phone' };
+  }
+  if(settled && s.backend === 'onedrive' && !s.signedIn){
+    return { kind: 'signedout',
+             head: 'OneDrive sign-in has expired on this phone.',
+             hint: consequence,
+             last: lastContactText(s.seenRemoteAt, now),
+             action: 'Sign in again' };
+  }
+  if(s.pendingSince && (now - s.pendingSince) > (s.staleMs || SYNC_STALE_MS)){
+    const mins = Math.round((now - s.pendingSince)/60000);
+    return { kind: 'pending',
+             head: 'Changes have not reached OneDrive for ' + mins + ' minutes.',
+             hint: 'They are saved on this device. Other devices will not see them yet.' };
+  }
+  return null;
+}
+
+/* Pure. shoppingSeenRemoteAt advances only when a remote copy is actually read, so this
+   line cannot flatter a device that has never managed it. "never" is the word that makes
+   somebody stop. */
+function lastContactText(seenRemoteAt, now){
+  const t = tsOf(seenRemoteAt);
+  if(!t) return 'Last reached the family folder: never.';
+  const mins = Math.round(((now || Date.now()) - t) / 60000);
+  if(mins < 1)  return 'Last reached the family folder: moments ago.';
+  if(mins < 60) return 'Last reached the family folder: ' + mins + ' minute' + (mins===1?'':'s') + ' ago.';
+  const hrs = Math.round(mins / 60);
+  if(hrs < 48)  return 'Last reached the family folder: ' + hrs + ' hour' + (hrs===1?'':'s') + ' ago.';
+  const days = Math.round(hrs / 24);
+  return 'Last reached the family folder: ' + days + ' day' + (days===1?'':'s') + ' ago.';
+}
+
 function renderSyncAlert(){
   const box = document.getElementById('syncAlert');
   if(!box) return;
-  if(lastWriteError){
-    const [head, hint] = writeErrorMessage(lastWriteError.status, lastWriteError.name);
-    box.className = 'sync-alert no-print err';
-    box.innerHTML = '';
-    box.appendChild(el('strong',{},[head]));
-    box.appendChild(el('span',{class:'hint'},[hint]));
-    box.hidden = false;
-    return;
+  const st = syncAlertState({
+    backend: syncBackend(),
+    signedIn: !!msalAccount,
+    lastWriteError: lastWriteError,
+    pendingSince: syncPendingSince,
+    seenRemoteAt: shoppingSeenRemoteAt,
+    startedAt: appStartedAt,
+    now: Date.now()
+  });
+  // A write failure is never silenced. Everything else can be put aside for the session:
+  // local-only use is legitimate, but the mute is never persisted, so a family phone that
+  // waved this away today is told again tomorrow.
+  if(!st || (st.kind !== 'error' && syncAlertMuted === st.kind)){ box.hidden = true; return; }
+
+  let head = st.head, hint = st.hint;
+  if(st.kind === 'error'){
+    const m = writeErrorMessage(st.writeError.status, st.writeError.name);
+    head = m[0]; hint = m[1];
   }
-  if(syncPendingSince && (Date.now() - syncPendingSince) > SYNC_STALE_MS){
-    const mins = Math.round((Date.now() - syncPendingSince)/60000);
-    box.className = 'sync-alert no-print pending';
-    box.innerHTML = '';
-    box.appendChild(el('strong',{},['Changes have not reached OneDrive for ' + mins + ' minutes.']));
-    box.appendChild(el('span',{class:'hint'},['They are saved on this device. Other devices will not see them yet.']));
-    box.hidden = false;
-    return;
+  box.className = 'sync-alert no-print ' + (st.kind === 'pending' ? 'pending' : 'err');
+  box.innerHTML = '';
+  box.appendChild(el('strong',{},[head]));
+  box.appendChild(el('span',{class:'hint'},[hint]));
+  if(st.last) box.appendChild(el('span',{class:'hint last'},[st.last]));
+  if(st.action){
+    const actions = el('div',{class:'alert-actions'});
+    const go = el('button',{class:'alert-btn'},[st.action]);
+    go.addEventListener('click', showSyncModal);   // the fix, where the complaint is
+    actions.appendChild(go);
+    const later = el('button',{class:'alert-btn quiet'},['Not now']);
+    later.addEventListener('click', ()=>{ syncAlertMuted = st.kind; renderSyncAlert(); });
+    actions.appendChild(later);
+    box.appendChild(actions);
   }
-  box.hidden = true;
+  box.hidden = false;
 }
 
 function markSyncPending(){

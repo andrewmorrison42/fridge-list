@@ -91,6 +91,13 @@ version history**, which covers every change the app has ever saved — not only
 deletions. See
 [Getting things back when something goes wrong](docs/SETUP-use-the-app.md#getting-things-back-when-something-goes-wrong).
 
+## Why can't the others see what I added?
+
+Almost always because that phone is not connected to the shared folder. From **v22.2** it
+says so itself: a red bar across the top reading *"This phone is not connected to the
+family's list"*, with a button that takes you straight to sign-in. If you see that bar,
+nothing you add is reaching anyone else until you connect it.
+
 ## Which version am I on?
 
 The build number shows at the top of the **Settings** tab, and in the startup message
