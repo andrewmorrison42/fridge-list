@@ -76,6 +76,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripHasProgress', 'tripIsLiv
                'cookRateSummary', 'atHomeStreaks', 'clearedWeekPlan',
                'mergeAuthored', 'resolveAuthoredItem', 'otherSideDropped',
                'effectiveAddedAt', 'authoredHorizons', 'describeMerge', 'mergeReport',
+               'lastAuthoredAt', 'noteRemoved', 'mergeTombstones', 'pruneTombstones',
+               'backfillAuthoredStamps',
                'syncAlertState', 'lastContactText'];
 
 const sandbox = { console };
@@ -93,6 +95,8 @@ vm.runInContext(
   extractConst('TRIP_HISTORY_MAX') + '\n' +
   extractConst('SYNC_STALE_MS') + '\n' +
   extractConst('MERGE_GRACE_MS') + '\n' +
+  extractConst('TOMBSTONE_MAX_AGE_MS') + '\n' +
+  extractConst('TOMBSTONE_MAX') + '\n' +
   extractConst('SELECTION_FIELDS') + '\n' +
   extractConst('WAITLIST_FIELDS') + '\n' +
   extractConst('SYNC_UNLINKED_GRACE_MS') + '\n' +
@@ -106,6 +110,8 @@ vm.runInContext(
   '             cookRateSummary, atHomeStreaks, clearedWeekPlan,' +
   '             mergeAuthored, otherSideDropped, MERGE_GRACE_MS, SELECTION_FIELDS, WAITLIST_FIELDS,' +
   '             describeMerge, mergeReport,' +
+  '             noteRemoved, mergeTombstones, pruneTombstones, lastAuthoredAt, TOMBSTONE_MAX_AGE_MS,' +
+  '             backfillAuthoredStamps,' +
   '             syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
@@ -120,6 +126,8 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         cookRateSummary, atHomeStreaks, clearedWeekPlan,
         mergeAuthored, otherSideDropped, MERGE_GRACE_MS, SELECTION_FIELDS, WAITLIST_FIELDS,
         describeMerge, mergeReport,
+        noteRemoved, mergeTombstones, pruneTombstones, lastAuthoredAt, TOMBSTONE_MAX_AGE_MS,
+        backfillAuthoredStamps,
         syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,
         setShoppingData, setRecipesData } = sandbox.api;
 
@@ -1279,6 +1287,148 @@ group('the knowledge horizon is this device’s, and the merge never adopts anot
   ok('but the same deletion is NOT honoured once that horizon has regressed',
      mergeShoppingData(Object.assign({}, deleter, { seenRemoteAt: T(0) }), holder)
        .neededList.length === 1);
+}
+
+group('a deletion sticks because it was recorded, not because it was inferred');
+{
+  /* Reported on v23.1: clear the week and the picks come back within a poll. Two defects
+     behind it, both introduced by v23.0's decision to infer deletions from timestamps.
+
+     A. Items made before v23.0 carry no addedAt, so effectiveAddedAt falls back to the
+        file's lastUpdated — which saveShoppingLocal bumps on EVERY save. A pick made a
+        week ago, in a file saved seconds ago, presents as seconds old and can never be
+        shown to have been seen. Permanently undeletable; waiting does not help.
+     B. Any removal within roughly 110s of the addition fails the same test, on all three
+        deletion paths.
+
+     A recorded removal answers both, because it never consults addedAt at all. */
+  const DAY = 86400*1000, S = 1000;
+  const pick = (id, addedAt) => addedAt ? {recipeId:id, servings:4, addedAt:addedAt, changedAt:addedAt}
+                                        : {recipeId:id, servings:4};      // pre-v23.0 shape
+  const held = (picks, lastUpdated) => ({
+    weekPlan:{ tripId:'trip:old', generatedAt:T(-7*DAY), selections:picks },
+    shoppingList:[], neededList:[], lastUpdated:lastUpdated, seenRemoteAt:T(-DAY) });
+  const cleared = (removedIds, at) => ({
+    weekPlan:{ tripId:'trip:new', generatedAt:at, supersedes:'trip:old', selections:[],
+               selectionsRemoved: removedIds.reduce((m,id)=>{ m[id]=at; return m; }, {}) },
+    shoppingList:[], neededList:[], lastUpdated:at, seenRemoteAt:T(-60*S) });
+
+  // Defect A, exactly as reported: a week untouched, then a clear that will not stick.
+  const legacy = [pick('r1'), pick('r2'), pick('r3')];
+  const both = (a,b) => [mergeShoppingData(a,b), mergeShoppingData(b,a)];
+  both(cleared(['r1','r2','r3'], T(0)), held(legacy, T(-5*S))).forEach((m,i)=>{
+    ok('a week-old pick with no addedAt, in a freshly-saved file, stays cleared [' + i + ']',
+       m.weekPlan.selections.length === 0, m.weekPlan.selections);
+  });
+
+  // Defect B: the same, at every delay that used to matter.
+  [10*S, 60*S, 110*S, DAY].forEach(delay=>{
+    const picks = [pick('r1', T(0)), pick('r2', T(0))];
+    const m = mergeShoppingData(cleared(['r1','r2'], T(delay)), held(picks, T(S)));
+    ok('cleared ' + Math.round(delay/1000) + 's after picking, and it stays cleared',
+       m.weekPlan.selections.length === 0, m.weekPlan.selections);
+  });
+
+  // Removing ONE pick sticks too — the path a per-collection watermark would have missed.
+  {
+    const keep = pick('keep', T(0)), drop = pick('drop', T(0));
+    const after = { weekPlan:{ tripId:'trip:old', generatedAt:T(0), selections:[keep],
+                               selectionsRemoved:{ drop: T(30*S) } },
+                    shoppingList:[], neededList:[], lastUpdated:T(30*S), seenRemoteAt:T(0) };
+    const ids = mergeShoppingData(after, held([keep, drop], T(S)))
+                  .weekPlan.selections.map(x=>x.recipeId);
+    ok('removing a single pick 30s after choosing it sticks',
+       ids.join() === 'keep', ids);
+  }
+
+  // A removal must not outrank a later re-add, or a recipe could never be picked again.
+  {
+    const readded = { weekPlan:{ tripId:'t', generatedAt:T(0),
+                                 selections:[pick('r1', T(60*S))],
+                                 selectionsRemoved:{ r1: T(30*S) } },
+                      shoppingList:[], neededList:[], lastUpdated:T(60*S), seenRemoteAt:T(0) };
+    ok('re-adding after a removal wins, because the re-add is later',
+       mergeShoppingData(readded, held([pick('r1', T(0))], T(S)))
+         .weekPlan.selections.length === 1);
+  }
+
+  // And a tombstone must not reach across to something the other phone added afterwards.
+  {
+    const clearedEarly = cleared(['r1'], T(10*S));
+    const addedLater = held([pick('r1', T(300*S))], T(300*S));
+    ok('a removal does not delete an addition made after it',
+       mergeShoppingData(clearedEarly, addedLater).weekPlan.selections.length === 1);
+  }
+
+  // The Wait List behaves identically — one rule, still.
+  {
+    const entry = { id:'n1', text:'shampoo', addedAt:T(0), done:false };
+    const holder = { weekPlan:{tripId:'t',generatedAt:T(0),selections:[]},
+                     shoppingList:[], neededList:[entry], lastUpdated:T(S), seenRemoteAt:T(0) };
+    const emptied = { weekPlan:{tripId:'t',generatedAt:T(0),selections:[]},
+                      shoppingList:[], neededList:[], neededRemoved:{ n1: T(30*S) },
+                      lastUpdated:T(30*S), seenRemoteAt:T(0) };
+    ok('clearing the Wait List 30s after adding to it sticks',
+       mergeShoppingData(emptied, holder).neededList.length === 0);
+  }
+
+  // The record itself has to survive the merge, or it only works once.
+  {
+    const m = mergeShoppingData(cleared(['r1'], T(0)), held([pick('r1', T(-DAY))], T(-DAY)));
+    ok('and the record of the removal is carried into the merged copy',
+       !!(m.weekPlan.selectionsRemoved && m.weekPlan.selectionsRemoved.r1),
+       m.weekPlan.selectionsRemoved);
+  }
+}
+
+group('the record of a removal is itself well behaved');
+{
+  const DAY = 86400*1000;
+  ok('a removal is stamped', noteRemoved({}, ['a'], T(0)).a === T(0));
+  ok('a later removal of the same thing replaces the earlier',
+     noteRemoved({a: T(0)}, ['a'], T(1000)).a === T(1000));
+  ok('and an earlier one does not', noteRemoved({a: T(1000)}, ['a'], T(0)).a === T(1000));
+  ok('noteRemoved does not mutate what it is given',
+     (()=>{ const m={}; noteRemoved(m,['a'],T(0)); return Object.keys(m).length===0; })());
+
+  const merged = mergeTombstones({a:T(0), b:T(5000)}, {b:T(9000), c:T(0)}, T(9000));
+  ok('two records merge, later stamp winning',
+     merged.a===T(0) && merged.b===T(9000) && merged.c===T(0), merged);
+  ok('and the merge is order-independent',
+     JSON.stringify(mergeTombstones({b:T(9000)}, {b:T(5000)}, T(9000)))
+     === JSON.stringify(mergeTombstones({b:T(5000)}, {b:T(9000)}, T(9000))));
+
+  const old = { ancient: T(-90*DAY), recent: T(-1*DAY) };
+  const pruned = pruneTombstones(old, T(0));
+  ok('a record too old to matter is dropped', pruned.ancient === undefined, pruned);
+  ok('and a recent one is kept', pruned.recent === T(-1*DAY));
+
+  ok('a legacy item with no stamps reads as authored at the dawn of time, so any record beats it',
+     lastAuthoredAt({recipeId:'r'}) === 0);
+  ok('and an edited item reads by its changedAt',
+     lastAuthoredAt({addedAt:T(0), changedAt:T(5000)}) === Date.parse(T(5000)));
+}
+
+group('legacy items get a creation time that stops moving');
+{
+  const sd = { weekPlan:{ selections:[{recipeId:'r1'}, {recipeId:'r2', addedAt:T(0)}] },
+               neededList:[{id:'n1', text:'x'}], lastUpdated:T(5000) };
+  backfillAuthoredStamps(sd);
+  ok('an unstamped pick is stamped with the file it arrived in',
+     sd.weekPlan.selections[0].addedAt === T(5000));
+  ok('one that already had a stamp is left alone',
+     sd.weekPlan.selections[1].addedAt === T(0));
+  ok('and the Wait List is treated the same', sd.neededList[0].addedAt === T(5000));
+
+  // The point of it: a second pass with a newer lastUpdated must NOT move the stamp on.
+  sd.lastUpdated = T(999999);
+  backfillAuthoredStamps(sd);
+  ok('a later save does not push the stamp forward — that was the bug',
+     sd.weekPlan.selections[0].addedAt === T(5000));
+
+  ok('a file with no lastUpdated is left alone rather than guessed at',
+     backfillAuthoredStamps({ weekPlan:{selections:[{recipeId:'r'}]}, neededList:[] })
+       .weekPlan.selections[0].addedAt === undefined);
 }
 
 /* ---------- result ---------- */

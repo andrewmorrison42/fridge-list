@@ -340,7 +340,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v23.1';
+const APP_VERSION = 'v23.2';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -671,6 +671,7 @@ function init(){
   recipesData = migrateIngredientsIfStale(recipesData, seedRecipes);
   imagesData = seedImages || {};
   shoppingData = lsS ? JSON.parse(lsS) : defaultShoppingData();
+  backfillAuthoredStamps(shoppingData);   // freeze legacy creation times before anything saves
   // Pick the horizon back up from the saved copy — this is the point of persisting it.
   shoppingSeenRemoteAt = shoppingData.seenRemoteAt || null;
   saveRecipesLocal();
@@ -1638,12 +1639,80 @@ function resolveAuthoredItem(x, y, fields){
   return m;
 }
 
+/* ---- v23.2: a deletion is recorded, not inferred ----
+
+   v23.0 decided deletions by inference — an item on only one side was dropped only if its
+   addedAt was comfortably older than this device's horizon. That was wrong twice over.
+
+   Items written before v23.0 carry no addedAt, so effectiveAddedAt fell back to the file's
+   lastUpdated — which saveShoppingLocal bumps on EVERY save. A pick made a week ago, in a
+   file saved ten seconds ago, presented as ten seconds old and could never be shown to
+   have been seen. It was permanently undeletable, and waiting did not help: the reported
+   bug, where a week nobody had touched would not clear.
+
+   And any removal within roughly 110 seconds of the addition failed the same test, on
+   every deletion path, because the horizon trails the poll and the grace window is 90s.
+
+   A removal now leaves a record. The merge honours it because it can see one, rather than
+   guessing from timestamps — which also keeps the "keep when in doubt" bias, since an item
+   is only ever dropped on positive evidence.
+
+   Tombstones were declined in v21.x on three grounds: file shape, a purge window, and code
+   in the delicate function. All three are cheaper now — the map is an additive sibling
+   field that older builds ignore, mergeAuthored is a single chokepoint rather than three
+   ad-hoc rules, and a pruned tombstone degrades to exactly the old behaviour, so pruning
+   cannot regress anything. */
+
+const TOMBSTONE_MAX_AGE_MS = 60*24*60*60*1000;   // a device offline longer is past helping
+const TOMBSTONE_MAX = 500;
+
+// Pure. The moment an item was last authored. Legacy items have neither stamp and so read
+// as 0, which is the point: any recorded removal outranks them.
+function lastAuthoredAt(item){
+  return tsOf(item && item.changedAt) || tsOf(item && item.addedAt) || 0;
+}
+
+// Pure. Stamp a removal against each id, keeping any later stamp already there.
+function noteRemoved(map, ids, now){
+  const out = Object.assign({}, map || {});
+  (ids || []).forEach(id=>{
+    if(id == null) return;
+    if(tsOf(now) >= tsOf(out[id])) out[id] = now;
+  });
+  return out;
+}
+
+// Pure. Union of two tombstone maps, later stamp winning, then pruned.
+function mergeTombstones(a, b, now){
+  const out = Object.assign({}, a || {});
+  Object.keys(b || {}).forEach(id=>{
+    if(tsOf(b[id]) > tsOf(out[id])) out[id] = b[id];
+  });
+  return pruneTombstones(out, now);
+}
+
+/* Pure. Drop what is too old to matter and cap the rest, newest kept. A tombstone that has
+   been pruned simply stops being evidence, which returns that item to the pre-v23.2
+   behaviour rather than doing anything worse. */
+function pruneTombstones(map, now){
+  const at = tsOf(now) || Date.now();
+  const ids = Object.keys(map || {})
+    .filter(id => (at - tsOf(map[id])) < TOMBSTONE_MAX_AGE_MS)
+    .sort((p,q)=> tsOf(map[q]) - tsOf(map[p]))
+    .slice(0, TOMBSTONE_MAX);
+  const out = {};
+  ids.sort().forEach(id=>{ out[id] = map[id]; });   // sorted keys so the merge is stable
+  return out;
+}
+
 function mergeAuthored(mine, theirs, opts){
   const o = opts || {};
   const idOf = o.id || (x=> x && x.id);
   const fields = o.fields || [];
   const byId = list => { const m = {}; (list||[]).forEach(x=>{ const k = idOf(x); if(k != null) m[k] = x; }); return m; };
   const A = byId(mine), B = byId(theirs);
+  // Both sides' records of what has been removed, seen as one.
+  const tombs = mergeTombstones(o.myRemoved, o.theirRemoved, o.now);
 
   const out = [];
   const seen = {};
@@ -1652,9 +1721,19 @@ function mergeAuthored(mine, theirs, opts){
     if(k == null || seen[k]) return;
     seen[k] = true;
     const x = A[k], y = B[k];
-    if(x && y) out.push(resolveAuthoredItem(x, y, fields));
-    else if(x){ if(!otherSideDropped(x, o.myFileAt,    o.theirHorizon, o.graceMs)) out.push(Object.assign({}, x)); }
-    else       { if(!otherSideDropped(y, o.theirFileAt, o.myHorizon,    o.graceMs)) out.push(Object.assign({}, y)); }
+    const merged = (x && y) ? resolveAuthoredItem(x, y, fields) : Object.assign({}, x || y);
+
+    /* A record of removal beats everything else, unless the item has been authored again
+       since — otherwise a recipe could never be picked a second time. This is checked
+       before the inference below, and it does not consult addedAt, which is why it works
+       for items written by builds that never stamped one. */
+    if(tsOf(tombs[k]) > lastAuthoredAt(merged)) return;
+
+    if(x && y) out.push(merged);
+    // No record either way: fall back to inferring from the horizons, which is all a copy
+    // from a build older than v23.2 can offer.
+    else if(x){ if(!otherSideDropped(x, o.myFileAt,    o.theirHorizon, o.graceMs)) out.push(merged); }
+    else       { if(!otherSideDropped(y, o.theirFileAt, o.myHorizon,    o.graceMs)) out.push(merged); }
   });
 
   // Stable, order-independent: oldest first, ties broken by id.
@@ -1677,6 +1756,26 @@ const WAITLIST_FIELDS = [
   { name:'done', stamp:'changedAt', whenUnstamped:(a,b)=> !!(a || b) },
   { name:'text', stamp:'changedAt' }
 ];
+
+/* Pure. Give every authored item a fixed creation stamp, once.
+
+   v23.2. Items written before v23.0 carry no addedAt, and effectiveAddedAt fell back to
+   the file's lastUpdated — which saveShoppingLocal bumps on EVERY save. So a pick made a
+   week ago, in a file saved ten seconds ago, presented to the merge as ten seconds old,
+   and no amount of waiting would ever make it deletable. Stamping it once with the file's
+   lastUpdated turns that moving upper bound into a fixed one: still an upper bound, still
+   never earlier than the truth, but it stops sliding forward every time anything is saved.
+
+   The tombstones make this unnecessary for anything actually removed through the app; this
+   is here so the pre-v23 data is sane on every other path too. */
+function backfillAuthoredStamps(sd){
+  if(!sd) return sd;
+  const at = sd.lastUpdated || null;
+  if(!at) return sd;
+  ((sd.weekPlan && sd.weekPlan.selections) || []).forEach(s=>{ if(s && !s.addedAt) s.addedAt = at; });
+  (sd.neededList || []).forEach(n=>{ if(n && !n.addedAt) n.addedAt = at; });
+  return sd;
+}
 
 function mergeShoppingData(a, b){
   if(!a) return b;
@@ -1738,13 +1837,32 @@ function mergeShoppingData(a, b){
      that had not caught up. chooseTripWinner governs shoppingList, which is what it was
      always for. */
   const horizons = authoredHorizons(a, b);
+  const now = [a.lastUpdated, b.lastUpdated].reduce((best,v)=> tsOf(v) > tsOf(best) ? v : best, null);
+
+  /* The records of what has been removed are merged in their own right and travel with the
+     result — a removal that only survived one merge would work exactly once. */
+  const selRemoved = mergeTombstones(a.weekPlan && a.weekPlan.selectionsRemoved,
+                                     b.weekPlan && b.weekPlan.selectionsRemoved, now);
+  const needRemoved = mergeTombstones(a.neededRemoved, b.neededRemoved, now);
+
   out.weekPlan.selections = mergeAuthored(
     (a.weekPlan && a.weekPlan.selections) || [],
     (b.weekPlan && b.weekPlan.selections) || [],
-    Object.assign({ id: s=> s && s.recipeId, fields: SELECTION_FIELDS }, horizons));
+    Object.assign({ id: s=> s && s.recipeId, fields: SELECTION_FIELDS, now: now,
+                    myRemoved: a.weekPlan && a.weekPlan.selectionsRemoved,
+                    theirRemoved: b.weekPlan && b.weekPlan.selectionsRemoved }, horizons));
+  /* Only carry the map when there is something in it. An empty one still counts as a
+     difference to applyMergedShopping's stringify-compare, which would make every identical
+     sync look like a change — swapping the object graph and repainting over whoever is
+     typing, which is the v21.0/v21.5 bug. */
+  if(Object.keys(selRemoved).length) out.weekPlan.selectionsRemoved = selRemoved;
+  else delete out.weekPlan.selectionsRemoved;
 
   out.neededList = mergeAuthored(a.neededList || [], b.neededList || [],
-    Object.assign({ id: n=> n && n.id, fields: WAITLIST_FIELDS }, horizons));
+    Object.assign({ id: n=> n && n.id, fields: WAITLIST_FIELDS, now: now,
+                    myRemoved: a.neededRemoved, theirRemoved: b.neededRemoved }, horizons));
+  if(Object.keys(needRemoved).length) out.neededRemoved = needRemoved;
+  else delete out.neededRemoved;
 
   return out;
 }
@@ -1842,6 +1960,9 @@ function mergeRemoteShopping(remote){
      merge, which is what let the value be overwritten by the other side's. */
   const advanced = (remote && remote.lastUpdated && tsOf(remote.lastUpdated) > tsOf(shoppingSeenRemoteAt))
     ? remote.lastUpdated : shoppingSeenRemoteAt;
+  // Stamp the incoming copy's legacy items against ITS lastUpdated, not ours — the bound
+  // has to come from the file the item actually arrived in.
+  backfillAuthoredStamps(remote);
   const merged = mergeShoppingData(shoppingData, remote);
   shoppingSeenRemoteAt = advanced;
   if(merged) merged.seenRemoteAt = advanced || null;
@@ -3111,6 +3232,8 @@ function finishShopping(){
         : '\n\nNothing on the Wait List is ticked off, so the Wait List is left as it is.')
     + '\n\nYour menu list and recipe picks are not touched.';
   if(!confirm(msg)) return;
+  shoppingData.neededRemoved = noteRemoved(shoppingData.neededRemoved,
+    going.map(n=> n.id), new Date().toISOString());
   shoppingData.neededList = shoppingData.neededList.filter(n=> !n.done);
   shoppingData.weekPlan.shoppingDoneAt = new Date().toISOString();
   // Order matters: the trip goes into the archive while the list it is made of still
@@ -3142,8 +3265,12 @@ function finishShopping(){
    v21.8, and builds older than that took the later generatedAt, which this now sets to
    the newest possible value rather than null. */
 function clearedWeekPlan(sd, now, byDevice, seenRemoteAt){
+  const clearing = (((sd && sd.weekPlan && sd.weekPlan.selections) || [])).map(s=> s && s.recipeId);
   return {
     selections: [],
+    // v23.2: what was cleared, and when. Without this the merge is left inferring the
+    // deletion from timestamps, which is how a week nobody had touched kept coming back.
+    selectionsRemoved: noteRemoved(sd && sd.weekPlan && sd.weekPlan.selectionsRemoved, clearing, now),
     generatedAt: now,
     tripId: 'trip:' + now + ':' + byDevice,
     supersedes: tripIdOf(sd),
@@ -3804,6 +3931,8 @@ function renderStartTab(){
       drop.disabled = shopping;
       drop.addEventListener('click', ()=>{
         shoppingData.weekPlan.selections = shoppingData.weekPlan.selections.filter(x=>x.recipeId!==sel.recipeId);
+        shoppingData.weekPlan.selectionsRemoved = noteRemoved(
+          shoppingData.weekPlan.selectionsRemoved, [sel.recipeId], new Date().toISOString());
         persist('shopping');
         drawPicked(); draw(); updateCountLabel();
       });
@@ -3836,6 +3965,8 @@ function renderStartTab(){
           shoppingData.weekPlan.selections.push(newSelection(r.id, parseInt(servInput.value,10)||defaultShoppingServings(r)));
         } else {
           shoppingData.weekPlan.selections = shoppingData.weekPlan.selections.filter(s=>s.recipeId!==r.id);
+          shoppingData.weekPlan.selectionsRemoved = noteRemoved(
+            shoppingData.weekPlan.selectionsRemoved, [r.id], new Date().toISOString());
         }
         persist('shopping');
         servInput.disabled = shopping || !cb.checked;
@@ -4287,6 +4418,8 @@ function renderNeededTab(){
     const clearBtn = el('button',{class:'btn small danger'},['Clear wait list']);
     clearBtn.addEventListener('click', ()=>{
       if(!confirm('Clear the whole Wait List? This does not touch this week’s selected recipes.')) return;
+      shoppingData.neededRemoved = noteRemoved(shoppingData.neededRemoved,
+        shoppingData.neededList.map(n=> n.id), new Date().toISOString());
       shoppingData.neededList = [];
       persist('shopping'); render();
     });
@@ -4307,7 +4440,11 @@ function renderNeededTab(){
     });
     const label = el('label',{},[item.text]);
     const rm = el('button',{class:'btn small danger'},['Remove']);
-    rm.addEventListener('click', ()=>{ shoppingData.neededList = shoppingData.neededList.filter(n=>n.id!==item.id); persist('shopping'); render(); });
+    rm.addEventListener('click', ()=>{
+      shoppingData.neededRemoved = noteRemoved(shoppingData.neededRemoved, [item.id], new Date().toISOString());
+      shoppingData.neededList = shoppingData.neededList.filter(n=>n.id!==item.id);
+      persist('shopping'); render();
+    });
     li.appendChild(cb); li.appendChild(label); li.appendChild(rm);
     ul.appendChild(li);
   });

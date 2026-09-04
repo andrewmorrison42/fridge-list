@@ -9,8 +9,8 @@ noticed mid-shop. They are worth reading before changing sync, rendering or stor
 ## Commands
 
 ```
-npm test                # 259 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 174 browser assertions — needs playwright-core + Chromium
+npm test                # 285 logic assertions — no dependencies, no browser, ~1s
+npm run test:browser    # 182 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -50,6 +50,23 @@ Consequences:
 ## Invariants
 
 Each of these has a bug behind it.
+
+**A deletion is recorded, never inferred.** v23.0 decided deletions by comparing an item's
+`addedAt` against this device's horizon, and that was wrong twice: items written before
+v23.0 carry no `addedAt`, so `effectiveAddedAt` fell back to the file's `lastUpdated` —
+which `saveShoppingLocal` bumps on EVERY save, so a week-old pick in a freshly saved file
+presented as seconds old and was permanently undeletable; and any removal within ~110s of
+the addition failed the same test on every path. `noteRemoved` stamps the removal at each
+deletion site, `mergeAuthored` honours a record that post-dates the item's own
+`lastAuthoredAt`, and a re-add wins because it stamps a later time. `otherSideDropped`
+survives only as the fallback for copies from builds that write no records. If you add a way
+to delete something, it records the removal or it does not work. *(v23.2)*
+
+**Never let the merge emit an empty tombstone map.** `applyMergedShopping` decides "did
+anything change" by stringify-comparing, so a `selectionsRemoved: {}` that was not in the
+input makes every identical sync look like a change — swapping the object graph and
+repainting over whoever is typing, which is the v21.0/v21.5 bug. The map appears only once
+something has actually been removed. Caught by the browser corpus, not by review. *(v23.2)*
 
 **`seenRemoteAt` is per-device state and the merge must never adopt the other side's.**
 `mergeShoppingData` builds its result with `Object.assign({}, secondary, primary)`, so the
