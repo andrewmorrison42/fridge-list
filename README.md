@@ -13,9 +13,9 @@ your own OneDrive.
   seconds.
 - A Wait List anyone can add to the moment they notice you're low on something.
 - Print the shopping list, or a weekly menu for the fridge door.
-- Remembers each finished shop, so a previous week can be put back as this week's picks
-  with one tap instead of going through the whole book again — and so the Menu tab can
-  tell you how many of the meals you planned actually got cooked.
+- Remembers each finished shop, so the Menu tab can tell you how many of the meals you
+  planned actually got cooked. It keeps the record and leaves the choosing to you — see
+  [Decisions, and why](docs/DECISIONS.md#what-this-app-is-and-is-not).
 - Copy one recipe to the clipboard, laid out and ready to paste into an email or a
   document — or send it as a file another copy of the app can import. One recipe,
   not the whole book.
@@ -30,10 +30,6 @@ Turn them on under **Settings → Features**:
   quantity you normally buy.
 - **Pantry items start as "at home"** — flour, oil and spices begin in an "already
   have this" group rather than on the buy list.
-- **Order aisles the way you walk the shop** — works the route out from the order things
-  were ticked off on previous shops, instead of listing the aisles alphabetically. It
-  needs a few finished shops first, and Settings shows you the route it has worked out
-  before you switch it on.
 
 Comes with a few hundred family recipes to start from. You can cook from them, add
 your own, or [clear them out](docs/SETUP-use-the-app.md#deleting-a-lot-of-recipes-at-once)
@@ -100,6 +96,11 @@ whether you picked a recipe, added something to the Wait List, or ticked an item
 up it says what changed, e.g. *"Caught up with the family list — 2 recipes added to the
 week, 1 Wait List item added."*
 
+From **v23.2** a deletion sticks because the app *recorded* it, not because it worked out
+that you must have seen the thing being deleted. Before that, clearing the week could
+appear to work and then undo itself when another phone reported in. If you clear something
+and it comes back, that is a bug worth reporting, not something to wait out.
+
 ## Why can't the others see what I added?
 
 Almost always because that phone is not connected to the shared folder. From **v22.2** it
@@ -133,6 +134,11 @@ See [`test/README.md`](test/README.md) for what each suite covers and why they a
 split, and [`CLAUDE.md`](CLAUDE.md) for the architectural rules worth knowing before
 changing anything — several of them exist because breaking them caused real bugs.
 
+[`docs/DECISIONS.md`](docs/DECISIONS.md) is the companion to that: the reasoning behind
+those rules, the features that were deliberately rejected or removed and why, and what the
+sync rewrites cost. Worth reading before proposing a feature — several ideas have been
+raised, built, and taken out again.
+
 ### What's in the repo
 
 | | |
@@ -141,7 +147,7 @@ changing anything — several of them exist because breaking them caused real bu
 | `sw.js` | Service worker. Network-first for the page, so a cached copy can never pin a device on an old build |
 | `manifest.webmanifest` | Lets the app install to a phone's home screen |
 | `.nojekyll` | Stops GitHub Pages running the site through Jekyll, which breaks it |
-| `docs/` | The two setup guides |
+| `docs/` | The two setup guides, and the decision record |
 | `test/` | Both test suites and their own README |
 
 ### One surprise worth knowing up front
@@ -164,11 +170,11 @@ are best kept surgical rather than reformatting.
 
 ### Known limitations
 
-- **A phone still on an older build cannot have its deletions honoured** until it
-  updates. From v23.0 the app can tell "you added that while I was away" from "I deleted
-  it while you were away", but only for devices that record what they have read. An older
-  phone's additions still arrive; only its removals wait. It keeps rather than loses,
-  which is the side to err on.
+- **A phone still on an older build may not have its deletions honoured** until it
+  updates. From v23.2 a phone records what it removed, and those removals are honoured
+  everywhere; a phone on v23.1 or earlier writes no such record, so its removals fall back
+  to being worked out from timings, and can be delayed. Its additions always arrive. It
+  keeps rather than loses, which is the side to err on.
 - **Recipes are last-save-wins**, with no per-item merge. Concurrent edits to *different*
   recipes on two devices can lose one side. An ETag guard stops a stale copy silently
   overwriting a newer one, and reports the clash instead.
