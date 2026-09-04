@@ -1367,6 +1367,86 @@ async function suiteImportRespectsTheMerge(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+async function suiteClearedWeekStaysCleared(browser) {
+  group('a cleared week does not come back, however old the picks were');
+  /* The reported v23.1 bug, end to end: clear the week and the picks reappear within a
+     poll. Two causes, both from v23.0 inferring deletions from timestamps — legacy items
+     with no addedAt were permanently undeletable because the fallback tracked the file's
+     lastUpdated, and anything removed within ~110s of being added failed the same test.
+     Recording the removal answers both. */
+  const file = instrument('clear2-hook.html',
+    'window.__t = { remote: mergeRemoteShopping, sd: () => shoppingData };');
+  const srv = await serve(8188, file);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  page.on('dialog', d => d.accept());
+  try {
+    await page.goto('http://localhost:8188/', { waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+    await buildAList(page);
+
+    /* Make the held copy look like the reported situation exactly: picks chosen a week ago
+       with NO addedAt at all (a pre-v23.0 file), sitting in a copy saved seconds ago. */
+    const held = await page.evaluate(() => {
+      const sd = JSON.parse(localStorage.getItem('fma_shopping_v4'));
+      const remote = JSON.parse(JSON.stringify(sd));
+      remote.weekPlan.selections.forEach(s => { delete s.addedAt; delete s.changedAt; });
+      remote.lastUpdated = new Date().toISOString();       // freshly saved, as it would be
+      window.__held = remote;
+      return { picks: sd.weekPlan.selections.length, trip: sd.weekPlan.tripId };
+    });
+    ok('a week is picked, in the shape an older build would have written it',
+       held.picks === 2 && !!held.trip, held);
+
+    // Clear it from the Start tab, the way a person does.
+    await page.click('#mainNav button[data-tab="start"]');
+    await page.waitForSelector('#app input[type=checkbox]', { timeout: 15000 });
+    await page.click('#app >> text="Clear all selections"');
+    await page.waitForTimeout(500);
+
+    const cleared = await readShopping(page);
+    ok('the week clears', cleared.weekPlan.selections.length === 0);
+    ok('and the app records what it removed, rather than leaving it to be guessed at',
+       !!cleared.weekPlan.selectionsRemoved
+       && Object.keys(cleared.weekPlan.selectionsRemoved).length === held.picks,
+       cleared.weekPlan.selectionsRemoved);
+
+    // The other phone's copy arrives, exactly as the 20s poll would deliver it.
+    const after = await page.evaluate(() => {
+      window.__t.remote(window.__held);
+      return { picks: window.__t.sd().weekPlan.selections.length };
+    });
+    ok('and the picks do NOT come back', after.picks === 0, after);
+
+    // Twice, because a record that only worked once would look fixed and not be.
+    const again = await page.evaluate(() => {
+      window.__t.remote(window.__held);
+      return { picks: window.__t.sd().weekPlan.selections.length };
+    });
+    ok('nor on the poll after that', again.picks === 0, again);
+
+    await page.waitForTimeout(300);
+    ok('and the Start tab agrees',
+       await page.evaluate(() => /Nothing picked yet/i.test(document.getElementById('app').innerText)));
+
+    /* And the week can be used again afterwards — a removal must not make a recipe
+       permanently unpickable. */
+    await page.fill('#app input[type=search]', '');
+    await page.waitForTimeout(400);
+    const boxes = await page.$$('#app .recipe-card input[type=checkbox]');
+    await boxes[0].check();
+    await page.waitForTimeout(400);
+    const repick = await page.evaluate(() => {
+      window.__t.remote(window.__held);
+      return window.__t.sd().weekPlan.selections.length;
+    });
+    ok('a recipe picked again after the clear survives the same stale copy',
+       repick === 1, repick);
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 (async () => {
   console.log('Chromium: ' + EXECUTABLE);
   const browser = await chromium.launch({ executablePath: EXECUTABLE, args: ['--no-sandbox'] });
@@ -1379,6 +1459,7 @@ async function suiteImportRespectsTheMerge(browser) {
                          suiteTripHistory, suiteClearSurvivesSync,
                          suiteTwoPhonesBothKeepTheirWork,
                          suiteImportRespectsTheMerge,
+                         suiteClearedWeekStaysCleared,
                          suiteUnsyncedPhoneSaysSo,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
