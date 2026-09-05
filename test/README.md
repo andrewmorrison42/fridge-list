@@ -54,6 +54,27 @@ FRIDGE_TEST_CHROMIUM=/path/to/chrome npm run test:browser
 
 Both suites exit non-zero on failure. `npm run test:all` runs them in order.
 
+## What the suites are for, and what they cannot do
+
+The logic suite is a **regression corpus** first and a unit-test suite second. Nearly every
+group in it is named after the release whose bug it caught — v21.0 ticks, v21.5 typing,
+v21.8 a live list, v21.9 the freeze, v22.1 clearing the week, v22.2 the sync banner, v23.0
+the union rule, v23.1 the horizon, v23.2 recorded deletions. Four structural rewrites of the
+sync model have gone through that corpus untouched, and it is the main reason a fifth is
+safe to attempt. Add to it; do not rewrite it to suit a new design.
+
+Two things it cannot do, both learned the hard way:
+
+- **A passing test does not prove a test bites.** One written for a specific bug passed
+  against that very bug, because a button was matched by the wrong label and nothing was
+  ever clicked. Check out the previous release and run the suite — if the new test passes
+  there, it is testing nothing.
+- **Coverage is agreement between test and code, not evidence about the world.** Both v23.2
+  defects lived under assertions that passed, on two of the best-covered functions in the
+  app, because the tests were written by the same reasoning that wrote the code and
+  inherited its false premise. See "How to review this codebase" in
+  [`../docs/DECISIONS.md`](../docs/DECISIONS.md).
+
 ### A note on the test hooks
 
 Two browser suites need to reach inside the app's IIFE, which exposes nothing on

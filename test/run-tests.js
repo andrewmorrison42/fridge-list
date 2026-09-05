@@ -63,7 +63,8 @@ function extractConst(name){
 // Keep this in step with the constant in index.html; asserted below so it can't drift.
 const TICK_TIE_WINDOW_MS = 10000;
 
-const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripHasProgress', 'tripIsLive',
+const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProgress',
+               'tripIsLive', 'tripIsWorkedOn', 'recipeSelectionsList', 'picksOnlyAdded',
                'chooseTripWinner', 'mergeFlag', 'flagStamp', 'mergeShoppingLine',
                'mergeShoppingData', 'lineMergeKey', 'selectionsSignature',
                'recipeSelectionsSignature', 'shoppingListIsStale',
@@ -74,6 +75,7 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripHasProgress', 'tripIsLiv
                'recipeHistoryLabel', 'recipeHistoryTime', 'daysSinceStamp', 'daysSinceCooked',
                'daysSincePlanned', 'migrateCookedStamps',
                'cookRateSummary', 'atHomeStreaks', 'clearedWeekPlan',
+               'sameTripRebuild', 'stashReplacedTrip', 'generateShoppingList',
                'mergeAuthored', 'resolveAuthoredItem', 'otherSideDropped',
                'effectiveAddedAt', 'authoredHorizons', 'describeMerge', 'mergeReport',
                'lastAuthoredAt', 'noteRemoved', 'mergeTombstones', 'pruneTombstones',
@@ -85,6 +87,12 @@ vm.createContext(sandbox);
 vm.runInContext(
   'const TICK_TIE_WINDOW_MS = ' + TICK_TIE_WINDOW_MS + ';\n' +
   'let shoppingData = null;\n' +
+  'let replacedTrip = null;\n' +
+  'let shoppingSeenRemoteAt = null;\n' +
+  // The two genuine I/O calls on the rebuild path. Everything that DECIDES anything is
+  // still the real function out of index.html.
+  'function persist(){}\n' +
+  'function deviceId(){ return "test-device"; }\n' +
   'let recipesData = { recipes: [], ingredients: [], settings: { features: {}, staples: [], stapleQty: {} } };\n' +
   extractConst('COUNT_UNITS') + '\n' +
   extractConst('MEASURE_ML') + '\n' +
@@ -104,7 +112,12 @@ vm.runInContext(
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
   '             ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,' +
-  '             tripProgress, tripHasProgress, tripIsLive, chooseTripWinner, TRIP_LIVE_WINDOW_MS,' +
+  '             tripProgress, tripDecisions, tripHasProgress, tripIsLive, tripIsWorkedOn,' +
+  '             chooseTripWinner, TRIP_LIVE_WINDOW_MS,' +
+  '             sameTripRebuild, stashReplacedTrip, generateShoppingList,' +
+  '             getReplacedTrip: () => replacedTrip, setReplacedTrip: t => { replacedTrip = t; },' +
+  '             currentShopping: () => shoppingData,' +
+  '             currentLines: () => (shoppingData && shoppingData.shoppingList) || [],' +
   '             tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,' +
   '             recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,' +
   '             cookRateSummary, atHomeStreaks, clearedWeekPlan,' +
@@ -120,7 +133,10 @@ vm.runInContext(
 const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,
         ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,
-        tripProgress, tripHasProgress, tripIsLive, chooseTripWinner, TRIP_LIVE_WINDOW_MS,
+        tripProgress, tripDecisions, tripHasProgress, tripIsLive, tripIsWorkedOn,
+        chooseTripWinner, TRIP_LIVE_WINDOW_MS,
+        sameTripRebuild, stashReplacedTrip, generateShoppingList,
+        getReplacedTrip, setReplacedTrip,
         tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,
         recipeHistoryLabel, recipeHistoryTime, migrateCookedStamps,
         cookRateSummary, atHomeStreaks, clearedWeekPlan,
@@ -1429,6 +1445,189 @@ group('legacy items get a creation time that stops moving');
   ok('a file with no lastUpdated is left alone rather than guessed at',
      backfillAuthoredStamps({ weekPlan:{selections:[{recipeId:'r'}]}, neededList:[] })
        .weekPlan.selections[0].addedAt === undefined);
+}
+
+/* ---------- v23.3: pruning the list is work, and a rebuild must not throw it away ----------
+
+   Reported from a real shop on v23.2: someone marks items "at home" or removes them with
+   the X on the Review tab, somebody else adds another recipe, and every one of those
+   decisions is undone. The cause is not the merge — it is that `tripProgress` counts only
+   TICKS, so a carefully pruned list looks untouched to every mechanism that exists to
+   protect a shopper's work, and `generateShoppingList` carried the flags across only on a
+   same-trip rebuild. Adding a recipe changes recipeSelectionsSignature(), so it was never
+   the same trip. */
+
+// A pantry and two recipes sharing one ingredient, so the rebuild has something to roll up.
+function pruningWorld(){
+  setRecipesData({
+    recipes: [
+      { id:'r1', name:'Chorizo stew', servings:4, ingredients:[
+        { ingredientName:'Chorizo', quantity:'200', unit:'g' },
+        { ingredientName:'Olive oil', quantity:'2', unit:'tbsp' },
+        { ingredientName:'Onion', quantity:'1', unit:'' } ] },
+      { id:'r2', name:'Pancakes', servings:4, ingredients:[
+        { ingredientName:'Flour', quantity:'200', unit:'g' },
+        { ingredientName:'Milk', quantity:'300', unit:'ml' },
+        { ingredientName:'Olive oil', quantity:'1', unit:'tbsp' } ] }
+    ],
+    ingredients: [
+      { name:'Chorizo',   shoppingUnit:'g',  aisle:'Meat',   shoppingCategory:'Meat' },
+      { name:'Olive oil', shoppingUnit:'ml', aisle:'Pantry', shoppingCategory:'Pantry' },
+      { name:'Onion',     shoppingUnit:'',   aisle:'Veg',    shoppingCategory:'Veg' },
+      { name:'Flour',     shoppingUnit:'g',  aisle:'Pantry', shoppingCategory:'Pantry' },
+      { name:'Milk',      shoppingUnit:'ml', aisle:'Dairy',  shoppingCategory:'Dairy' }
+    ],
+    settings: { features:{}, staples:[], stapleQty:{}, alwaysAtHome:[] }
+  });
+  setReplacedTrip(null);
+  setShoppingData({
+    weekPlan: { selections:[{ recipeId:'r1', servings:4, addedAt:T(0) }] },
+    shoppingList: [], neededList: [], lastUpdated: T(0)
+  });
+  generateShoppingList();
+}
+
+const lineNamed = n => shoppingDataLines().find(l => l.ingredientName === n);
+function shoppingDataLines(){
+  // The sandbox owns shoppingData; read it back through a function the app itself uses.
+  return sandbox.api.currentLines();
+}
+
+group('v23.3 — two people pruning at once');
+{
+  /* The family's own requirement: several phones must be able to prune the same list at
+     the same time. Nothing here is new code — mergeShoppingLine already resolves removed
+     and atHome per flag by their own stamps — but nothing asserted it either, and the
+     whole point of v23.3 is that this is now the common case rather than a curiosity. */
+  const A = listFor([
+    line('chorizo', { removed: true, removedAt: T(1000), changedAt: T(1000) }),
+    line('olive oil', { atHome: true, atHomeAt: T(1100), changedAt: T(1100) }),
+    line('flour'), line('milk')
+  ], T(1100));
+  const B = listFor([
+    line('chorizo'), line('olive oil'),
+    line('flour', { removed: true, removedAt: T(2000), changedAt: T(2000) }),
+    line('milk', { atHome: true, atHomeAt: T(2100), changedAt: T(2100) })
+  ], T(2100));
+
+  const r = mergeShoppingData(A, B);
+  ok('my removal survives their copy', byName(r, 'chorizo').removed === true);
+  ok('my "at home" survives their copy', byName(r, 'olive oil').atHome === true);
+  ok('their removal survives mine', byName(r, 'flour').removed === true);
+  ok('their "at home" survives mine', byName(r, 'milk').atHome === true);
+
+  const flipped = mergeShoppingData(B, A);
+  const shape = d => JSON.stringify(d.shoppingList
+    .map(l => [l.ingredientName, !!l.removed, !!l.atHome]).sort());
+  ok('and it does not matter whose phone merged first', shape(flipped) === shape(r));
+}
+
+group('v23.3 — a pruned list is not thrown away by a phone that has done nothing');
+{
+  // The other half of "protects but does not lock": with nothing ticked, the old rule
+  // judged these two forks on generatedAt alone, so the phone that had merely opened the
+  // tab could replace an evening of pruning with a clean list.
+  const pruned = listFor([
+    line('chorizo', { removed: true, removedAt: T(1000), changedAt: T(1000) }),
+    line('olive oil', { atHome: true, atHomeAt: T(1000), changedAt: T(1000) })
+  ], T(1000), { tripId: 'trip:pruned', generatedAt: T(1000) });
+  const untouched = listFor([
+    line('chorizo'), line('olive oil')
+  ], T(9000), { tripId: 'trip:fresh', generatedAt: T(9000) });
+
+  ok('the pruned list counts as worked on', tripIsWorkedOn(pruned, BASE + 2000) === true);
+  ok('the untouched one does not', tripIsWorkedOn(untouched, BASE + 9500) === false);
+  ok('so the pruning wins even though the other list is newer',
+     chooseTripWinner(pruned, untouched, T(1000), T(9000), untouched, BASE + 9500) === pruned);
+  ok('and it is decided the same way round the other way',
+     chooseTripWinner(untouched, pruned, T(9000), T(1000), untouched, BASE + 9500) === pruned);
+
+  // But it still lapses: six hours after the last decision nobody is working on it.
+  ok('a pruned list nobody has touched for six hours stops defending itself',
+     tripIsWorkedOn(pruned, BASE + 1000 + TRIP_LIVE_WINDOW_MS + 1) === false);
+}
+
+group('v23.3 — pruning is work: decisions survive somebody adding a recipe');
+{
+  pruningWorld();
+  const now = new Date().toISOString();
+
+  // What a person actually does at the kitchen table before leaving.
+  lineNamed('Olive oil').atHome = true;  lineNamed('Olive oil').atHomeAt = now;
+  lineNamed('Onion').atHome    = true;   lineNamed('Onion').atHomeAt    = now;
+  lineNamed('Chorizo').removed = true;   lineNamed('Chorizo').removedAt = now;
+
+  ok('pruning alone is not a tick, so the trip is not "live" — the Start tab stays open',
+     tripIsLive(sandbox.api.currentShopping()) === false);
+
+  // ...and then somebody adds a second recipe to the week.
+  sandbox.api.currentShopping().weekPlan.selections.push({ recipeId:'r2', servings:4, addedAt:now });
+  generateShoppingList();
+
+  ok('an ingredient marked "at home" is still at home after a recipe is added',
+     lineNamed('Olive oil') && lineNamed('Olive oil').atHome === true);
+  ok('an at-home ingredient only the first recipe used is still at home',
+     lineNamed('Onion') && lineNamed('Onion').atHome === true);
+  ok('an ingredient removed with the X is still removed',
+     lineNamed('Chorizo') && lineNamed('Chorizo').removed === true);
+  ok('the stamps survive too, or the other phone would win with its stale copy',
+     lineNamed('Olive oil').atHomeAt === now && lineNamed('Chorizo').removedAt === now);
+  ok('the recipe that was added did arrive on the list',
+     !!lineNamed('Flour') && !!lineNamed('Milk'));
+  ok('a line the new recipe contributes to is not silently at home',
+     lineNamed('Flour').atHome !== true);
+}
+
+group('v23.3 — ticks still belong to their trip');
+{
+  pruningWorld();
+  const now = new Date().toISOString();
+  lineNamed('Chorizo').checked = true; lineNamed('Chorizo').checkedAt = now;
+  const before = tripIdOf(sandbox.api.currentShopping());
+
+  // Adding a recipe EXTENDS the shop; it is the same trip, so the trolley survives.
+  sandbox.api.currentShopping().weekPlan.selections.push({ recipeId:'r2', servings:4, addedAt:now });
+  generateShoppingList();
+  ok('adding a recipe keeps the same trip, so a tick is not thrown away',
+     tripIdOf(sandbox.api.currentShopping()) === before && lineNamed('Chorizo').checked === true);
+
+  // Taking one back OFF is a different list, and a new trip starts clean of ticks.
+  sandbox.api.currentShopping().weekPlan.selections =
+    sandbox.api.currentShopping().weekPlan.selections.filter(x => x.recipeId !== 'r1');
+  generateShoppingList();
+  /* Not asserted on the trip id: it is minted from new Date(), and this whole block runs
+     inside one millisecond, so two genuinely different trips can share an id here. What
+     a new trip demonstrably does is name the one it supersedes. */
+  ok('removing a recipe does start a new trip',
+     !!sandbox.api.currentShopping().weekPlan.supersedes);
+  ok('and last trip’s ticks do not leak into it',
+     shoppingDataLines().every(l => !l.checked));
+}
+
+group('v23.3 — a pruned list is worth protecting, even with nothing ticked');
+{
+  pruningWorld();
+  const now = new Date().toISOString();
+  lineNamed('Chorizo').removed = true; lineNamed('Chorizo').removedAt = now;
+  const sd = sandbox.api.currentShopping();
+
+  ok('a pruned list counts as work worth keeping', tripHasProgress(sd) === true);
+  ok('but it does not lock the week’s recipes — that needs a tick', tripIsLive(sd) === false);
+
+  setReplacedTrip(null);
+  sd.weekPlan.selections = [{ recipeId:'r2', servings:4, addedAt:now }];   // a genuine replacement
+  generateShoppingList();
+  ok('replacing the week stashes the pruned list, so there is an undo',
+     !!getReplacedTrip());
+}
+
+group('v23.3 — a decision has to be a decision, not a default');
+{
+  pruningWorld();
+  const sd = sandbox.api.currentShopping();
+  sd.shoppingList.forEach(l => { l.atHome = true; });   // as the pantry rule would leave it
+  ok('an unstamped "at home" is a default and does not count as work',
+     tripHasProgress(sd) === false);
 }
 
 /* ---------- result ---------- */

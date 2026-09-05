@@ -340,7 +340,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v23.2';
+const APP_VERSION = 'v23.3';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -1454,19 +1454,56 @@ function tripProgress(sd){
   return { ticks: ticks, newestAt: newestAt };
 }
 
-function tripHasProgress(sd){
-  if(!sd || !sd.weekPlan || sd.weekPlan.shoppingDoneAt) return false;
-  return tripProgress(sd).ticks > 0;
+/* v23.3: everything that protects a shopper's work used to ask tripProgress, and
+   tripProgress counts TICKS. But a family does two different things with a list: they
+   prune it at the kitchen table — "we have olive oil", "not chorizo this week" — and then
+   they tick it off in the aisle. Only the second was visible, so a carefully pruned list
+   looked untouched to the freeze, to the auto-refresh, to the undo and to the merge, and
+   adding one recipe threw the whole lot away. That was the bug behind v23.3.
+   A stamped removal or "at home" counts here; an unstamped one does not, because the
+   pantry rule sets atHome without a stamp and a default is not a decision — the same
+   distinction atHomeAt exists to make. */
+function tripDecisions(sd){
+  const lines = (sd && sd.shoppingList) || [];
+  let decisions = 0, newestAt = 0;
+  lines.forEach(l=>{
+    if(!((l.checked && !l.removed) || l.removedAt || l.atHomeAt)) return;
+    decisions++;
+    const t = Math.max(tsOf(l.checkedAt), tsOf(l.removedAt), tsOf(l.atHomeAt), tsOf(l.changedAt));
+    if(t > newestAt) newestAt = t;
+  });
+  return { decisions: decisions, newestAt: newestAt };
 }
 
-// A trip nobody has ticked in six hours is not a trip anybody is still shopping.
-// Ticks with no stamp at all are treated as live: the cost of being wrong is one
-// visible "start a new list anyway" tap, and the cost the other way is a wiped trolley.
+// "Is there work here worth keeping?" — an undo is owed for pruning just as much as for
+// a half-filled trolley.
+function tripHasProgress(sd){
+  if(!sd || !sd.weekPlan || sd.weekPlan.shoppingDoneAt) return false;
+  return tripDecisions(sd).decisions > 0;
+}
+
+/* "Is somebody in a shop right now?" — a DIFFERENT question, and it is still ticks only.
+   This one freezes the week's recipes, and pruning must not do that: people prune at home
+   and then carry on planning, which is exactly what the family was doing when this broke.
+   Deliberately separate from tripHasProgress above. Do not fold the two back together.
+   A trip nobody has ticked in six hours is not a trip anybody is still shopping.
+   Ticks with no stamp at all are treated as live: the cost of being wrong is one
+   visible "start a new list anyway" tap, and the cost the other way is a wiped trolley. */
 function tripIsLive(sd, now){
-  if(!tripHasProgress(sd)) return false;
+  if(!sd || !sd.weekPlan || sd.weekPlan.shoppingDoneAt) return false;
   const p = tripProgress(sd);
+  if(!p.ticks) return false;
   if(!p.newestAt) return true;
   return ((now || Date.now()) - p.newestAt) <= TRIP_LIVE_WINDOW_MS;
+}
+
+// The same six-hour test against decisions rather than ticks, for the one place that has
+// to weigh two copies of a list against each other rather than lock a tab.
+function tripIsWorkedOn(sd, now){
+  if(!tripHasProgress(sd)) return false;
+  const d = tripDecisions(sd);
+  if(!d.newestAt) return true;
+  return ((now || Date.now()) - d.newestAt) <= TRIP_LIVE_WINDOW_MS;
 }
 
 /* ---- v21.8: which of two DIFFERENT trips is the real one ----
@@ -1496,8 +1533,10 @@ function chooseTripWinner(a, b, aGen, bGen, primary, now){
   if(aReplacesB !== bReplacesA) return aReplacesB ? a : b;
 
   // 2. Neither knew the other, so this is a fork rather than a replacement. A list
-  //    nobody has shopped from never replaces one somebody is shopping from.
-  const aLive = tripIsLive(a, now), bLive = tripIsLive(b, now);
+  //    nobody has touched never replaces one somebody has worked on — v23.3 widened
+  //    "worked on" from ticks to any deliberate decision, because a phone that had
+  //    merely regenerated could otherwise discard another phone's whole pruning.
+  const aLive = tripIsWorkedOn(a, now), bLive = tripIsWorkedOn(b, now);
   if(aLive !== bLive) return aLive ? a : b;
 
   // 3. Two forks, neither being shopped: the one generated from fresher shared data
@@ -1988,6 +2027,9 @@ function stashReplacedTrip(sd){
     shoppingList: JSON.parse(JSON.stringify(sd.shoppingList || [])),
     tripId: tripIdOf(sd),
     ticks: tripProgress(sd).ticks,
+    // v23.3: a list can now be stashed with nothing ticked — an evening's pruning is
+    // work too — so the card has to be able to say what was actually on it.
+    decisions: tripDecisions(sd).decisions,
     at: new Date().toISOString()
   };
 }
@@ -3014,9 +3056,33 @@ function selectionsSignature(){
    to happen, and they must never disagree about it. */
 function sameTripRebuild(){
   const prevTripId = tripIdOf(shoppingData);
-  return !!prevTripId
-    && !shoppingData.weekPlan.shoppingDoneAt
-    && shoppingData.weekPlan.lastGeneratedRecipeSignature === recipeSelectionsSignature();
+  if(!prevTripId || shoppingData.weekPlan.shoppingDoneAt) return false;
+  if(shoppingData.weekPlan.lastGeneratedRecipeSignature === recipeSelectionsSignature()) return true;
+  /* v23.3: adding a recipe is an addition to the same shop, exactly as a Wait List entry
+     is — "we'll do a curry too" is not "throw that list away and start again". It used to
+     mint a new trip, which discarded the trolley, undid every deselection, and had two
+     phones minting rival trip ids for what everyone thought was one list. Taking a recipe
+     back OFF, or changing servings, still starts a new trip: that is a different list. */
+  return picksOnlyAdded(shoppingData.weekPlan.lastGeneratedRecipeSelections);
+}
+
+/* The picks a list was last generated from. The signature beside it is a hash and can
+   only say "different"; this can say "different because something was ADDED". Optional
+   and additive — a file from an older build has no such field, picksOnlyAdded says no,
+   and the signature test alone decides, which is the pre-v23.3 behaviour. */
+function recipeSelectionsList(){
+  return shoppingData.weekPlan.selections
+    .map(s=>({ r:s.recipeId, s:(s.servings === undefined ? null : s.servings) }))
+    .sort((a,b)=> a.r < b.r ? -1 : a.r > b.r ? 1 : 0);
+}
+
+function picksOnlyAdded(prev){
+  if(!Array.isArray(prev)) return false;
+  const now = {};
+  recipeSelectionsList().forEach(x=>{ now[x.r] = x.s; });
+  // Every recipe the current list was built from must still be picked, at the same
+  // servings. Anything else — a removal, a serving change — is a different list.
+  return prev.every(x => Object.prototype.hasOwnProperty.call(now, x.r) && now[x.r] === x.s);
 }
 
 function generateShoppingList(){
@@ -3162,19 +3228,28 @@ function generateShoppingList(){
   // "Need it"/"At home" choice) together with the stamps the sync merge resolves on.
   // Without the stamps a carried-over tick would look unstamped to the other device
   // and lose to its stale copy of the same line.
-  if(sameTrip){
-    arr.forEach(l=>{
-      const p = prevByKey[lineMergeKey(l)];
-      if(!p) return;
-      l.checked = !!p.checked;
-      l.checkedAt = p.checkedAt || (p.checked ? (p.changedAt || null) : null);
-      l.removed = !!p.removed;
-      l.removedAt = p.removedAt || (p.removed ? (p.changedAt || null) : null);
-      if(p.atHomeAt){ l.atHome = !!p.atHome; l.atHomeAt = p.atHomeAt; }
-      else if(p.atHome === false && l.atHome){ l.atHome = false; } // pre-v21 "Need it"
-      if(p.changedAt) l.changedAt = p.changedAt;
-    });
-  }
+  /* v23.3: two kinds of work live on these lines and they do not have the same lifetime.
+     A TICK means "in the trolley" — it belongs to the trip being shopped and must never
+     leak into a different one (v21.8). A removal or an "at home" is a statement about the
+     week and the cupboard — "we already have olive oil", "not chorizo this week" — and it
+     is still true whichever generation of the list is on the screen. Both used to be
+     carried only on a same-trip rebuild, so adding one recipe undid every deselection the
+     family had made. Decisions now cross any rebuild; ticks still cross only their own
+     trip. A finished shop carries nothing: finishShopping clears the list, and the guard
+     below says so for any path that reaches here with one still marked done. */
+  const shopFinished = !!shoppingData.weekPlan.shoppingDoneAt;
+  arr.forEach(l=>{
+    const p = prevByKey[lineMergeKey(l)];
+    if(!p || shopFinished) return;
+    l.removed = !!p.removed;
+    l.removedAt = p.removedAt || (p.removed ? (p.changedAt || null) : null);
+    if(p.atHomeAt){ l.atHome = !!p.atHome; l.atHomeAt = p.atHomeAt; }
+    else if(p.atHome === false && l.atHome){ l.atHome = false; } // pre-v21 "Need it"
+    if(p.changedAt) l.changedAt = p.changedAt;
+    if(!sameTrip) return;
+    l.checked = !!p.checked;
+    l.checkedAt = p.checkedAt || (p.checked ? (p.changedAt || null) : null);
+  });
   shoppingData.shoppingList = arr;
   shoppingData.weekPlan.generatedAt = generatedNow;
   /* The trip id is what lets the merge tell "the same list, edited by two people"
@@ -3191,6 +3266,7 @@ function generateShoppingList(){
   }
   shoppingData.weekPlan.shoppingDoneAt = null; // a fresh list is an unfinished list
   shoppingData.weekPlan.lastGeneratedRecipeSignature = recipeSelectionsSignature();
+  shoppingData.weekPlan.lastGeneratedRecipeSelections = recipeSelectionsList();
   shoppingData.weekPlan.lastGeneratedSignature = selectionsSignature();
   persist('shopping');
   persist('recipes'); // saves the lastPlanned stamps set above — NOT lastCooked, which
@@ -3241,6 +3317,7 @@ function finishShopping(){
   archiveFinishedTrip();
   shoppingData.shoppingList = [];
   shoppingData.weekPlan.lastGeneratedRecipeSignature = recipeSelectionsSignature();
+  shoppingData.weekPlan.lastGeneratedRecipeSelections = recipeSelectionsList();
   persist('shopping');
   render();
   setStatus('Shopping marked as done — list cleared, menu kept.', 'ok');
@@ -3279,8 +3356,22 @@ function clearedWeekPlan(sd, now, byDevice, seenRemoteAt){
     // An empty week is not stale — shoppingListIsStale returns false with no selections —
     // so nothing regenerates off these, and the next real generate mints its own trip.
     lastGeneratedRecipeSignature: null,
+    lastGeneratedRecipeSelections: null,
     lastGeneratedSignature: null
   };
+}
+
+/* What was on the list that got replaced, in the words that fit what was actually done
+   to it. v23.3: before this, the card always said "N item(s) ticked", which read as "0
+   item(s) ticked" for a list somebody had spent an evening pruning — the exact work this
+   release exists to stop losing. */
+function replacedTripSummary(t){
+  const ticks = (t && t.ticks) || 0;
+  const others = Math.max(0, ((t && t.decisions) || 0) - ticks);
+  if(ticks && others) return 'It had ' + ticks + ' item(s) ticked and ' + others + ' marked at home or removed';
+  if(ticks) return 'It had ' + ticks + ' item(s) ticked';
+  if(others) return 'It had ' + others + ' item(s) marked at home or removed';
+  return 'It was the list you had';
 }
 
 /* Undo for a superseded trip. The restored list has to WIN once it goes back, or the
@@ -3291,7 +3382,8 @@ function clearedWeekPlan(sd, now, byDevice, seenRemoteAt){
 function putBackReplacedList(){
   if(!replacedTrip) return;
   const msg = 'Put back the list that was replaced?\n\n'
-    + replacedTrip.ticks + ' ticked item(s) come back, along with the recipe picks that list was made from.'
+    + replacedTripSummary(replacedTrip)
+    + ', and it comes back along with the recipe picks that list was made from.'
     + '\n\nThe list that replaced it goes — on every phone, within a few seconds.';
   if(!confirm(msg)) return;
   const now = new Date().toISOString();
@@ -4119,10 +4211,10 @@ function renderReviewTab(){
   if(replacedTrip && tripIdOf(shoppingData) !== replacedTrip.tripId){
     const card = el('div',{class:'card notice-card'});
     card.appendChild(el('p',{style:'margin-top:0;'},[
-      el('strong',{},['The list that had your ticks on it was replaced.'])
+      el('strong',{},['The list you had been working on was replaced.'])
     ]));
     card.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
-      'It had ' + replacedTrip.ticks + ' item(s) ticked, and is kept until this page is closed \u2014 whether it was replaced here or from another phone.'
+      replacedTripSummary(replacedTrip) + ', and is kept until this page is closed \u2014 whether it was replaced here or from another phone.'
     ]));
     const backBtn = el('button',{class:'btn'},['Put back the list that was replaced']);
     backBtn.addEventListener('click', putBackReplacedList);

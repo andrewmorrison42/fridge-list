@@ -6,11 +6,16 @@ A family shopping-list app used on phones in a supermarket. One self-contained
 Most of the rules below exist because breaking them caused a real bug that a family
 noticed mid-shop. They are worth reading before changing sync, rendering or storage.
 
+This file is the rules. [`docs/DECISIONS.md`](docs/DECISIONS.md) is the reasoning: what was
+chosen, what was rejected and why, what the sync rewrites cost, and how to review this
+codebase given that an adversarial review passed over two real defects. Read that one
+before proposing a feature or starting a review; read this one before changing code.
+
 ## Commands
 
 ```
-npm test                # 285 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 182 browser assertions — needs playwright-core + Chromium
+npm test                # 309 logic assertions — no dependencies, no browser, ~1s
+npm run test:browser    # 191 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -50,6 +55,36 @@ Consequences:
 ## Invariants
 
 Each of these has a bug behind it.
+
+**"Is there work here worth keeping" and "is somebody in a shop right now" are two
+different questions.** They were one — `tripProgress`, counting ticks — and that single
+answer drove the freeze, the Review tab's auto-refresh, the undo stash and
+`chooseTripWinner`. But a family does two things with a list: they prune it at the kitchen
+table ("we have olive oil", "not chorizo this week") and they tick it off in the aisle.
+Only the second counted, so a carefully pruned list looked untouched to all four, and
+adding one recipe threw the lot away. `tripHasProgress` now asks `tripDecisions` — any
+STAMPED removal or at-home, plus ticks — and is what earns an undo and defends a list in
+the merge. `tripIsLive` still counts ticks only, because it freezes the week's recipes and
+pruning must not do that: people prune and then carry on planning. Stamped only, or the
+pantry default would count as a decision. Two functions on purpose; do not tidy them back
+into one. *(v23.3)*
+
+**A decision outlives its trip. A tick does not.** `checked` means "in the trolley" and
+belongs to the trip being shopped — v21.8's rule that last trip's ticks must not leak in
+still holds exactly. `removed` and `atHome` are statements about the week and the cupboard,
+still true whichever generation of the list is on screen. `generateShoppingList` carried
+both across only on a same-trip rebuild, which is why adding a recipe undid every
+deselection. The carry-forward is now split: decisions cross any rebuild, ticks cross only
+their own trip, and a shop marked done carries nothing. *(v23.3)*
+
+**Adding a recipe extends the shop; taking one off replaces it.** Any change to the picks
+used to mint a new trip, so "we'll do a curry too" discarded the trolley, undid the
+pruning, and had two phones minting rival trip ids for what everyone thought was one list —
+a Wait List addition, which is the same kind of act, was a same-trip rebuild all along.
+`sameTripRebuild` now also returns true when the picks changed only by ADDING, tested
+against `weekPlan.lastGeneratedRecipeSelections`; a removal or a serving change still
+starts a new trip. The new field is optional and additive: a file from an older build has
+none, `picksOnlyAdded` says no, and the old signature test alone decides. *(v23.3)*
 
 **A deletion is recorded, never inferred.** v23.0 decided deletions by comparing an item's
 `addedAt` against this device's horizon, and that was wrong twice: items written before
@@ -105,12 +140,15 @@ is why every release from v21.8 on had to invent another tiebreaker — `generat
 throwing away. A device with no horizon can delete nothing: it cannot prove it ever saw
 what it is removing. *(v23.0)*
 
-**Items from before v23.0 are bounded by their file's `lastUpdated`.** They carry no
-`addedAt`, and with no creation time at all they could never be shown to have been seen,
-so they would be immortal and clearing the week would quietly stop working against any
-phone on an older build. A file written at T proves everything in it existed by T at the
-latest — `effectiveAddedAt` — which is the bound needed and never invents a time earlier
-than the truth. *(v23.0)*
+**Items from before v23.0 are bounded by their file's `lastUpdated`, and the bound is
+frozen on arrival.** They carry no `addedAt`, and with no creation time at all they could
+never be shown to have been seen. A file written at T proves everything in it existed by T
+at the latest — `effectiveAddedAt` — which never invents a time earlier than the truth.
+But that is an upper BOUND, not a creation time, and v23.0 then used it as one: because
+`saveShoppingLocal` bumps `lastUpdated` on every save, the bound moved forward forever and
+the item was permanently undeletable. `backfillAuthoredStamps` stamps the file's current
+`lastUpdated` onto such an item once, so the bound stops moving. Do not reintroduce a
+reader that recomputes it live. *(v23.0, corrected v23.2)*
 
 **Shopping list lines are DERIVED, and that is why they do not go through `mergeAuthored`.**
 They are regenerated from the picks, the staples and the Wait List; the authored part of a
@@ -169,7 +207,9 @@ progress alone, which is the safe side. *(v21.8)*
 
 **The week's picks are frozen while a shop is under way.** `shoppingInProgress()` — one
 definition, `tripIsLive(shoppingData)` — disables every control on the Start tab that
-changes `weekPlan.selections`, and the tab says why. v21.8 instead let the picks change
+changes `weekPlan.selections`, and the tab says why. v23.3 deliberately left this reading
+TICKS, not decisions: locking the tab the moment somebody prunes would block the very
+thing the family was doing when they reported the bug. v21.8 instead let the picks change
 and then offered "Make a new list anyway", which confused the people it was there to
 protect: asked to choose between two lists, nobody knew which was which. There is
 nothing to choose now. The Wait List is the way to add something mid-shop (a same-trip
@@ -301,6 +341,14 @@ passed against the very bug it was meant to catch, because a button was matched 
 wrong label and nothing was ever clicked. Checking out the previous version and running
 the suite takes a minute and is the only thing that proves a test bites.
 
+**Green is not evidence about the world.** Both v23.2 defects sat under assertions that
+passed — `effectiveAddedAt` and the merge grace window were among the best covered things
+in the suite, and an adversarial review cited that coverage as a strength. The tests were
+written by the same reasoning that wrote the code, so they asserted the same false premise
+back at it. Coverage measures agreement between test and code. When a test and the code it
+covers were written together, ask separately whether the thing they agree on is true —
+`docs/DECISIONS.md`, "How to review this codebase", says how.
+
 Browser suites needing internals serve a temporary instrumented copy from `test/.tmp/`.
 Production code carries no test hooks.
 
@@ -319,6 +367,10 @@ for the app to have painted.
 2. Both suites green.
 3. Open a PR naming the rollback commit.
 4. Merge to `main`; GitHub Pages publishes it.
+5. If the release settled a question — chose between approaches, rejected a feature,
+   reversed an earlier decision — add it to `docs/DECISIONS.md`. An invariant here says
+   what must hold; that file says why, which is what stops the same idea being rebuilt.
+   Two features were built and removed inside one week for want of this.
 
 **Check for stranded commits before merging.** `git log origin/main..HEAD`. During one
 session three separate commits were pushed after their PR had already been merged and
@@ -331,13 +383,16 @@ than working around it.
 
 ## Known limitations, deliberately left
 
-- **A mixed fleet is the transition cost of v23.0, and it is bounded.** A phone on v22.2
-  or earlier writes picks with no `addedAt` and a file with no `seenRemoteAt`. Both are
-  handled — such items are bounded by the file's `lastUpdated`, and a device with no
-  horizon simply cannot delete anything — so the failure mode is that an old phone's
-  deletions do not propagate until it updates. It keeps rather than loses, which is the
-  side to err on. This replaces the two entries that used to sit here, which recorded that
-  the picks and the Wait List were last-writer-wins; they no longer are.
+- **A mixed fleet is the transition cost of v23.0, and it is bounded.** A phone on v23.1
+  or earlier writes no removal records, so its deletions fall back to `otherSideDropped` —
+  the v23.0 inference, with everything v23.2 says is wrong with it. A phone on v22.2 or
+  earlier additionally writes picks with no `addedAt` and a file with no `seenRemoteAt`;
+  `backfillAuthoredStamps` freezes the first the moment such a file is read here, and a
+  device with no horizon simply cannot delete anything. So the failure mode is that an old
+  phone's deletions may not propagate until it updates. Its additions always arrive. It
+  keeps rather than loses, which is the side to err on. This replaces the two entries that
+  used to sit here, which recorded that the picks and the Wait List were last-writer-wins;
+  they no longer are.
 
 - **A mixed fleet pollutes `lastCooked` for as long as it lasts.** A phone still on v21.9
   goes on stamping `lastCooked` when it generates a list, so on a household running both
