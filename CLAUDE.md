@@ -14,8 +14,8 @@ before proposing a feature or starting a review; read this one before changing c
 ## Commands
 
 ```
-npm test                # 285 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 182 browser assertions — needs playwright-core + Chromium
+npm test                # 309 logic assertions — no dependencies, no browser, ~1s
+npm run test:browser    # 191 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -55,6 +55,36 @@ Consequences:
 ## Invariants
 
 Each of these has a bug behind it.
+
+**"Is there work here worth keeping" and "is somebody in a shop right now" are two
+different questions.** They were one — `tripProgress`, counting ticks — and that single
+answer drove the freeze, the Review tab's auto-refresh, the undo stash and
+`chooseTripWinner`. But a family does two things with a list: they prune it at the kitchen
+table ("we have olive oil", "not chorizo this week") and they tick it off in the aisle.
+Only the second counted, so a carefully pruned list looked untouched to all four, and
+adding one recipe threw the lot away. `tripHasProgress` now asks `tripDecisions` — any
+STAMPED removal or at-home, plus ticks — and is what earns an undo and defends a list in
+the merge. `tripIsLive` still counts ticks only, because it freezes the week's recipes and
+pruning must not do that: people prune and then carry on planning. Stamped only, or the
+pantry default would count as a decision. Two functions on purpose; do not tidy them back
+into one. *(v23.3)*
+
+**A decision outlives its trip. A tick does not.** `checked` means "in the trolley" and
+belongs to the trip being shopped — v21.8's rule that last trip's ticks must not leak in
+still holds exactly. `removed` and `atHome` are statements about the week and the cupboard,
+still true whichever generation of the list is on screen. `generateShoppingList` carried
+both across only on a same-trip rebuild, which is why adding a recipe undid every
+deselection. The carry-forward is now split: decisions cross any rebuild, ticks cross only
+their own trip, and a shop marked done carries nothing. *(v23.3)*
+
+**Adding a recipe extends the shop; taking one off replaces it.** Any change to the picks
+used to mint a new trip, so "we'll do a curry too" discarded the trolley, undid the
+pruning, and had two phones minting rival trip ids for what everyone thought was one list —
+a Wait List addition, which is the same kind of act, was a same-trip rebuild all along.
+`sameTripRebuild` now also returns true when the picks changed only by ADDING, tested
+against `weekPlan.lastGeneratedRecipeSelections`; a removal or a serving change still
+starts a new trip. The new field is optional and additive: a file from an older build has
+none, `picksOnlyAdded` says no, and the old signature test alone decides. *(v23.3)*
 
 **A deletion is recorded, never inferred.** v23.0 decided deletions by comparing an item's
 `addedAt` against this device's horizon, and that was wrong twice: items written before
@@ -177,7 +207,9 @@ progress alone, which is the safe side. *(v21.8)*
 
 **The week's picks are frozen while a shop is under way.** `shoppingInProgress()` — one
 definition, `tripIsLive(shoppingData)` — disables every control on the Start tab that
-changes `weekPlan.selections`, and the tab says why. v21.8 instead let the picks change
+changes `weekPlan.selections`, and the tab says why. v23.3 deliberately left this reading
+TICKS, not decisions: locking the tab the moment somebody prunes would block the very
+thing the family was doing when they reported the bug. v21.8 instead let the picks change
 and then offered "Make a new list anyway", which confused the people it was there to
 protect: asked to choose between two lists, nobody knew which was which. There is
 nothing to choose now. The Wait List is the way to add something mid-shop (a same-trip

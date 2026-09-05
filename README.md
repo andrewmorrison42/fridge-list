@@ -101,6 +101,16 @@ that you must have seen the thing being deleted. Before that, clearing the week 
 appear to work and then undo itself when another phone reported in. If you clear something
 and it comes back, that is a bug worth reporting, not something to wait out.
 
+## I crossed things off the list, then added a recipe — do I lose them?
+
+No. From **v23.3** marking something "at home" or taking it off with the ✕ is treated as
+real work: adding another recipe extends the same shop rather than starting a new list, and
+your crossings-off stay crossed off. Several people can prune the list at the same time and
+everyone's changes survive. Ticking items off in the shop still belongs to that shop, so a
+list you genuinely replace starts with an empty trolley — and offers you the old one back.
+
+Before v23.3 adding a recipe silently rebuilt the list and undid every deselection.
+
 ## Why can't the others see what I added?
 
 Almost always because that phone is not connected to the shared folder. From **v22.2** it

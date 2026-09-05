@@ -33,6 +33,11 @@ nudges or suggests meals is out of scope, however gently it is phrased. If you a
 to propose a feature that ends in a recommendation about dinner, this is the entry to read
 first.
 
+**It does not decide what "using the list" means.** *(v23.3)* Pruning the list at home and
+ticking it off in the aisle are both real work, done by different people at different
+times, sometimes at once. The app protects both and privileges neither, and it does not
+lock anyone out of the other while one is happening.
+
 **It does not learn the shop for you.** *(removed in v23.0)* v22.0 shipped a learned aisle
 route — the app watched the order things were ticked off across finished shops and reordered
 the list to match the way the family walks round. It worked, and it was removed anyway. It
@@ -145,6 +150,40 @@ get it wrong and no shared notion of what "seen" meant. v23.0 made `mergeAuthore
 chokepoint and gave the app a persisted horizon. The objection expired; the idea did not.
 Worth remembering when rejecting something — record *why*, so you can tell later whether
 the reason still holds.
+
+### v23.3 — the family does two things with a list, and the app only knew about one
+
+Not a sync bug, and worth saying because the four releases before it were. The merge did
+what it was told. The app modelled one activity — ticking things off in the aisle — and
+defined "progress" as ticks. The family does two: they **prune the list at the kitchen
+table** ("we already have olive oil", "not chorizo this week") and then they tick it off
+in the shop. Pruning was invisible to every mechanism that protects a shopper's work, so
+all four stood down at once: the freeze did not engage, the Review tab auto-rebuilt the
+list, the undo stash returned early, and `chooseTripWinner` would not defend it. Adding a
+single recipe then rebuilt the list from scratch and undid the lot.
+
+Underneath it, a second thing: **adding a recipe was treated as replacing the list rather
+than extending it**, even though a Wait List addition — the same kind of act — had been an
+extension all along.
+
+Three decisions, taken with the family:
+
+- **Pruning protects, but does not lock.** It earns an undo and holds its ground against
+  another phone, but the Start tab stays open. Locking would have blocked exactly what
+  they were doing. This is why `tripHasProgress` and `tripIsLive` are two functions.
+- **Several people prune at once.** No single-writer restriction, no "one phone at a time"
+  mode. The per-flag merge already supported it; what was missing was that anything
+  believed it counted as work.
+- **At-home and removed decisions carry across even a genuinely new list.** They are facts
+  about the cupboard and the week, not about which generation of the list you are looking
+  at. Ticks still do not carry — those mean "in the trolley", and v21.8 exists because a
+  tick leaking into the wrong trip cost a family a shopping trip.
+
+The general lesson is the one written in "How to review this codebase" below, and this
+release is its first real test: **ask what a field means, not just what it does.**
+`tripProgress` does exactly what its name says. What it was being *used* to mean — "is
+there work here worth protecting" — was wrong, and no amount of checking the code against
+the documentation would have found it, because the documentation said ticks too.
 
 ### What the arc actually cost
 

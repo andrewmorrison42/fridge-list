@@ -906,7 +906,7 @@ async function suiteLiveListNotWiped(browser) {
     ok('which is what clears the ticks', await ticks() === 0, await ticks());
     const undo = await page.evaluate(() => {
       const c = [...document.querySelectorAll('#app .notice-card')]
-        .find(n => /had your ticks on it was replaced/i.test(n.innerText));
+        .find(n => /you had been working on was replaced/i.test(n.innerText));
       return c ? c.innerText : null;
     });
     ok('and the replaced list is offered back', !!undo && /3 item\(s\) ticked/.test(undo), undo);
@@ -1447,6 +1447,75 @@ async function suiteClearedWeekStaysCleared(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+async function suitePruningSurvivesAddingARecipe(browser) {
+  group('v23.3 — pruning the list survives somebody adding a recipe');
+  /* The report, end to end: two items taken off the list with the X, then another recipe
+     added to the week, and every deselection came back. The cause was not the merge — it
+     was that adding a recipe minted a NEW trip, and the carry-forward that preserves the
+     flags only ran on a same-trip rebuild. */
+  const srv = await serve(8189);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  try {
+    await page.goto('http://localhost:8189/', { waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+    await buildAList(page);
+
+    const tripBefore = (await readShopping(page)).weekPlan.tripId;
+    ok('the list starts on a trip', !!tripBefore);
+
+    // Prune two items the way a person does at the kitchen table, before leaving.
+    // Which two is read back out of the saved state rather than scraped off the row
+    // label — the label carries quantities and "(Staple)" suffixes, and matching on it
+    // is how a test ends up asserting nothing.
+    for (let i = 0; i < 2; i++) {
+      await page.click('#app .shop-row button.danger');
+      await page.waitForTimeout(250);
+    }
+    const afterPrune = await readShopping(page);
+    const pruned = afterPrune.shoppingList.filter(l => l.removed).map(l => l.ingredientName);
+    const isPruned = d => pruned.length === 2 && pruned.every(n => {
+      const l = d.shoppingList.find(x => x.ingredientName === n);
+      return l && l.removed && l.removedAt;
+    });
+    ok('both items really were removed, and stamped', isPruned(afterPrune), pruned);
+
+    // Nothing is ticked, so this must NOT have locked the week's recipes.
+    const boxDisabled = await page.evaluate(async () => {
+      document.querySelector('#mainNav button[data-tab="start"]').click();
+      await new Promise(r => setTimeout(r, 600));
+      const b = document.querySelector('#app input[type=checkbox]');
+      return b ? b.disabled : null;
+    });
+    ok('pruning does not freeze the week — the Start tab is still usable', boxDisabled === false);
+
+    // ...and then somebody adds another recipe.
+    await page.waitForSelector('#app input[type=checkbox]', { timeout: 15000 });
+    const boxes = await page.$$('#app input[type=checkbox]');
+    await boxes[2].check();
+    await page.waitForTimeout(400);
+    const picked = (await readShopping(page)).weekPlan.selections.length;
+    ok('a third recipe really was added', picked === 3, picked);
+
+    await page.click('#mainNav button[data-tab="review"]');
+    await page.waitForTimeout(700);
+
+    const after = await readShopping(page);
+    ok('the added recipe reached the list',
+       after.shoppingList.length > afterPrune.shoppingList.length,
+       { before: afterPrune.shoppingList.length, after: after.shoppingList.length });
+    ok('and both pruned items are STILL off the list — the reported bug', isPruned(after),
+       after.shoppingList.filter(l => l.removed).map(l => l.ingredientName));
+    ok('adding a recipe extended the same trip rather than starting a new one',
+       after.weekPlan.tripId === tripBefore, { before: tripBefore, after: after.weekPlan.tripId });
+    const replacedCard = await page.evaluate(() =>
+      [...document.querySelectorAll('#app .notice-card')].some(n => /was replaced/i.test(n.innerText)));
+    ok('and nothing claims the list was replaced', replacedCard === false);
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 (async () => {
   console.log('Chromium: ' + EXECUTABLE);
   const browser = await chromium.launch({ executablePath: EXECUTABLE, args: ['--no-sandbox'] });
@@ -1460,6 +1529,7 @@ async function suiteClearedWeekStaysCleared(browser) {
                          suiteTwoPhonesBothKeepTheirWork,
                          suiteImportRespectsTheMerge,
                          suiteClearedWeekStaysCleared,
+                         suitePruningSurvivesAddingARecipe,
                          suiteUnsyncedPhoneSaysSo,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
