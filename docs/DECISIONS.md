@@ -185,6 +185,34 @@ release is its first real test: **ask what a field means, not just what it does.
 there work here worth protecting" — was wrong, and no amount of checking the code against
 the documentation would have found it, because the documentation said ticks too.
 
+### v23.4 — a control that had never existed
+
+Reported: adding a new ingredient never asks for the units. It never could. Every write to
+`shoppingUnit` was either the seed migration or a hardcoded `''`, with one exception — the
+unit typed on a recipe line, captured when that recipe is saved. Nothing could edit it
+afterwards.
+
+It stayed hidden because the seed ships 446 ingredients with units already set (245 `g`,
+120 `qty`, 80 `mL`, one blank), so the gap only bites a household adding its own.
+
+Two decisions:
+
+- **The picker offers `g`, `mL` and "each", and nothing else.** Free text would let
+  somebody enter `cup`, which the app deliberately refuses as a shopping unit because it
+  hard-locks that ingredient's unit box to a kitchen measure forever after. The three
+  cover 100% of the real data.
+- **`qty` is shown as "each" and still stored as `qty`.** No change to the shape of synced
+  JSON, and it closes a separate open item about the editor showing `qty` as if it were a
+  unit. The catch is that the editor SAVES what that box displays, so the label lives in
+  `.value` and the truth in `dataset.unit` — a detail worth a test of its own, and it has
+  one.
+
+The reason this is worth recording rather than just fixing: it is the third defect running
+that this repo's own documentation would have concealed. Two strings in the UI assert the
+control exists. Reading the docs finds nothing; enumerating every writer of `shoppingUnit`
+finds it in a minute. That is the method in "How to review this codebase" below, and this
+was its first unprompted success.
+
 ### What the arc actually cost
 
 Four structural sync changes in two days, two of them fixing something the previous one

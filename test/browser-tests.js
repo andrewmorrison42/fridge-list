@@ -1516,6 +1516,147 @@ async function suitePruningSurvivesAddingARecipe(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+async function suiteIngredientUnits(browser) {
+  group('v23.4 — an ingredient you add can be given a unit');
+  /* Reported: adding a new ingredient never asks for the units. It never could — every
+     creation site wrote shoppingUnit:'' and the master-list row editor offered name,
+     category, aisle and delete, with no unit control anywhere in the app. */
+  const srv = await serve(8190);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  const master = () => page.evaluate(() =>
+    JSON.parse(localStorage.getItem('fma_recipes_v4')).ingredients);
+  try {
+    await page.goto('http://localhost:8190/', { waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+    await page.click('#mainNav button[data-tab="settings"]');
+    await page.waitForTimeout(500);
+    await page.click('button:has-text("Show ingredient list")');
+    await page.waitForTimeout(500);
+
+    // The reported flow: add an ingredient of your own.
+    await page.fill('input[placeholder="add a new ingredient…"]', 'Nduja');
+    const unitOnAdd = await page.evaluate(() => {
+      const box = [...document.querySelectorAll('#app select')]
+        .find(s => [...s.options].some(o => /counted|each/i.test(o.textContent))
+                && [...s.options].some(o => /\bg\b|weight/i.test(o.textContent)));
+      return !!box;
+    });
+    ok('the add row asks for a unit', unitOnAdd === true);
+
+    await page.click('button:has-text("Add ingredient")');
+    await page.waitForTimeout(500);
+    const created = (await master()).find(i => i.name === 'Nduja');
+    ok('the ingredient was created', !!created, created);
+
+    // Its row must offer a unit control, and the choice must stick.
+    const setIt = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('.ingredient-editor-row')];
+      const row = rows.find(r => {
+        const n = r.querySelector('input');
+        return n && n.value === 'Nduja';
+      });
+      if (!row) return 'no row';
+      const sel = [...row.querySelectorAll('select')]
+        .find(s => [...s.options].some(o => o.value === 'g')
+                && [...s.options].some(o => o.value === 'qty'));
+      if (!sel) return 'no unit control';
+      sel.value = 'g';
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      return 'set';
+    });
+    ok('the row offers a unit control', setIt !== 'no unit control', setIt);
+    await page.waitForTimeout(400);
+    const saved = (await master()).find(i => i.name === 'Nduja');
+    ok('and the unit is saved', saved && saved.shoppingUnit === 'g',
+       saved && saved.shoppingUnit);
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
+async function suiteCountedUnitReadsAsEach(browser) {
+  group('v23.4 — a counted ingredient reads as "each" but still saves as qty');
+  /* The recipe editor locks the unit box to the master unit and then SAVES whatever that
+     box contains, so showing a friendlier label is a data-integrity question, not a
+     cosmetic one: get it wrong and "each" is written into every recipe line. */
+  const srv = await serve(8191);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  try {
+    await page.goto('http://localhost:8191/', { waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+
+    // Find a real counted ingredient out of the seed rather than inventing one.
+    const counted = await page.evaluate(() =>
+      (JSON.parse(localStorage.getItem('fma_recipes_v4')).ingredients
+        .find(i => i.shoppingUnit === 'qty') || {}).name);
+    ok('the seed has a counted ingredient to test with', !!counted, counted);
+
+    const shown = await page.evaluate(async (name) => {
+      document.querySelector('#mainNav button[data-tab="recipes"]').click();
+      await new Promise(r => setTimeout(r, 800));
+      const addBtn = [...document.querySelectorAll('button')]
+        .find(b => /add recipe|new recipe/i.test(b.textContent));
+      if (!addBtn) return { err: 'no add-recipe button' };
+      addBtn.click();
+      await new Promise(r => setTimeout(r, 600));
+      const nameIn = document.querySelector('.ing-name-input');
+      if (!nameIn) return { err: 'no ingredient row' };
+      nameIn.value = name;
+      nameIn.dispatchEvent(new Event('input', { bubbles: true }));
+      nameIn.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise(r => setTimeout(r, 300));
+      const row = nameIn.closest('.ingredient-editor-row') || nameIn.parentElement;
+      const unitBox = row.querySelector('.unit-input');
+      return { text: unitBox ? unitBox.value : null,
+               truth: unitBox ? (unitBox.dataset.unit || null) : null };
+    }, counted);
+
+    ok('the editor no longer shows "qty" as if it were a unit',
+       shown.text !== 'qty', shown);
+    ok('it reads as "each"', shown.text === 'each', shown);
+    ok('and the real unit is kept for saving', shown.truth === 'qty', shown);
+
+    /* The assertion this whole suite exists for. The save path reads the unit box back
+       as the recipe line's unit, so a careless label change writes "each" into recipe
+       data. Assert what is STORED, not what is rendered. */
+    const stored = await page.evaluate(async (name) => {
+      // The recipe name box has no placeholder — it is identified by its field label.
+      const titleField = [...document.querySelectorAll('.field')]
+        .find(f => /recipe name/i.test((f.querySelector('label') || {}).textContent || ''));
+      const titleIn = titleField ? titleField.querySelector('input') : null;
+      if (titleIn) {
+        titleIn.value = 'Unit guard test';
+        titleIn.dispatchEvent(new Event('input', { bubbles: true }));
+        titleIn.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      const qtyIn = document.querySelector('.qty-input');
+      if (qtyIn) {
+        qtyIn.value = '2';
+        qtyIn.dispatchEvent(new Event('input', { bubbles: true }));
+        qtyIn.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      const save = [...document.querySelectorAll('button')]
+        .find(b => b.textContent.trim() === 'Save recipe');
+      if (!save) return { err: 'no save button' };
+      save.click();
+      await new Promise(r => setTimeout(r, 900));
+      const rec = JSON.parse(localStorage.getItem('fma_recipes_v4')).recipes
+        .find(r => r.name === 'Unit guard test');
+      if (!rec) return { err: 'recipe not saved' };
+      const line = (rec.ingredients || []).find(i => i.ingredientName === name);
+      return { unit: line ? line.unit : null, qty: line ? line.quantity : null };
+    }, counted);
+
+    ok('the recipe saved', !stored.err, stored);
+    ok('and the STORED unit is still "qty", not the label shown on screen',
+       stored.unit === 'qty', stored);
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 (async () => {
   console.log('Chromium: ' + EXECUTABLE);
   const browser = await chromium.launch({ executablePath: EXECUTABLE, args: ['--no-sandbox'] });
@@ -1530,6 +1671,7 @@ async function suitePruningSurvivesAddingARecipe(browser) {
                          suiteImportRespectsTheMerge,
                          suiteClearedWeekStaysCleared,
                          suitePruningSurvivesAddingARecipe,
+                         suiteIngredientUnits, suiteCountedUnitReadsAsEach,
                          suiteUnsyncedPhoneSaysSo,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
