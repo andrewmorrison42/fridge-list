@@ -118,6 +118,17 @@ says so itself: a red bar across the top reading *"This phone is not connected t
 family's list"*, with a button that takes you straight to sign-in. If you see that bar,
 nothing you add is reaching anyone else until you connect it.
 
+## How does the app know whether something is bought by weight or by the each?
+
+Every ingredient has a shopping unit — grams, millilitres, or counted ("each") — and that
+is what the shopping list totals it in. From **v23.4** you set it yourself: **Settings →
+Ingredient list** asks for it when you add an ingredient, and every ingredient's row has a
+unit box next to its aisle and category. The filter there will show you anything still
+missing an aisle, a category or a unit.
+
+Before v23.4 there was no way to set it at all, so an ingredient you added yourself had no
+unit and the list fell back to whatever unit the first recipe using it happened to specify.
+
 ## Which version am I on?
 
 The build number shows at the top of the **Settings** tab, and in the startup message

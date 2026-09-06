@@ -340,7 +340,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v23.3';
+const APP_VERSION = 'v23.4';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -584,12 +584,33 @@ function setStapleQty(name, qty){
   if(n !== null) map[name] = n;
 }
 
+/* v23.4: the shopping units the app can actually work with, and the only ones it will
+   offer. A kitchen measure (cup/TBsp/tsp) must NEVER become an ingredient's shopping
+   unit — it hard-locks the recipe editor's unit box to that measure forever after, which
+   is why saveRecipeFromForm converts such lines to mL instead. The stored values are
+   exactly the three the seed already uses, so this adds no new shape to the file. */
+const SHOPPING_UNIT_OPTIONS = [
+  { value: '', label: '\u2014 unit \u2014' },
+  { value: 'g', label: 'Weight (g)' },
+  { value: 'mL', label: 'Volume (mL)' },
+  { value: 'qty', label: 'Counted (each)' }
+];
+
+/* What a shopping unit is CALLED, as against what is stored. 'qty' is the stored value
+   for 120 of the seeded ingredients and means "each"; displayUnit already blanks it for
+   the shopping list, and a unit that was never set has always been treated as counted.
+   One rule, so the picker, the recipe editor and the staples row cannot drift apart —
+   they used to be three separate opinions, and one of them didn't exist. */
+function unitLabel(u){
+  const v = (u || '').trim();
+  return v === '' ? 'each' : (displayUnit(v) || 'each');
+}
+
 // What to label the amount box with in Settings. 'qty' means "each", which reads
 // better than the raw token beside a number someone is about to type.
 function stapleUnitLabel(name){
   const meta = findIngredientMeta(name);
-  const u = (meta && meta.shoppingUnit) || '';
-  return u === '' ? 'each' : (displayUnit(u) || 'each');
+  return unitLabel(meta && meta.shoppingUnit);
 }
 
 function featureOn(name){
@@ -4899,9 +4920,16 @@ function wireUnitControls(name, qty, unit, unitSel, hint, presetDisplayUnit){
   function showTextUnit(lockedValue){
     unitSel.style.display='none'; unit.style.display='';
     if(lockedValue !== undefined && lockedValue !== null && lockedValue !== false){
-      unit.value = lockedValue; unit.readOnly = true; unit.classList.add('locked-unit');
+      /* v23.4: show what the unit is CALLED, keep what is STORED. collectRecipeIngredients
+         reads this box back as the recipe line's unit, so putting "each" in `.value` would
+         write "each" into every recipe that uses a counted ingredient. dataset.unit carries
+         the truth and the save path prefers it. */
+      unit.value = unitLabel(lockedValue);
+      unit.dataset.unit = lockedValue;
+      unit.readOnly = true; unit.classList.add('locked-unit');
       unit.title = 'Unit is set by the master ingredient list — change it via Settings › Ingredients if it\'s wrong for every recipe.';
     } else {
+      delete unit.dataset.unit;   // or a locked truth leaks into a free-text line
       unit.readOnly = false; unit.classList.remove('locked-unit'); unit.title='';
     }
   }
@@ -4985,7 +5013,11 @@ function collectIngredientRows(wrap){
     const unitInput = row.querySelector('.unit-input');
     const unitSel = row.querySelector('.unit-select');
     const useSel = unitSel && unitSel.style.display !== 'none';
-    const unitVal = useSel ? unitSel.value : unitInput.value.trim();
+    // v23.4: a locked box displays the unit's LABEL, so the stored unit comes off the
+    // dataset. Present-but-empty is a real value here, hence the undefined test.
+    const unitVal = useSel ? unitSel.value
+                  : (unitInput.dataset.unit !== undefined ? unitInput.dataset.unit
+                                                          : unitInput.value.trim());
     if(useSel && MEASURE_ML[unitVal]){
       const num = parseMeasureQty(qtyStr);
       if(num===null || !validMeasureQty(num, unitVal)){
@@ -5518,7 +5550,7 @@ function renderSettingsTab(){
   const searchInput = el('input',{type:'search', placeholder:'Search ingredients…'});
   const filterSelect = el('select',{});
   filterSelect.appendChild(el('option',{value:'all'},['Show: All ingredients']));
-  filterSelect.appendChild(el('option',{value:'uncategorised'},['Show: Uncategorised only']));
+  filterSelect.appendChild(el('option',{value:'uncategorised'},['Show: needs an aisle, category or unit']));
   searchbar.appendChild(searchInput); searchbar.appendChild(filterSelect);
   managerBody.appendChild(searchbar);
 
@@ -5528,8 +5560,12 @@ function renderSettingsTab(){
   const usageIndex = buildIngredientUsageIndex();
   const USED_IN_SHOW = 5;
 
+  /* v23.4: a missing shopping unit counts too. It could not before, so an ingredient
+     added by hand — which until v23.4 could never be given a unit at all — was invisible
+     to the one filter whose whole purpose is "things worth fixing". */
   function isUncategorisedIngredient(i){
-    return isUnsetCategory(i.shoppingCategory) || isUnsetAisle(i.aisle);
+    return isUnsetCategory(i.shoppingCategory) || isUnsetAisle(i.aisle)
+        || !((i.shoppingUnit || '').trim());
   }
   // The bulk "delete all unused ingredients" action was removed in v19.0. It was a
   // development convenience; with other people adding their own ingredients it
@@ -5554,7 +5590,7 @@ function renderSettingsTab(){
     const shownTotal = list.length;
     const capped = showAllRows ? list : list.slice(0, ROW_CAP);
     countNote.innerHTML = '';
-    countNote.appendChild(el('span',{},[capped.length + ' of ' + shownTotal + ' shown · ' + totalUncategorised + ' uncategorised in total ']));
+    countNote.appendChild(el('span',{},[capped.length + ' of ' + shownTotal + ' shown · ' + totalUncategorised + ' needing an aisle, category or unit ']));
     if(!showAllRows && shownTotal > ROW_CAP){
       const showAllBtn = el('button',{class:'btn small secondary', type:'button'},['Show all ' + shownTotal]);
       showAllBtn.addEventListener('click', ()=>{ showAllRows = true; drawList(); });
@@ -5591,12 +5627,48 @@ function renderSettingsTab(){
         aisleSelect.value = matched;
       }
       fillAisles(false);
+      /* v23.4: until now nothing in the app could set an ingredient's shopping unit. Every
+         creation site wrote '' and this row offered name, category, aisle and delete — while
+         the recipe editor's unit box told people to "change it via Settings › Ingredients",
+         which is here, where no such control existed. */
+      const unitSelect = el('select',{style:'flex:0 0 auto;min-width:120px;',
+        title:'How this ingredient is bought — the unit the shopping list totals it in'});
+      function fillUnits(){
+        unitSelect.innerHTML = '';
+        SHOPPING_UNIT_OPTIONS.forEach(o=> unitSelect.appendChild(el('option',{value:o.value},[o.label])));
+        const cur = (ing.shoppingUnit || '').trim();
+        /* Anything else got there from a recipe line, which is the one path that has ever
+           captured a unit. Keep it selectable rather than silently rewriting it the next
+           time somebody edits this row's aisle. */
+        if(cur && !SHOPPING_UNIT_OPTIONS.some(o=> o.value === cur)){
+          unitSelect.appendChild(el('option',{value:cur},[cur + ' (current — off-list)']));
+        }
+        unitSelect.value = cur;
+      }
+      fillUnits();
       const delBtn = el('button',{class:'btn small danger', type:'button', title:'Delete this ingredient from the master list'},['✕']);
       function saveMeta(){
         ing.aisle = (aisleSelect.value || 'Uncategorised').replace(' (current — off-list)','');
         ing.shoppingCategory = catSelect.value || 'Other';
+        ing.shoppingUnit = unitSelect.value;
         persist('recipes');
         drawList();
+      }
+      /* Changing a unit that is already set is worth a word first: the amounts saved in
+         recipes are not converted. Changing one that was never set is just filling a gap,
+         and asking about that would be noise on exactly the ingredients this fixes. */
+      function changeUnit(){
+        const prev = (ing.shoppingUnit || '').trim();
+        const usedIn = usageIndex.get(ing.name.trim().toLowerCase()) || [];
+        if(prev && prev !== unitSelect.value && usedIn.length){
+          const msg = 'Change the shopping unit for "' + ing.name + '" from '
+            + unitLabel(prev) + ' to ' + unitLabel(unitSelect.value) + '?\n\n'
+            + 'It is used in ' + usedIn.length + ' recipe(s). The amounts already saved in '
+            + 'those recipes are NOT converted — they keep the numbers they have, and the '
+            + 'shopping list will total them in the new unit.';
+          if(!confirm(msg)){ fillUnits(); return; }
+        }
+        saveMeta();
       }
       function saveName(){
         const newName = nameInput.value.trim();
@@ -5625,10 +5697,12 @@ function renderSettingsTab(){
       nameInput.addEventListener('change', saveName);
       aisleSelect.addEventListener('change', saveMeta);
       catSelect.addEventListener('change', ()=>{ fillAisles(true); saveMeta(); });
+      unitSelect.addEventListener('change', changeUnit);
       delBtn.addEventListener('click', confirmDelete);
       row.appendChild(nameInput);
       row.appendChild(catSelect);
       row.appendChild(aisleSelect);
+      row.appendChild(unitSelect);
       row.appendChild(delBtn);
       wrapper.appendChild(row);
 
@@ -5662,20 +5736,26 @@ function renderSettingsTab(){
   // gets a proper aisle/category so anyone can find it in the shop via Wait List.
   const addWrap = el('div',{class:'row', style:'align-items:center;gap:6px;margin:10px 0;'});
   const addNameInput = el('input',{type:'text', placeholder:'add a new ingredient…', style:'min-width:200px;'});
+  // v23.4: ask for the unit at the point of creation — this is the flow that was reported,
+  // where the app took the name and never asked how the thing is bought.
+  const addUnitSelect = el('select',{style:'flex:0 0 auto;min-width:120px;',
+    title:'How this ingredient is bought — you can change it in its row afterwards'});
+  SHOPPING_UNIT_OPTIONS.forEach(o=> addUnitSelect.appendChild(el('option',{value:o.value},[o.label])));
   const addBtn2 = el('button',{class:'btn small', type:'button'},['Add ingredient']);
   function addMasterDirect(){
     const v = addNameInput.value.trim();
     if(!v) return;
     if(findIngredientMeta(v)){ alert('"' + v + '" is already in the ingredient list — search for it above to edit it.'); return; }
-    recipesData.ingredients.push({name: v, shoppingUnit:'', aisle:'Uncategorised', shoppingCategory:'Other'});
+    recipesData.ingredients.push({name: v, shoppingUnit: addUnitSelect.value, aisle:'Uncategorised', shoppingCategory:'Other'});
     persist('recipes');
     addNameInput.value = '';
+    addUnitSelect.value = '';
     searchInput.value = v; // jump straight to the new entry so its aisle/category get set now
     drawList();
   }
   addBtn2.addEventListener('click', addMasterDirect);
   addNameInput.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); addMasterDirect(); } });
-  addWrap.appendChild(addNameInput); addWrap.appendChild(addBtn2);
+  addWrap.appendChild(addNameInput); addWrap.appendChild(addUnitSelect); addWrap.appendChild(addBtn2);
   managerBody.insertBefore(addWrap, listWrap);
   container.appendChild(managerBody);
   // list is drawn on first open — no point building 400+ rows nobody's looking at

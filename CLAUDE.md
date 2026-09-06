@@ -14,8 +14,8 @@ before proposing a feature or starting a review; read this one before changing c
 ## Commands
 
 ```
-npm test                # 309 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 191 browser assertions — needs playwright-core + Chromium
+npm test                # 322 logic assertions — no dependencies, no browser, ~1s
+npm run test:browser    # 203 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -55,6 +55,26 @@ Consequences:
 ## Invariants
 
 Each of these has a bug behind it.
+
+**An ingredient's shopping unit must be settable, and `SHOPPING_UNIT_OPTIONS` is the whole
+vocabulary.** Until v23.4 nothing in the app could set `shoppingUnit`: every creation site
+wrote `''` and the master-list row offered name, category, aisle and delete — while the
+recipe editor's unit box told people to "change it via Settings › Ingredients", where the
+control did not exist, and the delete dialog claimed to be clearing a unit nobody could
+have set. The picker offers `''`, `g`, `mL`, `qty` and nothing else: a kitchen measure
+(cup/TBsp/tsp) must NEVER become a shopping unit — it hard-locks the recipe editor's unit
+box to that measure forever after, which is why `saveRecipeFromForm` converts such lines to
+mL. A unit already on an ingredient that is not in the list came off a recipe line; the row
+keeps it as an "(off-list)" option rather than rewriting it the next time somebody edits
+the aisle. *(v23.4)*
+
+**The locked unit box shows a LABEL and stores the truth in `dataset.unit`.**
+`collectRecipeIngredients` reads that box back as the recipe line's unit, so displaying
+"each" for a `qty` ingredient without the dataset writes `"each"` into every recipe that
+uses one. `unitLabel` is the single rule for what a unit is called — blank and `qty` both
+read as "each" — and `stapleUnitLabel` calls it rather than keeping a second copy. If you
+touch either, the test to keep green is the one asserting what is SAVED, not what is
+rendered. *(v23.4)*
 
 **"Is there work here worth keeping" and "is somebody in a shop right now" are two
 different questions.** They were one — `tripProgress`, counting ticks — and that single
@@ -439,10 +459,6 @@ than working around it.
   checkout (one number, no per-item prices, and the trend is the whole point — needs a
   currency decision first); "you buy this every week, make it a staple"; and the
   never-bought and never-cooked lists that would make a clear-out an informed one.
-
-- **`qty` in the recipe editor.** The shopping list no longer prints "1 qty Banana",
-  but the editor still shows `qty` as a unit for the 120 ingredients that use it to
-  mean "each".
 
 - **Wait List additions are not visibly confirmed.** Making an unsent addition obvious
   on the Wait List tab would address the limitation above without touching the merge.

@@ -69,7 +69,7 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProg
                'mergeShoppingData', 'lineMergeKey', 'selectionsSignature',
                'recipeSelectionsSignature', 'shoppingListIsStale',
                'featureOn', 'stapleQtyFor', 'stapleQtyToShopping', 'parseQty', 'fmtQty',
-               'displayUnit', 'lineQtyText', 'findIngredientMeta', 'rollUpQty', 'fmtExactQty',
+               'displayUnit', 'unitLabel', 'stapleUnitLabel', 'lineQtyText', 'findIngredientMeta', 'rollUpQty', 'fmtExactQty',
                'ingredientLineText', 'recipeToPlainText', 'recipeToHtml', 'buildShareBundle',
                'tripRecordFromShopping', 'mergeTripHistory', 'pruneTripHistory',
                'recipeHistoryLabel', 'recipeHistoryTime', 'daysSinceStamp', 'daysSinceCooked',
@@ -106,12 +106,14 @@ vm.runInContext(
   extractConst('TOMBSTONE_MAX_AGE_MS') + '\n' +
   extractConst('TOMBSTONE_MAX') + '\n' +
   extractConst('SELECTION_FIELDS') + '\n' +
+  extractConst('SHOPPING_UNIT_OPTIONS') + '\n' +
   extractConst('WAITLIST_FIELDS') + '\n' +
   extractConst('SYNC_UNLINKED_GRACE_MS') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
   '             ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,' +
+  '             unitLabel, stapleUnitLabel, SHOPPING_UNIT_OPTIONS, MEASURE_ML,' +
   '             tripProgress, tripDecisions, tripHasProgress, tripIsLive, tripIsWorkedOn,' +
   '             chooseTripWinner, TRIP_LIVE_WINDOW_MS,' +
   '             sameTripRebuild, stashReplacedTrip, generateShoppingList,' +
@@ -133,6 +135,7 @@ vm.runInContext(
 const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,
         ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,
+        unitLabel, stapleUnitLabel, SHOPPING_UNIT_OPTIONS, MEASURE_ML,
         tripProgress, tripDecisions, tripHasProgress, tripIsLive, tripIsWorkedOn,
         chooseTripWinner, TRIP_LIVE_WINDOW_MS,
         sameTripRebuild, stashReplacedTrip, generateShoppingList,
@@ -1628,6 +1631,51 @@ group('v23.3 — a decision has to be a decision, not a default');
   sd.shoppingList.forEach(l => { l.atHome = true; });   // as the pantry rule would leave it
   ok('an unstamped "at home" is a default and does not count as work',
      tripHasProgress(sd) === false);
+}
+
+/* ---------- v23.4: an ingredient you add yourself can be given a unit ----------
+
+   Reported: adding a new ingredient never asks for the units. It never could — every
+   creation site wrote shoppingUnit:'' and no control anywhere in the app could set it,
+   while the recipe editor's unit box told people to change it in Settings, where the
+   control did not exist. */
+
+group('v23.4 — one rule for what a shopping unit is called');
+{
+  ok('a unit that was never set reads as "each"', unitLabel('') === 'each');
+  ok('so does one that is missing altogether', unitLabel(undefined) === 'each');
+  ok('"qty" reads as "each" — it is stored, not shown', unitLabel('qty') === 'each');
+  ok('so does any other counted token', unitLabel('each') === 'each' && unitLabel('pcs') === 'each');
+  ok('a real unit reads as itself', unitLabel('g') === 'g' && unitLabel('mL') === 'mL');
+  ok('and whitespace does not make a new unit', unitLabel('  g  ') === 'g');
+
+  // The staples row had the only correct version of this rule. It must now BE that rule,
+  // not a second copy of it that can drift.
+  setRecipesData({ recipes: [], ingredients: [
+      { name:'Banana', shoppingUnit:'qty' }, { name:'Flour', shoppingUnit:'g' },
+      { name:'Nduja', shoppingUnit:'' } ],
+    settings:{ features:{}, staples:[], stapleQty:{} } });
+  ok('the staples label agrees with it for a counted ingredient',
+     stapleUnitLabel('Banana') === unitLabel('qty'));
+  ok('...for a weighed one', stapleUnitLabel('Flour') === unitLabel('g'));
+  ok('...for one with no unit yet', stapleUnitLabel('Nduja') === unitLabel(''));
+  ok('...and for a name that is not an ingredient at all',
+     stapleUnitLabel('nothing by this name') === 'each');
+  noStaples();
+}
+
+group('v23.4 — the picker offers only units the app can work with');
+{
+  const vals = SHOPPING_UNIT_OPTIONS.map(o => o.value);
+  ok('it offers exactly the three the data uses, plus "not set"',
+     JSON.stringify(vals) === JSON.stringify(['', 'g', 'mL', 'qty']), vals);
+  /* A kitchen measure must never become a shopping unit: it hard-locks the recipe
+     editor's unit box to that measure forever after, which is why saveRecipeFromForm
+     converts such lines to mL instead. */
+  ok('and never a kitchen measure',
+     !vals.some(v => Object.prototype.hasOwnProperty.call(MEASURE_ML, v)), Object.keys(MEASURE_ML));
+  ok('every option has a label a person can read',
+     SHOPPING_UNIT_OPTIONS.every(o => typeof o.label === 'string' && o.label.trim().length > 0));
 }
 
 /* ---------- result ---------- */
