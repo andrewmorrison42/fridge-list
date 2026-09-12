@@ -514,9 +514,29 @@ for the app to have painted.
    likely to be wrong — v23.9 and v24.0 each shipped a structural fix that was less
    structural than advertised, and both times a by-hand revert was the only thing that
    noticed. A claim with no case behind it is a comment.
-4. Open a PR naming the rollback commit.
-5. Merge to `main`; GitHub Pages publishes it.
-6. If the release settled a question — chose between approaches, rejected a feature,
+4. **Review the merge candidate as a separate pass, following `docs/DECISIONS.md`,
+   "How to review this codebase".** Not the builder re-reading their own diff: the same
+   reasoning that wrote the code wrote the tests, and it will find them agreeing. The
+   cheapest real version is a **fresh session** — hand it the branch and that section, and
+   nothing else. It has now found something both times it has been run: the v23.1 horizon
+   regression a week after v23.0 was built around that field, and v24.0.1 within the hour.
+
+   Use the half of the method that does not read documentation. **Follow the data**: for
+   every field something treats as evidence, find all its writers and ask whether it still
+   means what its readers assume. Tracing invariants finds code that contradicts its stated
+   intent; it cannot find code that faithfully implements an intent that is wrong, which is
+   what both v23.2 defects were, and what the v24.0.1 one was.
+
+   Step 3 does not substitute for this. **A bite case only covers a defect somebody thought
+   of** — it is a ratchet, not a net: it stops a fixed bug coming back and says nothing
+   about the one nobody has had yet. Both are needed and neither is the other.
+
+   If a separate pass genuinely is not possible, say so in the PR body rather than skip it
+   quietly. A release that went out unreviewed and turned out fine is not evidence; v24.0
+   went out unreviewed and did not.
+5. Open a PR naming the rollback commit, and what the review found — including "nothing".
+6. Merge to `main`; GitHub Pages publishes it.
+7. If the release settled a question — chose between approaches, rejected a feature,
    reversed an earlier decision — add it to `docs/DECISIONS.md`. An invariant here says
    what must hold; that file says why, which is what stops the same idea being rebuilt.
    Two features were built and removed inside one week for want of this.
