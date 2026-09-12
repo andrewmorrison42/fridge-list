@@ -88,6 +88,13 @@ module.exports = [
     replace: '    } else if(rRead === null || rRead.absent){'
   },
 
+  {
+    name: 'a merge that lands out of order drags `held` backwards, so the device reports ' +
+          'itself behind a copy it is holding',
+    find: '    if(!held || tsOf(mtime) >= tsOf(held)) held = mtime;',
+    replace: '    held = mtime;'
+  },
+
   /* ---- v24.0: the replacement record ---- */
   {
     name: '"Keep this one" mints a superseding trip whatever the stash is, so a phone ' +

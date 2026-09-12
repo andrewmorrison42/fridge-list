@@ -14,15 +14,15 @@ before proposing a feature or starting a review; read this one before changing c
 ## Commands
 
 ```
-npm test                # 485 logic assertions — no dependencies, no browser, ~1s
-npm run test:bite       # puts 9 shipped defects back; the suite must notice every one
+npm test                # 490 logic assertions — no dependencies, no browser, ~1s
+npm run test:bite       # puts 10 shipped defects back; the suite must notice every one
 npm run test:browser    # 210 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
 All three must pass before pushing. The logic suite is cheap enough to run constantly;
 run the browser suite before any commit that touches rendering, sync or the service
-worker. `test:bite` runs the logic suite nine times over, so it takes about ten seconds —
+worker. `test:bite` runs the logic suite ten times over, so it takes about ten seconds —
 run it before pushing, and whenever you have just written a test.
 
 ## Working in a 1.3 MB file
@@ -291,8 +291,11 @@ is why they kept arriving somewhere new. Four events: `answered(status, mtime)` 
 maps it, so nobody decides locally what a 404 means; `merged(mtime, remoteCopy)`, which
 takes the COPY so a function holding only metadata cannot claim one; `wrote(mtime)`, kept
 separate because a write teaches this device nothing about anybody else; and
-`unreachable()`. Both holders move `held` and `latest` together, `horizon()` is the only
-reader, and no local save clock is in scope to fall back to. Every folder request reports
+`unreachable()`. Both holders move `held` and `latest` together and **neither goes
+backwards** — the two merge paths are not mutually excluded (`syncInFlight` guards the
+pollers, but `writeShoppingMerged` merges from the autosave timer and checks nothing), so an
+out-of-order merge would otherwise leave a device reporting itself behind a copy it holds.
+`horizon()` is the only reader, and no local save clock is in scope to fall back to. Every folder request reports
 exactly one event on every exit path; a source test counts the call sites, so a new one
 fails the suite rather than silently under-reporting. `listFreshness` and `syncAlertState`
 both read one `snapshot()` instead of each assembling the same list by hand.
