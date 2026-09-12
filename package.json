@@ -1,12 +1,13 @@
 {
   "name": "fridge-list",
-  "version": "23.8.0",
+  "version": "24.0.0",
   "private": true,
   "description": "Family recipes, weekly menu and shopping list — a single self-contained page.",
   "scripts": {
     "test": "node test/run-tests.js",
     "test:browser": "node test/browser-tests.js",
-    "test:all": "node test/run-tests.js && node test/browser-tests.js",
+    "test:bite": "node test/bite.js",
+    "test:all": "node test/run-tests.js && node test/bite.js && node test/browser-tests.js",
     "postinstall-browser": "playwright install chromium"
   },
   "devDependencies": {

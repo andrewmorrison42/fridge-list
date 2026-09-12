@@ -14,14 +14,16 @@ before proposing a feature or starting a review; read this one before changing c
 ## Commands
 
 ```
-npm test                # 433 logic assertions — no dependencies, no browser, ~1s
+npm test                # 485 logic assertions — no dependencies, no browser, ~1s
+npm run test:bite       # puts 9 shipped defects back; the suite must notice every one
 npm run test:browser    # 210 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
-Both suites must pass before pushing. The logic suite is cheap enough to run
-constantly; run the browser suite before any commit that touches rendering, sync or
-the service worker.
+All three must pass before pushing. The logic suite is cheap enough to run constantly;
+run the browser suite before any commit that touches rendering, sync or the service
+worker. `test:bite` runs the logic suite nine times over, so it takes about ten seconds —
+run it before pushing, and whenever you have just written a test.
 
 ## Working in a 1.3 MB file
 
@@ -152,16 +154,6 @@ input makes every identical sync look like a change — swapping the object grap
 repainting over whoever is typing, which is the v21.0/v21.5 bug. The map appears only once
 something has actually been removed. Caught by the browser corpus, not by review. *(v23.2)*
 
-**`seenRemoteAt` is per-device state and the merge must never adopt the other side's.**
-`mergeShoppingData` builds its result with `Object.assign({}, secondary, primary)`, so the
-horizon was silently taken from whichever file was newer — normally the remote copy, since
-that is usually why a merge is running. That value is the other device's record of how far
-IT had read, always behind what this device has just read, so the horizon regressed on the
-commonest path in the app and this device then under-claimed what it had seen, meaning its
-deletions went unhonoured elsewhere. `mergeRemoteShopping` owns the value: it works the new
-horizon out, merges without touching its inputs, and stamps the result. Found by adversarial
-review of v23.0, a week after v23.0 was built entirely around this field. *(v23.1)*
-
 **Import is a deliberate replacement, and goes through `applyMergedShopping` like every
 other one.** `importData` used to do `shoppingData = parsed`, the one thing the invariant
 above forbids by name: no trip lineage, so the copy it replaced won the next poll and the
@@ -289,17 +281,33 @@ already needs Milk folds onto that existing line, and until the line carries the
 crosses nothing off. A name check calls that case satisfied and leaves the two permanently
 out of step. *(v23.7)*
 
-**The shared file is the list; a phone holds a cache, and one strip says when that cache is
-wrong.** Ways to be wrong used to live in three places — two cards on the Review tab, one
-in the sync banner, and "you are behind the shared copy" nowhere at all — so nobody could
-look in one place and know. `listFreshness` ranks them: `behind`, `unreachable`, `frozen`,
-`picks`. `behind` outranks everything because rebuilding from a stale base is the act that
-mints a rival trip. It is pure, like `syncAlertState`, because the wording is the feature.
-The comparison is **mtime against mtime** — `shoppingRemoteModifiedLatest` (what a metadata
-poll saw) against `shoppingRemoteModifiedSeen` (what was merged). `shoppingSeenRemoteAt` is
-a stamp from INSIDE the file and mixing the two invents staleness that is not there.
-`behind` waits out `FRESHNESS_GRACE_MS` because the 5s poll normally fixes it and a warning
-on every tick the other shopper makes is noise. *(v23.7)*
+**`syncClock` owns "how current is this device", and call sites report what happened
+rather than which field to move.** Six loose module variables used to hold this, any call
+site could move any of them, and between v21.8 and v23.9 that produced the same bug five
+times — the merge adopting the other side's horizon; guard returns counted as failed reads;
+a write leaving the device permanently behind itself; a 404 read as "cannot reach"; and
+`basedOn` falling back to a local save clock. v23.9 fixed all five where they stood, which
+is why they kept arriving somewhere new. Four events: `answered(status, mtime)` — the call site hands over the status and the clock
+maps it, so nobody decides locally what a 404 means; `merged(mtime, remoteCopy)`, which
+takes the COPY so a function holding only metadata cannot claim one; `wrote(mtime)`, kept
+separate because a write teaches this device nothing about anybody else; and
+`unreachable()`. Both holders move `held` and `latest` together, `horizon()` is the only
+reader, and no local save clock is in scope to fall back to. Every folder request reports
+exactly one event on every exit path; a source test counts the call sites, so a new one
+fails the suite rather than silently under-reporting. `listFreshness` and `syncAlertState`
+both read one `snapshot()` instead of each assembling the same list by hand.
+
+Two rules that used to stand on their own are now things the clock enforces. The guard
+returns (hidden tab, wrong tab, no account, a poll in flight) are not attempts and never
+reach it — they return above every event, which is why `unreachable` needs
+`FRESHNESS_MIN_FAILURES` consecutive failures AND `FRESHNESS_UNREACHABLE_MS` since the last
+success, rather than the elapsed-time-alone test that flashed red at a phone in a pocket.
+And `seenRemoteAt` is per-device: `mergeShoppingData` builds its result with
+`Object.assign({}, secondary, primary)`, which silently took the horizon from whichever
+file was newer — normally the remote copy — so this device under-claimed what it had seen
+and its deletions went unhonoured elsewhere. The merge never touches it now;
+`mergeRemoteShopping` reads it back with `horizon()` afterwards.
+The reasoning is in `docs/DECISIONS.md`. *(v23.1, v23.7, v23.8, v23.9, restructured v24.0)*
 
 **Silence is the in-step state, and red means the two sync cases and nothing else.**
 `listFreshness` returns null when there is nothing wrong and `renderListFreshness` appends
@@ -311,31 +319,27 @@ were saying one thing. `behind` and `unreachable` render as `.alert-card` (red �
 is wrong with what you are looking at); `frozen` and `picks` stay `.notice-card` (amber —
 there is an update available). Keep red rare or it stops meaning anything. *(v23.8)*
 
-**A warning follows a FAILED attempt, never a missing one.** `unreachable` needs
-`FRESHNESS_MIN_FAILURES` consecutive failures from `noteRemoteCheckFailed` AND
-`FRESHNESS_UNREACHABLE_MS` since the last success — the count rules out a blip, the elapsed
-time rules out three fast retries in one bad second. v23.7 measured time since the last
-success alone, and `pollShoppingNow` returns early while the screen is off, so a phone in a
-pocket between aisles was indistinguishable from one that could not reach the folder and
-flashed red every time somebody picked it up. Only the two genuine read failures in each
-poll — a non-200 and the `catch` — may call `noteRemoteCheckFailed`; the guard returns
-above them (hidden tab, wrong tab, no account, a poll in flight) are not failures, and that
-distinction is the whole fix. *(v23.8)*
-
 **The card that offers a choice between two lists renders before anything that can return
 early.** An import lands on an empty list, which is the branch that returns — and the
 import is the single path where the undo most needs to be on screen. *(v23.6)*
 
-**Whichever trip loses is stashed, on both phones, and choosing is a WRITE.**
-`stashReplacedTrip` used to run only when THIS device's trip was the one replaced, so the
-winning phone had nothing to offer and nothing to say; `mergeRemoteShopping` now stashes
-the remote copy when this device wins, gated on the loser actually having work on it.
-`tripConflict` names the disagreement by calling `chooseTripWinner`, so the card can never
-claim an outcome the merge did not reach. Both buttons supersede: `putBackReplacedList`
-always did, and `keepThisList` is its mirror — "Keep this one" used to only drop the local
-stash, which settles nothing, because the phone holding the other list goes on offering it
-every poll until something supersedes it. A decision that does not supersede is a pause.
-*(v23.6)*
+**`replacement` is one record: the displaced list, and the two facts about how it got
+there.** `stashReplacedTrip` used to run only when THIS device's trip was replaced, so the
+winning phone had nothing to offer and nothing to say; v23.6 added a second variable beside
+the stash saying who had won, and the only thing keeping the two in step was a comment. They
+came apart twice: a fork whose loser had no work left a settled argument on screen, and
+"Keep this one" minted a superseding trip whatever the stash was — so a phone that had LOST
+superseded its own dead trip, left the real winner unsuperseded, and made a third trip id
+out of a two-way argument. One record now, one writer (`stashReplacedTrip`), one clearer
+(`clearReplacement`). `argued` means a remote fork put this here, so somebody needs telling;
+a list this device replaced itself is an undo and nothing more. `rival` means another phone
+is still holding the loser and will offer it every poll — true only of a fork this device
+WON, and the only thing that makes "Keep this one" a write. `iWon` is for the wording. A
+decision that does not supersede is a pause, but only where somebody is still arguing: the
+stash and the argument have different lifetimes on purpose, and a clean merge ends the
+argument while leaving the undo, which is kept until the page closes. `tripConflict` still
+names the disagreement by calling `chooseTripWinner`, so the card can never claim an
+outcome the merge did not reach. *(v21.8, v23.6, restructured v24.0)*
 
 **`tripCode` is a label, never an identifier.** Nothing parses it back, nothing stores it,
 and it is derived from the whole trip id so it changes exactly when the trip does. It
@@ -455,10 +459,24 @@ Tests **extract the real functions out of `index.html`** by brace-matching and r
 in a VM sandbox, rather than keeping a second copy that would drift. A rename fails
 loudly. Shared constants are pulled from the source the same way.
 
-**Verify a new test fails against the old code.** A test written for this session
-passed against the very bug it was meant to catch, because a button was matched by the
-wrong label and nothing was ever clicked. Checking out the previous version and running
-the suite takes a minute and is the only thing that proves a test bites.
+**Verify a new test fails against the old code — `npm run test:bite`.** A test written
+for one session passed against the very bug it was meant to catch, because a button was
+matched by the wrong label and nothing was ever clicked. In v23.9 it happened twice more:
+one hand-rolled revert was wrong, and one assertion passed vacuously on missing code. In
+v24.0, three guarantees the first sync-clock API was said to make turned out not to be
+guarantees — nothing stopped a call site naming the wrong event, so the reverts sailed
+through and the design looked safer than it was.
+
+`test/bite-cases.js` is the list of defects this project has shipped, each expressed as
+the smallest edit to `index.html` that brings it back; `test/bite.js` applies them one at
+a time and reports any the suite fails to notice. It is the only check here whose passing
+result is a FAILURE of the code under test, so it reads back-to-front on purpose.
+
+**Every release adds a case for anything it claims to make impossible.** That claim is the
+part most likely to be wrong — it was wrong twice in two releases, and only reverting
+caught it both times. A case that does not bite means the test is agreeing with the code
+rather than checking it: fix the test, never the case. A case that no longer matches the
+source is reported STALE rather than skipped; re-point it and confirm it still bites.
 
 **Green is not evidence about the world.** Both v23.2 defects sat under assertions that
 passed — `effectiveAddedAt` and the merge grace window were among the best covered things
@@ -487,10 +505,15 @@ for the app to have painted.
    manifest and icons. `sw.js` has said "bump CACHE on every release" in a comment since
    v21.2 and four releases went past it in one session, because this list only ever named
    `APP_VERSION`. Two version strings, one step.
-2. Both suites green.
-3. Open a PR naming the rollback commit.
-4. Merge to `main`; GitHub Pages publishes it.
-5. If the release settled a question — chose between approaches, rejected a feature,
+2. All three green: `npm test`, `npm run test:bite`, `npm run test:browser`.
+3. **Every behaviour this release claims to make impossible has a case in
+   `test/bite-cases.js`, and it bites.** "This bug cannot happen now" is the claim most
+   likely to be wrong — v23.9 and v24.0 each shipped a structural fix that was less
+   structural than advertised, and both times a by-hand revert was the only thing that
+   noticed. A claim with no case behind it is a comment.
+4. Open a PR naming the rollback commit.
+5. Merge to `main`; GitHub Pages publishes it.
+6. If the release settled a question — chose between approaches, rejected a feature,
    reversed an earlier decision — add it to `docs/DECISIONS.md`. An invariant here says
    what must hold; that file says why, which is what stops the same idea being rebuilt.
    Two features were built and removed inside one week for want of this.
@@ -505,6 +528,17 @@ If tooling starts calling a text file binary, look for stray control characters 
 than working around it.
 
 ## Known limitations, deliberately left
+
+- **The shared-folder backend is barely synced at all.** Everything above describes the
+  OneDrive path. `autoSaveToFolder` writes the whole `shoppingData` blind — no read-back, no
+  merge, no concurrency guard — where OneDrive goes through `writeShoppingMerged`, so two
+  folder-linked devices overwrite each other's ticks exactly as every device did before v15.
+  There is no folder poll either: `loadFromFolderOrSeed` runs at startup and on reconnect
+  and that is all. v24.0 at least routes its merge through the sync clock, so such a device
+  records contact and advances a horizon; the freshness strip still has no mtimes to compare
+  and so can never report `behind` there. Left alone because nobody uses it — the family is
+  on OneDrive and the folder link predates that — but do not read the invariants above as
+  covering it.
 
 - **A mixed fleet is the transition cost of v23.0, and it is bounded.** A phone on v23.1
   or earlier writes no removal records, so its deletions fall back to `otherSideDropped` —
