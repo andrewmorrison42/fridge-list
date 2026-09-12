@@ -71,7 +71,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProg
                'featureOn', 'stapleQtyFor', 'stapleQtyToShopping', 'parseQty', 'fmtQty',
                'displayUnit', 'unitLabel', 'stapleUnitLabel', 'lineQtyText', 'findIngredientMeta', 'rollUpQty', 'fmtExactQty',
                'unitKey', 'isMeasure', 'measureNames', 'parseAmount', 'convertAmount',
-               'parseMeasureQty', 'validMeasureQty', 'formatMeasureQty', 'measureToShoppingQty',
+               'parseMeasureQty', 'snapMeasureQty', 'allowedMeasureText', 'measureToShoppingQty',
+               'measuredEntry',
                'kitchenMeasureCanon',
                'ingredientLineText', 'recipeToPlainText', 'recipeToHtml', 'buildShareBundle',
                'tripRecordFromShopping', 'mergeTripHistory', 'pruneTripHistory',
@@ -114,6 +115,9 @@ vm.runInContext(
   extractConst('UNITS') + '\n' +
   extractConst('UNIT_ALIASES') + '\n' +
   extractConst('ROLLUP_TO') + '\n' +
+  extractConst('MEASURE_FRACTIONS') + '\n' +
+  extractConst('FRACTION_GLYPHS') + '\n' +
+  extractConst('MEASURE_SNAP_TOLERANCE') + '\n' +
   extractConst('TRIP_LIVE_WINDOW_MS') + '\n' +
   extractConst('SHARE_MARKER') + '\n' +
   extractConst('APP_VERSION') + '\n' +
@@ -135,7 +139,9 @@ vm.runInContext(
   '             ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,' +
   '             unitLabel, stapleUnitLabel, SHOPPING_UNIT_OPTIONS, UNITS,' +
   '             unitKey, isMeasure, measureNames, parseAmount, convertAmount, rollUpQty,' +
-  '             parseMeasureQty, validMeasureQty, formatMeasureQty, measureToShoppingQty,' +
+  '             parseMeasureQty, snapMeasureQty, allowedMeasureText, measureToShoppingQty,' +
+  '             measuredEntry,' +
+  '             MEASURE_FRACTIONS, MEASURE_SNAP_TOLERANCE,' +
   '             kitchenMeasureCanon,' +
   '             tripProgress, tripDecisions, tripHasProgress, tripIsLive, tripIsWorkedOn,' +
   '             chooseTripWinner, TRIP_LIVE_WINDOW_MS,' +
@@ -165,7 +171,9 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,
         unitLabel, stapleUnitLabel, SHOPPING_UNIT_OPTIONS, UNITS,
         unitKey, isMeasure, measureNames, parseAmount, convertAmount, rollUpQty,
-        parseMeasureQty, validMeasureQty, formatMeasureQty, measureToShoppingQty,
+        parseMeasureQty, snapMeasureQty, allowedMeasureText, measureToShoppingQty,
+        measuredEntry,
+        MEASURE_FRACTIONS, MEASURE_SNAP_TOLERANCE,
         kitchenMeasureCanon,
         tripProgress, tripDecisions, tripHasProgress, tripIsLive, tripIsWorkedOn,
         chooseTripWinner, TRIP_LIVE_WINDOW_MS,
@@ -555,6 +563,120 @@ group('one unit table, read both directions');
     ok(fn + '() reads the factor from UNITS rather than restating it',
        !/\b1000\b/.test(extract(fn)), extract(fn));
   });
+}
+
+group('a measured amount is snapped once');
+{
+  /* v24.1 — P3-02. The contract collectIngredientRows prints is "whole numbers and
+     ⅛ ¼ ⅓ ½ ⅔ ¾". 0.35 is not one of those, and the old 0.02 tolerance accepted it,
+     labelled it ⅓, and stored the conversion of 0.35 — so the recipe read "⅓ cup" for
+     ever while the shopping list was built from 88 mL against the ⅓ it named, 83. */
+  ok('a quantity the contract forbids is refused', snapMeasureQty(0.35, 'cup') === null);
+  ok('...and the whole old band with it',
+     [0.315, 0.32, 0.345, 0.353].every(x => snapMeasureQty(x, 'cup') === null));
+  ok('typing noise around a real fraction still lands',
+     snapMeasureQty(0.333, 'cup').label === '⅓' && snapMeasureQty(0.33, 'cup').label === '⅓');
+
+  /* The structural claim: one number, so the label and the stored amount cannot
+     disagree. Whatever is accepted, converting the snapped value and converting the
+     value its own label denotes give the same answer. */
+  const LABEL_VALUE = { '⅛':1/8, '¼':1/4, '⅓':1/3, '½':1/2, '⅔':2/3, '¾':3/4 };
+  ok('the stored number is always the number the label denotes',
+     ['cup','tsp','TBsp'].every(u =>
+       [0.125, 0.25, 1/3, 0.5, 2/3, 0.75, 1.5, 2, 2.25, 0.333, 0.2, 0.35, 0.9].every(x => {
+         const s = snapMeasureQty(x, u);
+         if(s === null) return true;
+         const m = s.label.match(/^(?:(\d+) )?([⅛¼⅓½⅔¾])$/);
+         const denoted = m ? (m[1] ? Number(m[1]) : 0) + LABEL_VALUE[m[2]] : Number(s.label);
+         return Math.abs(denoted - s.n) < 1e-9;
+       })));
+
+  ok('a whole number keeps its own label',
+     snapMeasureQty(2, 'cup').n === 2 && snapMeasureQty(2, 'cup').label === '2');
+  ok('a mixed amount reads as one',
+     snapMeasureQty(1.5, 'cup').label === '1 ½' && snapMeasureQty(1.5, 'cup').n === 1.5);
+
+  /* A fraction one unit allows and another does not. TBsp permits only ½, so ⅓ TBsp is
+     refused rather than displayed with a glyph the rule does not allow — formatMeasureQty
+     used to walk the full glyph table with no reference to the unit. */
+  ok('a fraction is only allowed where its unit allows it',
+     snapMeasureQty(1/3, 'cup').label === '⅓' && snapMeasureQty(1/3, 'TBsp') === null &&
+     snapMeasureQty(1/3, 'tsp') === null);
+  ok('zero and negatives are not amounts',
+     snapMeasureQty(0, 'cup') === null && snapMeasureQty(-1, 'cup') === null &&
+     snapMeasureQty(null, 'cup') === null);
+
+  /* v24.1 — P5-06: the rejection message is generated from the rule, not restated. */
+  ok('the allowed-amounts message comes off the table',
+     allowedMeasureText('cup') === 'whole numbers and ⅛ ¼ ⅓ ½ ⅔ ¾' &&
+     allowedMeasureText('tsp') === 'whole numbers and ⅛ ¼ ½ ¾' &&
+     allowedMeasureText('TBsp') === 'whole numbers and ½');
+  ok('...for every unit that has one',
+     Object.keys(MEASURE_FRACTIONS).every(u =>
+       allowedMeasureText(u).split(' ').length === MEASURE_FRACTIONS[u].length + 3));
+
+  /* v24.1 — P3-01: the conversion no longer rounds to whole millilitres. The stated
+     basis is cup = 250, TBsp = 20, tsp = 5; ½ tsp is 2.5 mL and ⅛ tsp is 0.625, and
+     both were stored as integers — 3 and 1, the second 60% out — in the recipe file. */
+  ok('half a teaspoon is two and a half millilitres',
+     measureToShoppingQty(0.5, 'tsp') === 2.5);
+  ok('an eighth of a teaspoon is not rounded up to one',
+     measureToShoppingQty(0.125, 'tsp') === 0.625);
+  ok('two half-teaspoons come to one teaspoon',
+     measureToShoppingQty(0.5, 'tsp') * 2 === measureToShoppingQty(1, 'tsp'));
+  ok('the ordinary cases are unchanged',
+     measureToShoppingQty(2, 'cup') === 500 && measureToShoppingQty(1, 'TBsp') === 20);
+  ok('a third of a cup is the basis, not a rounding of it',
+     Math.abs(measureToShoppingQty(1/3, 'cup') - 250/3) < 1e-9);
+}
+
+group('what a measured recipe line saves');
+{
+  /* v24.1: measuredEntry is collectIngredientRows' decision with the form reading taken
+     off it. That extraction is the reason these assertions exist at all — while the
+     decision was inside the DOM loop, the defect below could be written back into
+     index.html and the whole logic suite stayed green. */
+  const cupMeta = { name:'Flour', shoppingUnit:'g' };
+  const mlMeta  = { name:'Milk',  shoppingUnit:'mL' };
+
+  ok('a valid amount saves the label and the number it denotes',
+     (()=>{ const e = measuredEntry('Milk', '1/3', 'cup', mlMeta).entry;
+            return e.displayQty === '⅓' && Math.abs(e.quantity - 250/3) < 1e-9 &&
+                   e.displayUnit === 'cup' && e.unit === 'mL'; })());
+
+  /* P3-02, as the family would meet it: the line reads "⅓ cup" and the shopping list is
+     built from the number beside it. Those must be the same amount. */
+  ok('the saved number is the saved label, not the raw input',
+     measuredEntry('Milk', '0.35', 'cup', mlMeta).entry === undefined);
+  ok('...and 0.35 is refused with the message the contract promises',
+     /Allowed: whole numbers and ⅛ ¼ ⅓ ½ ⅔ ¾/.test(measuredEntry('Milk', '0.35', 'cup', mlMeta).error));
+  ok('...while 0.333 is accepted and stores exactly a third of a cup',
+     (()=>{ const e = measuredEntry('Milk', '0.333', 'cup', mlMeta).entry;
+            return e.displayQty === '⅓' && Math.abs(e.quantity - 250/3) < 1e-9; })());
+
+  /* The general form of the same claim, over the whole band the old tolerance let in. */
+  ok('nothing is ever saved whose number and label disagree',
+     ['1/3','0.333','0.35','1/2','2','1 1/2','0.2','5/8','3/4','0.24','1/8']
+       .every(typed => {
+         const got = measuredEntry('Milk', typed, 'cup', mlMeta);
+         if(!got.entry) return true;
+         const back = snapMeasureQty(parseMeasureQty(typed), 'cup');
+         return Math.abs(got.quantity === undefined
+                         ? got.entry.quantity - measureToShoppingQty(back.n, 'cup', 'mL')
+                         : 0) < 1e-9;
+       }));
+
+  ok('a gram-shopped ingredient uses the 1 g = 1 mL basis',
+     measuredEntry('Flour', '1', 'tsp', cupMeta).entry.quantity === 5 &&
+     measuredEntry('Flour', '1', 'tsp', cupMeta).entry.unit === 'g');
+  ok('half a teaspoon is not rounded on the way into the recipe',
+     measuredEntry('Flour', '1/2', 'tsp', cupMeta).entry.quantity === 2.5);
+  ok('a fraction the unit disallows is refused by name',
+     /isn't valid for TBsp/.test(measuredEntry('Milk', '1/3', 'TBsp', mlMeta).error) &&
+     /Allowed: whole numbers and ½/.test(measuredEntry('Milk', '1/3', 'TBsp', mlMeta).error));
+  ok('an unreadable amount is refused rather than saved as something',
+     measuredEntry('Milk', 'a splash', 'cup', mlMeta).entry === undefined &&
+     measuredEntry('Milk', '', 'cup', mlMeta).entry === undefined);
 }
 
 group('staple amounts are numbers in the shopping unit');

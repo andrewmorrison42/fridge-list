@@ -3393,11 +3393,14 @@ function addNewMasterIngredients(ingredients){
     // the editor offers the full mL/cup/TBsp/tsp dropdown from then on.
     const measure = kitchenMeasureCanon(ing.unit);
     if(measure){
-      const n = parseMeasureQty(ing.quantity);
-      if(n !== null && validMeasureQty(n, measure)){
-        ing.displayQty = ing.quantity;
+      // v24.1: the same snap-once rule as the editor. displayQty used to be the raw
+      // string the importer supplied while quantity came off the unsnapped number, so
+      // the two could describe different amounts from the moment the line was created.
+      const snapped = snapMeasureQty(parseMeasureQty(ing.quantity), measure);
+      if(snapped){
+        ing.displayQty = snapped.label;
         ing.displayUnit = measure;
-        ing.quantity = measureToShoppingQty(n, measure);
+        ing.quantity = measureToShoppingQty(snapped.n, measure);
       }
       ing.unit = 'mL';
     }
@@ -5649,25 +5652,85 @@ function convertAmount(n, from, to){
 
 const MEASURE_FRACTIONS = { cup:[1/8,1/4,1/3,1/2,2/3,3/4], tsp:[1/8,1/4,1/2,3/4], TBsp:[1/2] };
 const FRACTION_GLYPHS = [[1/8,'⅛'],[1/4,'¼'],[1/3,'⅓'],[1/2,'½'],[2/3,'⅔'],[3/4,'¾']];
+/* How far off a listed fraction a typed amount may be and still be read as that
+   fraction. This is a TYPING allowance — "0.33" and "0.333" mean a third — and nothing
+   more. It was 0.02 until v24.1, which is 5 mL of a cup: "0.35" was accepted as ⅓, and
+   the accepted band for ⅓ ran from 78 mL to 88 mL while the label said 83. The contract
+   the editor prints is "whole numbers and ⅛ ¼ ⅓ ½ ⅔ ¾", so anything wider than typing
+   noise is the code accepting what its own message forbids. */
+const MEASURE_SNAP_TOLERANCE = 0.005;
 // The recipe editor's name for parseAmount. Both names are kept: between them they have
 // five call sites, and a rename is a wide diff in this file for no change in behaviour.
 function parseMeasureQty(str){ return parseAmount(str); }
-function validMeasureQty(num, unit){
-  if(num===null || num<=0) return false;
-  const fr = MEASURE_FRACTIONS[unit]; if(!fr) return true;
-  const rem = num - Math.floor(num);
-  if(rem < 1e-9) return true;
-  return fr.some(x=> Math.abs(rem-x) < 0.02);
+
+/* Resolve a typed amount to the fraction the person meant, or null if it is not one.
+
+   v24.1: this exists so there is ONE number. Until now validMeasureQty accepted within
+   a tolerance, formatMeasureQty labelled within the same tolerance against a wider
+   table, and collectIngredientRows stored the conversion of the RAW input — three
+   readings of one typed value. Entering 0.35 cup was accepted, displayed for ever as
+   "⅓", and shopped as 88 mL where the ⅓ it claimed to be is 83. The number that is
+   stored and the label that is shown now come from the same place, so they cannot
+   disagree; that is the defect being made unrepresentable rather than corrected. */
+function snapMeasureQty(num, unit){
+  if(num === null || num === undefined || !(num > 0)) return null;
+  const whole = Math.floor(num), rem = num - whole;
+  if(rem < 1e-9) return { n: whole, label: String(whole) };
+  const allowed = MEASURE_FRACTIONS[unitKey(unit)] || MEASURE_FRACTIONS[unit];
+  // A unit with no fraction rule takes the amount as typed.
+  if(!allowed) return { n: num, label: String(Math.round(num*100)/100) };
+  for(const f of allowed){
+    if(Math.abs(rem - f) > MEASURE_SNAP_TOLERANCE) continue;
+    const glyph = FRACTION_GLYPHS.find(g=> Math.abs(g[0] - f) < 1e-9);
+    if(!glyph) continue;                     // a fraction with no glyph cannot be shown
+    return { n: whole + f, label: (whole ? whole + ' ' : '') + glyph[1] };
+  }
+  return null;
 }
-function formatMeasureQty(num){
-  const whole=Math.floor(num), rem=num-whole;
-  if(rem<1e-9) return String(whole);
-  for(const [v,g] of FRACTION_GLYPHS){ if(Math.abs(rem-v)<0.02) return (whole? whole+' ':'')+g; }
-  return String(Math.round(num*100)/100);
+/* The wording of the rejection, built from the rule it is enforcing. It used to be
+   hand-written prose beside the table, matching it by coincidence and by nobody having
+   changed either — one of the five coordinated edits adding a measure needed. */
+function allowedMeasureText(unit){
+  const allowed = MEASURE_FRACTIONS[unitKey(unit)] || MEASURE_FRACTIONS[unit];
+  if(!allowed) return 'whole numbers';
+  const glyphs = allowed.map(f=>{
+    const g = FRACTION_GLYPHS.find(x=> Math.abs(x[0] - f) < 1e-9);
+    return g ? g[1] : null;
+  }).filter(Boolean);
+  return 'whole numbers and ' + glyphs.join(' ');
 }
+/* One measured recipe line, from what was typed to what is stored. Pulled out of
+   collectIngredientRows in v24.1 because the decision was welded to reading the DOM,
+   which is why the defect it carried — the stored number and the shown label derived
+   separately from the raw input, so "0.35 cup" saved as 88 mL under a label reading
+   "⅓" — could not be written as a case the logic suite would notice. It bit nothing
+   until this came out of the form-reading loop. Snap ONCE, and both the number and the
+   label come off the snapped value; there is no second reading to disagree with. */
+function measuredEntry(name, qtyStr, measureUnit, meta){
+  const snapped = snapMeasureQty(parseMeasureQty(qtyStr), measureUnit);
+  if(snapped === null){
+    return { error: '"'+name+'": quantity "'+qtyStr+'" isn\'t valid for '+measureUnit+
+                    '. Allowed: '+allowedMeasureText(measureUnit)+' (e.g. 1 ½).' };
+  }
+  return { entry: {
+    ingredientName: name,
+    quantity: measureToShoppingQty(snapped.n, measureUnit, meta && meta.shoppingUnit),
+    unit: (meta && meta.shoppingUnit) || '',
+    displayQty: snapped.label,
+    displayUnit: measureUnit
+  } };
+}
+
+/* v24.1: no longer rounds. It used to return whole millilitres, and
+   collectIngredientRows stores the result as the recipe line's `quantity`, so the loss
+   was permanent rather than presentational: ½ tsp was saved as 3 mL against a basis of
+   2.5, and ⅛ tsp as 1 against 0.625 — 60% out, in the file. Existing recipe lines keep
+   the numbers they were saved with; re-saving a recipe re-derives from displayQty, so
+   they correct themselves as they are edited. Nothing needs migrating and nothing on the
+   wire changes shape: `quantity` was already a number and older builds read it through
+   parseQty, which has always handled a decimal. */
 function measureToShoppingQty(num, measureUnit, shopUnit){
-  const n = convertAmount(num, measureUnit, shopUnit || 'mL');
-  return n === null ? null : Math.round(n);
+  return convertAmount(num, measureUnit, shopUnit || 'mL');
 }
 
 function wireUnitControls(name, qty, unit, unitSel, hint, presetDisplayUnit){
@@ -5698,10 +5761,11 @@ function wireUnitControls(name, qty, unit, unitSel, hint, presetDisplayUnit){
   }
   function conversionNote(meta){
     if(unitSel.style.display==='none' || !isMeasure(unitSel.value)) return '';
-    const n = parseMeasureQty(qty.value);
-    if(n===null) return '';
-    if(!validMeasureQty(n, unitSel.value)) return ' · that fraction isn\'t allowed for '+unitSel.value;
-    return ' · = '+measureToShoppingQty(n, unitSel.value, meta.shoppingUnit)+' '+meta.shoppingUnit+' for shopping';
+    const snapped = snapMeasureQty(parseMeasureQty(qty.value), unitSel.value);
+    if(qty.value.trim() === '') return '';
+    if(snapped === null) return ' · that fraction isn\'t allowed for '+unitSel.value;
+    // The number the hint promises is the number that will be saved, snap included.
+    return ' · = '+measureToShoppingQty(snapped.n, unitSel.value, meta.shoppingUnit)+' '+meta.shoppingUnit+' for shopping';
   }
   function updateHint(preferredUnit){
     const meta = findIngredientMeta(name.value);
@@ -5782,14 +5846,9 @@ function collectIngredientRows(wrap){
                   : (unitInput.dataset.unit !== undefined ? unitInput.dataset.unit
                                                           : unitInput.value.trim());
     if(useSel && isMeasure(unitVal)){
-      const num = parseMeasureQty(qtyStr);
-      if(num===null || !validMeasureQty(num, unitVal)){
-        const allowed = unitVal==='cup' ? 'whole numbers and ⅛ ¼ ⅓ ½ ⅔ ¾' : unitVal==='tsp' ? 'whole numbers and ⅛ ¼ ½ ¾' : 'whole numbers and ½';
-        return {error:'"'+nameV+'": quantity "'+qtyStr+'" isn\'t valid for '+unitVal+'. Allowed: '+allowed+' (e.g. 1 ½).'};
-      }
-      const meta = findIngredientMeta(nameV);
-      const entry = {ingredientName:nameV, quantity: measureToShoppingQty(num, unitVal, meta&&meta.shoppingUnit),
-                unit:(meta&&meta.shoppingUnit)||'', displayQty: formatMeasureQty(num), displayUnit: unitVal};
+      const built = measuredEntry(nameV, qtyStr, unitVal, findIngredientMeta(nameV));
+      if(built.error) return {error: built.error};
+      const entry = built.entry;
       if(currentSection) entry.section = currentSection;
       if(descV) entry.descriptor = descV;
       out.push(entry);

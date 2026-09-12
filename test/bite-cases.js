@@ -134,6 +134,52 @@ module.exports = [
     replace: '    return null;'
   },
   {
+    name: 'the fraction tolerance is a whole 5 mL of a cup again, so "0.35" is accepted ' +
+          'as ⅓ and shopped as 88 mL under a label that says 83',
+    find: 'const MEASURE_SNAP_TOLERANCE = 0.005;',
+    replace: 'const MEASURE_SNAP_TOLERANCE = 0.02;'
+  },
+  {
+    name: 'the stored amount is derived from the raw input again, so the recipe reads ' +
+          '"⅓ cup" for ever while the list is built from a different number',
+    find: '    quantity: measureToShoppingQty(snapped.n, measureUnit, meta && meta.shoppingUnit),',
+    replace: '    quantity: measureToShoppingQty(parseMeasureQty(qtyStr), measureUnit, ' +
+             'meta && meta.shoppingUnit),'
+  },
+  {
+    name: 'the measure conversion rounds to whole millilitres again, so half a teaspoon ' +
+          'is saved as 3 and an eighth as 1',
+    find: '  return convertAmount(num, measureUnit, shopUnit || \'mL\');\n}',
+    replace: '  const n = convertAmount(num, measureUnit, shopUnit || \'mL\');\n' +
+             '  return n === null ? null : Math.round(n);\n}'
+  },
+  {
+    name: 'the glyph table is walked with no reference to the unit, so a TBsp value is ' +
+          'labelled with a fraction TBsp does not allow',
+    find: '    const glyph = FRACTION_GLYPHS.find(g=> Math.abs(g[0] - f) < 1e-9);\n' +
+          '    if(!glyph) continue;                     // a fraction with no glyph cannot be shown\n' +
+          '    return { n: whole + f, label: (whole ? whole + \' \' : \'\') + glyph[1] };\n' +
+          '  }\n' +
+          '  return null;',
+    replace: '    const glyph = FRACTION_GLYPHS.find(g=> Math.abs(g[0] - f) < 1e-9);\n' +
+             '    if(!glyph) continue;\n' +
+             '    return { n: whole + f, label: (whole ? whole + \' \' : \'\') + glyph[1] };\n' +
+             '  }\n' +
+             '  for(const [v,g] of FRACTION_GLYPHS){\n' +
+             '    if(Math.abs(rem - v) <= MEASURE_SNAP_TOLERANCE) ' +
+             'return { n: whole + v, label: (whole ? whole + \' \' : \'\') + g };\n' +
+             '  }\n' +
+             '  return null;'
+  },
+  {
+    name: 'the allowed-amounts message is hand-written prose again, so it agrees with ' +
+          'the rule only until somebody changes one of them',
+    find: '\'. Allowed: \'+allowedMeasureText(measureUnit)+\' (e.g. 1 ½).\' };',
+    replace: '\'. Allowed: \'+(measureUnit===\'cup\' ? \'whole numbers and ⅛ ¼ ⅓ ½ ⅔ ¾\' : ' +
+             'measureUnit===\'tsp\' ? \'whole numbers and ⅛ ¼ ½ ¾\' : \'whole numbers and ¼ ½\')+' +
+             '\' (e.g. 1 ½).\' };'
+  },
+  {
     name: 'the staple path converts units itself again, so the measure table is reached ' +
           'from the mL branch only and "1 Cup" is matched case-sensitively',
     find: '  return convertAmount(n, m[2], unit);',
