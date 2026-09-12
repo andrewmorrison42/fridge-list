@@ -56,6 +56,58 @@ Consequences:
 
 Each of these has a bug behind it.
 
+**A write is not a way to fall behind yourself.** `shoppingRemoteModifiedSeen` advanced in
+`mergeRemoteShopping` and nowhere else, so every successful write moved the folder's mtime
+past anything this device had marked as seen — and `pollShoppingNow`'s unchanged-stamp
+shortcut then returned *because* it recognised that mtime, so the two halves of the
+comparison could never meet again. `listFreshness` read `behind` from the next poll onwards
+and never stopped: the red card v23.8 exists to keep rare became the resting state of every
+phone anybody was shopping from, and `updateListFreshness` repainted the tab under their
+thumb as it appeared. A copy this device HOLDS — because it read it, or because it sent
+it — is not a copy it is behind, so `writeShoppingMerged` stamps its own write as SEEN.
+Only a holder may say so, and that is the other half of the rule: `pollShoppingNow` passes
+`null`, and must keep passing it. `shoppingFastPollStamp` is the mtime a poll ACTED ON, set
+before the download, so a fetch that then fails leaves it ahead of anything merged —
+treating it as "held" would silence `behind` in exactly the case it exists for. Two callers
+claim a copy, the merge and the write, and a test counts them. *(v23.9)*
+
+**`basedOn` is a fact about the shared folder, or it is nothing.** It is the only input to
+`chooseTripWinner`'s third rule — "generated from fresher shared data" — and five sites
+wrote it as `shoppingSeenRemoteAt || shoppingData.lastUpdated`. `saveShoppingLocal` bumps
+`lastUpdated` on EVERY save, so a phone that had never once read the folder wrote the
+newest `basedOn` in the household and won rule 3 against every phone that had: the rule
+inverted, by the same moving-clock fallback that made `effectiveAddedAt` wrong until v23.2.
+`syncHorizon()` is now the single answer, and it is `shoppingSeenRemoteAt` or null. A device
+with no horizon makes no claim, exactly as a device with no horizon can delete nothing; the
+decision falls to rule 4, which is the safe side. A local save time is not a fact about the
+shared folder, however tempting it is to use as one. *(v23.9)*
+
+**A 404 is an answer, not a silence.** `fetchRemoteShopping` has always read a missing
+`shopping-list.json` as "not created yet"; `pollShoppingNow` put the same status through
+`noteRemoteCheckFailed`, so a household that had not written the file yet was told in red
+that its phone could not reach a list which does not exist. The folder was reached and it
+answered. v23.8's rule — only a genuine read failure may reach `noteRemoteCheckFailed` —
+governs the statuses below the guard returns as much as the guard returns themselves.
+*(v23.9)*
+
+**"Keep this one" supersedes only when something out there is still offering the other
+list.** That is one of three ways a stash appears, and v23.6 minted a superseding trip for
+all of them. When this phone LOST a fork, the list on screen already IS the other phone's
+trip and the stash is this device's own dead one — so the mint superseded a trip nobody
+holds, left the actual winner unsuperseded, and put a third trip id into a household that
+was arguing about two. When the replacement was local — a generate, a clear, an import —
+the trip on screen already names what it replaced. `tripDisagreement.iWon` is the only
+thing that tells the three apart, and it travels with `replacedTrip`: both in-session, both
+set and cleared together. In the other two cases, keeping is settled by letting the stash
+go. *(v23.6, narrowed v23.9)*
+
+**A banner is cleared whenever there is nothing left to report.** `mergeRemoteShopping`
+cleared `tripDisagreement` only when there was no conflict at all, so a fork whose loser
+had no work on it fell straight through and left a previous disagreement standing. That
+banner is the top case in `syncAlertState` — above everything but a failed write, on every
+tab — so it sat there saying "two phones have different shopping lists" about an argument
+that had already settled. *(v23.9)*
+
 **A Wait List `done` set in the aisle is a TICK, and carries `doneTripId`.** `done` was one
 flag doing two jobs with different lifetimes: `syncNeededFromLine` writes it when somebody
 ticks a line in a shop ("it is in the trolley on this trip"), and the Wait List tab writes
@@ -331,11 +383,13 @@ import is the single path where the undo most needs to be on screen. *(v23.6)*
 winning phone had nothing to offer and nothing to say; `mergeRemoteShopping` now stashes
 the remote copy when this device wins, gated on the loser actually having work on it.
 `tripConflict` names the disagreement by calling `chooseTripWinner`, so the card can never
-claim an outcome the merge did not reach. Both buttons supersede: `putBackReplacedList`
-always did, and `keepThisList` is its mirror — "Keep this one" used to only drop the local
-stash, which settles nothing, because the phone holding the other list goes on offering it
-every poll until something supersedes it. A decision that does not supersede is a pause.
-*(v23.6)*
+claim an outcome the merge did not reach. Both buttons write: `putBackReplacedList` always
+superseded, and `keepThisList` is its mirror — "Keep this one" used to only drop the local
+stash, which settles nothing *while another phone is still holding the loser*, because it
+goes on offering it every poll until something supersedes it. A decision that does not
+supersede is a pause. v23.9 narrowed the mint to exactly that case — see the invariant
+above; where nothing is still being offered, dropping the stash IS the decision.
+*(v23.6, v23.9)*
 
 **`tripCode` is a label, never an identifier.** Nothing parses it back, nothing stores it,
 and it is derived from the whole trip id so it changes exactly when the trip does. It
@@ -426,6 +480,12 @@ details that rule is built on.
   why every merge site goes through `mergeRemoteShopping`. `shoppingData.lastUpdated`
   cannot be used for this: local saves move it forward without the device having learnt
   anything.
+- **A stamp is absent or it is a stamp; never an explicit `null`.** `mergeShoppingLine`
+  DELETES a stamp it cannot resolve, and `generateShoppingList`'s carry-forward used to
+  write `removedAt: null` / `checkedAt: null` instead. The first merge of an otherwise
+  identical line then read as a change to `applyMergedShopping`'s stringify-compare and
+  cost a repaint for nothing. `flagStamp` reads both the same way; the object graph should
+  too.
 - **Per-flag timestamps.** `checked`, `removed` and `atHome` each carry their own
   stamp. They used to share one `changedAt`, so marking something "at home" wiped the
   other shopper's tick.
@@ -506,6 +566,23 @@ than working around it.
 
 ## Known limitations, deliberately left
 
+- **The two sync backends are NOT equivalent, and the shared-folder one is barely synced
+  at all.** Everything above describes the OneDrive path. The File System Access folder
+  path has none of it: `autoSaveToFolder` writes the whole `shoppingData` blind — no
+  read-back, no merge, no concurrency guard — where OneDrive goes through
+  `writeShoppingMerged`, so two folder-linked devices overwrite each other's ticks exactly
+  as every device did before v15. There is no folder poll either: `loadFromFolderOrSeed`
+  runs at startup and on reconnect and that is all, so nothing arrives from the other
+  device until somebody reloads. And because that load calls `mergeRemoteShopping` with no
+  `modifiedAt`, `noteRemoteShoppingStamp` never runs on this backend,
+  `shoppingLastCheckedAt` stays null, and the whole v23.7/v23.8 freshness strip — `behind`
+  and `unreachable` — is silently unreachable there. (`loadFromFolderOrSeed` also rewrites
+  the ~1 MB recipe file on every load whether or not it changed, which the OneDrive path is
+  careful not to do.) Left alone because nobody uses it: the family is on OneDrive, and the
+  folder link is a desktop convenience from before that existed. It is the largest unfixed
+  sync gap in the app, so do not read the invariants above as covering it — anyone reaching
+  for this backend is picking up the pre-v15 behaviour with a modern UI on top.
+
 - **A mixed fleet is the transition cost of v23.0, and it is bounded.** A phone on v23.1
   or earlier writes no removal records, so its deletions fall back to `otherSideDropped` —
   the v23.0 inference, with everything v23.2 says is wrong with it. A phone on v22.2 or
@@ -557,6 +634,18 @@ than working around it.
   check on the local copy and a periodic forced refresh.
 
 ## Open work worth considering
+
+- **Take the Wait List rebuild out of the render path.** The v23.7 exception lives inside
+  `renderReviewTab`, and `render()` is reached from `repaintWhenSafe()` via
+  `applyMergedShopping`. So a background poll that merges somebody's Wait List addition
+  calls `generateShoppingList()` — which stamps `lastPlanned` and calls `persist('recipes')`,
+  a ~1 MB upload over supermarket mobile data, which is exactly what threading `which`
+  through `persist` exists to prevent. It is still safe by construction against minting a
+  trip or dropping a tick (all four conditions still hold), so this is cost and shape, not
+  correctness: a render should not be mutating synced state. Either hoist the exception
+  into the merge/poll path or give it a rebuild that does not re-upload the recipe file.
+  The source test in `test/run-tests.js` pins the call site, so it moves with the code.
+  Raised by the v23.9 audit and deliberately not done alongside a sync fix. *(v23.9)*
 
 - **Ship a small starter seed.** The bundled 635 recipes are one family's collection.
   A dozen generic recipes instead would make forking sensible and drop `index.html`

@@ -60,6 +60,15 @@ function extractConst(name){
   return m[0];
 }
 
+/* Same idea for module-level `let` state. The freshness fields are plain declarations
+   rather than consts, and v23.9's fix is about which of them a caller advances, so they
+   have to come out of the source rather than be re-declared here. */
+function extractLet(name){
+  const m = html.match(new RegExp('let\\s+' + name + '\\s*=\\s*([^;]+);'));
+  if (!m) throw new Error('Could not find let ' + name + ' in index.html');
+  return m[0];
+}
+
 // Keep this in step with the constant in index.html; asserted below so it can't drift.
 const TICK_TIE_WINDOW_MS = 10000;
 
@@ -83,7 +92,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProg
                'syncAlertState', 'lastContactText',
                'doneCountsHere', 'syncNeededFromLine',
                'tripParts', 'tripCode', 'tripLabel', 'tripConflict', 'keepThisList',
-               'pendingWaitListLines', 'listFreshness', 'agoText'];
+               'pendingWaitListLines', 'listFreshness', 'agoText',
+               'syncHorizon', 'noteRemoteShoppingStamp', 'noteRemoteCheckFailed'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -92,6 +102,14 @@ vm.runInContext(
   'let shoppingData = null;\n' +
   'let replacedTrip = null;\n' +
   'let shoppingSeenRemoteAt = null;\n' +
+  // v23.6 in-session state; keepThisList reads it to tell "this phone won an argument"
+  // from "this phone's own list was replaced locally".
+  'let tripDisagreement = null;\n' +
+  extractLet('shoppingRemoteModifiedSeen') + '\n' +
+  extractLet('shoppingRemoteModifiedLatest') + '\n' +
+  extractLet('shoppingBehindSince') + '\n' +
+  extractLet('shoppingLastCheckedAt') + '\n' +
+  extractLet('shoppingCheckFailures') + '\n' +
   // The two genuine I/O calls on the rebuild path. Everything that DECIDES anything is
   // still the real function out of index.html.
   'function persist(){}\n' +
@@ -142,6 +160,15 @@ vm.runInContext(
   '             tripParts, tripCode, tripLabel, tripConflict, keepThisList,' +
   '             pendingWaitListLines, listFreshness, agoText,' +
   '             FRESHNESS_GRACE_MS, FRESHNESS_UNREACHABLE_MS, FRESHNESS_MIN_FAILURES,' +
+  '             syncHorizon, noteRemoteShoppingStamp, noteRemoteCheckFailed,' +
+  '             setSeenRemoteAt: v => { shoppingSeenRemoteAt = v; },' +
+  '             setTripDisagreement: v => { tripDisagreement = v; },' +
+  '             freshnessState: () => ({ seen: shoppingRemoteModifiedSeen,' +
+  '               latest: shoppingRemoteModifiedLatest, behindSince: shoppingBehindSince,' +
+  '               lastCheckedAt: shoppingLastCheckedAt, failures: shoppingCheckFailures }),' +
+  '             resetFreshness: () => { shoppingRemoteModifiedSeen = null;' +
+  '               shoppingRemoteModifiedLatest = null; shoppingBehindSince = null;' +
+  '               shoppingLastCheckedAt = null; shoppingCheckFailures = 0; },' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -166,6 +193,8 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         tripParts, tripCode, tripLabel, tripConflict, keepThisList,
         pendingWaitListLines, listFreshness, agoText,
         FRESHNESS_GRACE_MS, FRESHNESS_UNREACHABLE_MS, FRESHNESS_MIN_FAILURES,
+        syncHorizon, noteRemoteShoppingStamp, noteRemoteCheckFailed,
+        setSeenRemoteAt, setTripDisagreement, freshnessState, resetFreshness,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -174,6 +203,8 @@ const noStaples = () => setRecipesData(
 noStaples();
 
 /* ---------- fixtures ---------- */
+
+const tsOfGen = d => Date.parse(d.weekPlan.generatedAt);
 
 const BASE = Date.parse('2026-08-15T10:00:00Z');
 const T = ms => new Date(BASE + ms).toISOString();
@@ -1952,6 +1983,9 @@ group('v23.6 — keeping a list settles it, rather than pausing the argument');
   setShoppingData(mine);
   setReplacedTrip({ tripId: 'trip:theirs', ticks: 3, decisions: 3,
                     weekPlan: { tripId: 'trip:theirs' }, shoppingList: [] });
+  // The state this button exists for: a fork this phone WON, so the other phone is still
+  // holding the losing trip and still offering it on every poll.
+  setTripDisagreement({ iWon: true });
   keepThisList();
   const after = sandbox.api.currentShopping();
   ok('a new trip is minted', tripIdOf(after) !== 'trip:mine');
@@ -1964,6 +1998,41 @@ group('v23.6 — keeping a list settles it, rather than pausing the argument');
   const theirs = listFor([line('milk')], T(300), { tripId: 'trip:theirs', basedOn: T(0) });
   const c = tripConflict(after, theirs);
   ok('and it beats the other list outright, even from the older file', c.iWon === true);
+  setReplacedTrip(null);
+  setTripDisagreement(null);
+}
+
+/* v23.9. The button minted in every case, and superseding is only right in one of them. */
+group('v23.9 — keeping a list that already won does not mint a third trip');
+{
+  /* This phone LOST: the list on screen is the other phone's, and the stash is this
+     device's own dead trip. Minting here superseded a trip nobody holds, left the actual
+     winner unsuperseded, and put a third id into a household arguing about two. */
+  const theirsHeldHere = listFor([line('milk', { checked: true, checkedAt: T(100) })], T(200),
+                                 { tripId: 'trip:theirs', basedOn: T(0) });
+  setShoppingData(theirsHeldHere);
+  setReplacedTrip({ tripId: 'trip:mine-dead', ticks: 2, decisions: 2,
+                    weekPlan: { tripId: 'trip:mine-dead' }, shoppingList: [] });
+  setTripDisagreement({ iWon: false });
+  keepThisList();
+  const after = sandbox.api.currentShopping();
+  ok('the trip on screen is left exactly as it is', tripIdOf(after) === 'trip:theirs');
+  ok('nothing is superseded \u2014 the winner was never in question',
+     after.weekPlan.supersedes === undefined);
+  ok('and the stash still goes', getReplacedTrip() === null);
+
+  /* A local replacement — a generate, a clear, an import. The trip on screen already names
+     what it replaced, so there is nothing for this button to add. */
+  const localGen = listFor([line('flour')], T(300),
+                           { tripId: 'trip:new', supersedes: 'trip:old', basedOn: T(0) });
+  setShoppingData(localGen);
+  setReplacedTrip({ tripId: 'trip:old', ticks: 0, decisions: 4,
+                    weekPlan: { tripId: 'trip:old' }, shoppingList: [] });
+  setTripDisagreement(null);
+  keepThisList();
+  const after2 = sandbox.api.currentShopping();
+  ok('a locally replaced list keeps the lineage generateShoppingList already wrote',
+     tripIdOf(after2) === 'trip:new' && after2.weekPlan.supersedes === 'trip:old');
   setReplacedTrip(null);
 }
 
@@ -2122,6 +2191,143 @@ group('v23.8 — "cannot reach" counts failed attempts, not elapsed time');
      at({ lastCheckedAt: stale, checkFailures: 5, picksChanged: true, keepsTicks: true }).kind === 'unreachable');
   ok('and an unshared phone never reports it — there is nothing to reach',
      listFreshness({ backend: null, lastCheckedAt: stale, checkFailures: 9, now: BASE }) === null);
+}
+
+/* ---- v23.9: a phone must not report itself behind its own write ----
+
+   shoppingRemoteModifiedSeen advanced in mergeRemoteShopping and nowhere else, so a
+   successful write moved the folder's mtime past anything this device had ever marked as
+   seen — and the fast poll's unchanged-stamp shortcut then returned before merging,
+   because the mtime was one it recognised. The two halves of the comparison could never
+   meet again. listFreshness read `behind` from that poll onwards, so the red card v23.8
+   exists to keep rare was the resting state of any phone somebody was shopping from.
+
+   These are behaviour assertions on noteRemoteShoppingStamp plus source assertions on the
+   two call sites that feed it, for the same reason the generateShoppingList caller count
+   is a source assertion: the rule is about which callers pass what, and no runtime test
+   in this file can reach an async Graph round-trip. */
+group('v23.9 — a write is not a way to fall behind yourself');
+{
+  resetFreshness();
+  // A poll that finds a copy and merges it: in step.
+  noteRemoteShoppingStamp('M0', null);
+  noteRemoteShoppingStamp('M0', 'M0');
+  ok('merging the copy the folder reports leaves nothing to warn about',
+     freshnessState().behindSince === null);
+
+  // The negative control, and the whole bug: latest moves, seen does not.
+  noteRemoteShoppingStamp('M1', null);
+  ok('a copy this device has NOT read does make it behind',
+     freshnessState().behindSince !== null);
+  const stillBehind = listFreshness({ backend: 'onedrive', signedIn: true,
+    behindSince: freshnessState().behindSince,
+    now: freshnessState().behindSince + FRESHNESS_GRACE_MS + 1000 });
+  ok('and after the grace window that is what the strip says',
+     stillBehind && stillBehind.kind === 'behind');
+
+  // This device's own write, stamped as seen because it is the copy it just sent.
+  resetFreshness();
+  noteRemoteShoppingStamp('M0', 'M0');
+  noteRemoteShoppingStamp('M1', 'M1');
+  ok('its own write leaves it in step', freshnessState().behindSince === null);
+  ok('and the strip says nothing at all',
+     listFreshness({ backend: 'onedrive', signedIn: true,
+                     behindSince: freshnessState().behindSince,
+                     lastCheckedAt: freshnessState().lastCheckedAt,
+                     checkFailures: freshnessState().failures,
+                     now: BASE + 10 * 60 * 1000 }) === null);
+  resetFreshness();
+
+  /* The call sites. A behaviour test cannot see which argument a poll passes. */
+  const wrote = html.slice(html.indexOf('async function writeShoppingMerged('));
+  const wroteBody = wrote.slice(0, wrote.indexOf('\n}'));
+  ok('the write records its own mtime as SEEN, not merely as the newest out there',
+     /noteRemoteShoppingStamp\(wrote\.lastModifiedDateTime,\s*wrote\.lastModifiedDateTime\)/
+       .test(wroteBody));
+  /* And the other half of the same rule, which is a `never`: the poll may NOT claim to
+     have seen a copy it has not merged. shoppingFastPollStamp is the mtime the poll acted
+     on, set before the download, so a fetch that then fails leaves it ahead of anything
+     merged — stamping it as seen would silence `behind` in exactly the case it is for.
+     Only whoever holds the copy says so: the merge, and the write. */
+  const poll = html.slice(html.indexOf('async function pollShoppingNow('));
+  const pollBody = poll.slice(0, poll.indexOf('\n}'));
+  ok('the poll still claims nothing it has not merged',
+     /noteRemoteShoppingStamp\(meta\.lastModifiedDateTime,\s*null\)/.test(pollBody));
+  ok('and only the merge and the write ever claim a copy is held',
+     (html.match(/(?<!function )noteRemoteShoppingStamp\([^)]*\)/g) || [])
+       .filter(c => !/,\s*null\)$/.test(c)).length === 2);
+}
+
+/* ---- v23.9: 404 is an answer, not a silence ---- */
+group('v23.9 — a file that does not exist yet is not a folder that cannot be reached');
+{
+  const poll = html.slice(html.indexOf('async function pollShoppingNow('));
+  const pollBody = poll.slice(0, poll.indexOf('\n}'));
+  const at404 = pollBody.indexOf('res.status === 404');
+  const atFail = pollBody.indexOf('noteRemoteCheckFailed()');
+  ok('the 404 case is handled', at404 !== -1);
+  // Guarded: with no 404 case at all, at404 is -1 and a bare `<` would pass vacuously.
+  ok('and it returns before anything counts a failed read', at404 !== -1 && at404 < atFail);
+  ok('it still records that the folder answered',
+     /res\.status === 404\)\{ noteRemoteShoppingStamp\(/.test(pollBody));
+
+  // And the consequence: a phone that has reached the folder every time never says it
+  // cannot. fetchRemoteShopping has always read 404 as "not created yet"; this is the
+  // poll agreeing with it.
+  resetFreshness();
+  noteRemoteShoppingStamp(null, null);
+  const st = freshnessState();
+  ok('a 404 leaves the failure count at zero', st.failures === 0);
+  ok('and nothing to be behind', st.behindSince === null);
+  ok('so the strip stays quiet',
+     listFreshness({ backend: 'onedrive', signedIn: true, behindSince: st.behindSince,
+                     lastCheckedAt: st.lastCheckedAt, checkFailures: st.failures,
+                     now: BASE + 60 * 60 * 1000 }) === null);
+  resetFreshness();
+}
+
+/* ---- v23.9: basedOn is a fact about the shared folder, or it is nothing ----
+
+   Every previous test handed basedOn in as a literal, so nothing ever asked where the
+   value came from. It came from `shoppingSeenRemoteAt || shoppingData.lastUpdated`, and
+   saveShoppingLocal bumps lastUpdated on every save — so the phone that had never once
+   read the folder wrote the NEWEST basedOn in the household and won chooseTripWinner's
+   third rule against every phone that had. The rule inverted. */
+group('v23.9 — a device with no horizon makes no claim about how caught-up it is');
+{
+  setRecipesData({ recipes: [{ id: 'r1', name: 'Soup', servings: 4, ingredients: [] }],
+                   ingredients: [], settings: { features: {}, staples: [], stapleQty: {} } });
+  setSeenRemoteAt(null);
+  setShoppingData({ lastUpdated: T(9e6), seenRemoteAt: null, neededList: [], shoppingList: [],
+    weekPlan: { selections: [{ recipeId: 'r1', servings: 4, addedAt: T(0), changedAt: T(0) }],
+                tripId: 'trip:before', generatedAt: T(0) } });
+  generateShoppingList();
+  const never = sandbox.api.currentShopping();
+  ok('a phone that has never read the folder claims nothing',
+     never.weekPlan.basedOn === null);
+
+  setSeenRemoteAt(T(5000));
+  setShoppingData({ lastUpdated: T(9e6), seenRemoteAt: T(5000), neededList: [], shoppingList: [],
+    weekPlan: { selections: [{ recipeId: 'r1', servings: 4, addedAt: T(0), changedAt: T(0) }],
+                tripId: 'trip:before2', generatedAt: T(0) } });
+  generateShoppingList();
+  ok('and one that has claims exactly what it read',
+     sandbox.api.currentShopping().weekPlan.basedOn === T(5000));
+  ok('syncHorizon is the one place that decides it', syncHorizon() === T(5000));
+  setSeenRemoteAt(null);
+  noStaples();
+
+  /* The consequence, in the rule that reads the field. Neither trip is worked on, so
+     rule 3 decides: the caught-up phone must win. With the old fallback the stale one
+     carried `now` and took it. */
+  const staleDevice = { lastUpdated: T(9e6), shoppingList: [],
+    weekPlan: { tripId: 'trip:stale', generatedAt: T(9e6), basedOn: null, selections: [] } };
+  const caughtUp = { lastUpdated: T(1000), shoppingList: [],
+    weekPlan: { tripId: 'trip:caught', generatedAt: T(1000), basedOn: T(900), selections: [] } };
+  const winner = chooseTripWinner(staleDevice, caughtUp, tsOfGen(staleDevice),
+                                  tsOfGen(caughtUp), staleDevice, BASE + 9e6);
+  ok('a fork between a stale phone and a caught-up one goes to the caught-up one',
+     winner === caughtUp);
 }
 
 group('v23.7 — the "how long ago" wording is coarse on purpose');
