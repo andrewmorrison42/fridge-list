@@ -101,5 +101,52 @@ module.exports = [
           'that LOST supersedes its own dead trip',
     find: '  const rival = replacement.rival;',
     replace: '  const rival = true;'
+  },
+
+  /* ---- v24.1: one parser, one unit table ---- */
+  {
+    name: 'the shopping parser divides by a user-supplied denominator, so "1/0" sums as ' +
+          'Infinity and is then stored as null by JSON.stringify',
+    find: '    if(!den) return null;             // "1/0" is not Infinity; it is not a number at all\n',
+    replace: ''
+  },
+  {
+    name: 'the shopping side keeps its own thinner parser, so a mixed fraction is not ' +
+          'summable and "1 1/2 tsp" twice prints as text instead of "3 tsp"',
+    find: 'function parseQty(q){ return parseAmount(q); }',
+    replace: 'function parseQty(q){\n' +
+             '  if(q === null || q === undefined || q === \'\') return null;\n' +
+             '  if(typeof q === \'number\') return q;\n' +
+             '  const s = String(q).trim();\n' +
+             '  const fracMap = {\'½\':0.5,\'¼\':0.25,\'¾\':0.75,\'⅓\':1/3,\'⅔\':2/3,\'⅛\':0.125};\n' +
+             '  if(fracMap[s] !== undefined) return fracMap[s];\n' +
+             '  const m = s.match(/^(\\d+)\\s*[½¼¾⅓⅔⅛]$/);\n' +
+             '  if(m && fracMap[s.slice(-1)] !== undefined) return parseInt(m[1],10) + fracMap[s.slice(-1)];\n' +
+             '  if(/^(\\d+(\\.\\d*)?|\\.\\d+)$/.test(s)) return parseFloat(s);\n' +
+             '  if(/^\\d+\\/\\d+$/.test(s)){ const [a,b] = s.split(\'/\'); return parseFloat(a)/parseFloat(b); }\n' +
+             '  return null;\n' +
+             '}'
+  },
+  {
+    name: 'the 1 g = 1 mL basis is not applied at all, so a kitchen measure typed for a ' +
+          'gram-shopped staple is dropped with no message',
+    find: '    if(!ua.measure || !massVolume) return null;',
+    replace: '    return null;'
+  },
+  {
+    name: 'the staple path converts units itself again, so the measure table is reached ' +
+          'from the mL branch only and "1 Cup" is matched case-sensitively',
+    find: '  return convertAmount(n, m[2], unit);',
+    replace: '  const suffix = (m[2] || \'\').toLowerCase();\n' +
+             '  if(unit === \'mL\'){\n' +
+             '    if(suffix === \'ml\') return n;\n' +
+             '    if(suffix === \'l\')  return n * 1000;\n' +
+             '    if(UNITS[m[2]] && UNITS[m[2]].measure) return n * UNITS[m[2]].per;\n' +
+             '  }\n' +
+             '  if(unit === \'g\'){\n' +
+             '    if(suffix === \'g\')  return n;\n' +
+             '    if(suffix === \'kg\') return n * 1000;\n' +
+             '  }\n' +
+             '  return null;'
   }
 ];

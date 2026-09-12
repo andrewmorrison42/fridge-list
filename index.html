@@ -657,26 +657,21 @@ function migrateStapleQty(data){
 }
 
 /* Read a typed staple amount as a number in `unit`. A bare number is already in that
-   unit; the everyday larger units convert; anything else has no numeric reading. */
+   unit; anything with a unit on it goes through the one conversion table, so a kitchen
+   measure works here exactly as it does on the recipe path. Until v24.1 the measure
+   table was consulted from the mL branch only, so "1 tsp" against a gram-shopped staple
+   returned null — and setStapleQty has already deleted the previous amount by then, so
+   it was dropped with no message. Anything with no numeric reading is still null:
+   "1 loaf" has no meaning in grams and inventing one puts a wrong number on the list. */
 function stapleQtyToShopping(raw, unit){
   const s = String(raw == null ? '' : raw).trim();
   if(!s) return null;
   const m = s.match(/^([0-9.,/½¼¾⅓⅔⅛\s]+?)\s*([a-zA-Z]*)$/);
   if(!m) return null;
-  const n = parseQty(m[1].replace(/,/g, '').trim());
+  const n = parseAmount(m[1].trim());
   if(n === null || !(n > 0)) return null;
-  const suffix = (m[2] || '').toLowerCase();
-  if(!suffix) return n;                                   // already in the shopping unit
-  if(unit === 'mL'){
-    if(suffix === 'ml') return n;
-    if(suffix === 'l')  return n * 1000;
-    if(MEASURE_ML[m[2]]) return n * MEASURE_ML[m[2]];     // cup / TBsp / tsp
-  }
-  if(unit === 'g'){
-    if(suffix === 'g')  return n;
-    if(suffix === 'kg') return n * 1000;
-  }
-  return null;
+  if(!m[2]) return n;                                     // already in the shopping unit
+  return convertAmount(n, m[2], unit);
 }
 
 // Quantity for a staple as a number in its shopping unit, or null if none is set.
@@ -3381,12 +3376,8 @@ function importSharedRecipes(){
 // "TBsp", "tbsp", "tablespoons", "cup", "tsp"… -> canonical measure name, or null
 // if the text isn't a kitchen measure at all.
 function kitchenMeasureCanon(u){
-  if(!u) return null;
-  const t = String(u).trim().toLowerCase();
-  if(t === 'cup' || t === 'cups') return 'cup';
-  if(t === 'tbsp' || t === 'tablespoon' || t === 'tablespoons') return 'TBsp';
-  if(t === 'tsp' || t === 'teaspoon' || t === 'teaspoons') return 'tsp';
-  return null;
+  const k = unitKey(u);
+  return (k && UNITS[k].measure) ? k : null;
 }
 
 function addNewMasterIngredients(ingredients){
@@ -3450,22 +3441,14 @@ function renameMasterIngredient(data, ing, newName){
   return true;
 }
 
-function parseQty(q){
-  if(q === null || q === undefined || q === '') return null;
-  if(typeof q === 'number') return q;
-  const s = String(q).trim();
-  const fracMap = {'½':0.5,'¼':0.25,'¾':0.75,'⅓':1/3,'⅔':2/3,'⅛':0.125};
-  if(fracMap[s] !== undefined) return fracMap[s];
-  const m = s.match(/^(\d+)\s*[½¼¾⅓⅔⅛]$/);
-  if(m && fracMap[s.slice(-1)] !== undefined) return parseInt(m[1],10) + fracMap[s.slice(-1)];
-  // Accept a leading or trailing decimal point too (".5", "1."). The old pattern
-  // required a digit before the point, so a quantity written ".5" failed to parse and
-  // fell through to the text branch below — it then showed on the list as a bare ".5"
-  // instead of being added into that ingredient's total.
-  if(/^(\d+(\.\d*)?|\.\d+)$/.test(s)) return parseFloat(s);
-  if(/^\d+\/\d+$/.test(s)){ const [a,b] = s.split('/'); return parseFloat(a)/parseFloat(b); }
-  return null; // ranges, "to taste", etc: not summable, keep as text
-}
+/* The shopping side's name for parseAmount. Until v24.1 this was a second, thinner
+   parser: it could not read a mixed fraction ("1 1/2", the commonest way to write an
+   amount in a recipe) or a comma decimal, so those amounts were dropped from the total
+   and printed as literal text beside it; and it divided by a user-supplied denominator
+   with no zero check, so "1/0" summed as Infinity and then stored as null, because
+   JSON.stringify(Infinity) is null. Ranges and "to taste" are still not summable and
+   still kept as text — that part was never the bug. */
+function parseQty(q){ return parseAmount(q); }
 
 function fmtQty(n){
   if(n === null) return '';
@@ -4688,12 +4671,18 @@ function displayUnit(unit){
 /* v21.4: once an amount reaches a kilo or a litre, show it in the larger unit —
    "2.125 L" reads better on a list than "2125 mL". Exact by instruction: no rounding,
    so 1250 g is 1.25 kg and 1001 g is 1.001 kg, not "1 kg". */
-const UNIT_ROLLUP = { g: { to: 'kg', per: 1000 }, ml: { to: 'L', per: 1000 } };
+/* Which unit each base rolls up INTO. The factor is not repeated here — it comes off
+   UNITS, where the kilo and the litre are defined once. Before v24.1 the same 1000 was
+   written here as a divisor and again inside stapleQtyToShopping as a multiplier. */
+const ROLLUP_TO = { g: 'kg', mL: 'L' };
 
 function rollUpQty(n, unit){
-  const r = UNIT_ROLLUP[(unit || '').trim().toLowerCase()];
-  if(!r || !(n >= r.per)) return null;
-  return { qty: n / r.per, unit: r.to };
+  const k = unitKey(unit);
+  const to = k && ROLLUP_TO[k];
+  if(!to) return null;
+  const per = UNITS[to].per / UNITS[k].per;
+  if(!(n >= per)) return null;
+  return { qty: n / per, unit: to };
 }
 
 /* Exact decimal with trailing zeros trimmed. The toFixed only clears floating-point
@@ -5575,22 +5564,94 @@ const INGREDIENT_CATEGORY_OPTIONS = CATEGORY_ORDER.concat(['Other']);
 // Category -> permitted aisles, taken from the Access database hierarchy
 const CATEGORY_AISLES = {"Pantry": ["Alcohol", "Bakery", "Baking", "Beverage", "Biscuits", "Breakfast", "International", "Rice/pasta", "Sauces", "Snacks", "Spices", "Tins - fruit", "Tins - veg"], "Cold": ["Dairy", "Deli", "Freezer"], "Fruit and Vegetables": ["Fruit", "Vegetables"], "Meat": ["Fish", "Meat"], "Toiletries": ["Toiletries"]};
 
-/* ---------------- measuring units (cup / TBsp / tsp) ----------------
+/* ---------------- quantities: one parser, one unit table ----------------
    Recipe entry may use kitchen measures; shopping stays in the master unit.
    Conversion basis agreed 17 Jul 2026: cup = 250 mL, TBsp = 20 mL, tsp = 5 mL,
-   and 1 g = 1 mL for gram-shopped ingredients. */
-const MEASURE_ML = { cup:250, TBsp:20, tsp:5 };
-const MEASURE_FRACTIONS = { cup:[1/8,1/4,1/3,1/2,2/3,3/4], tsp:[1/8,1/4,1/2,3/4], TBsp:[1/2] };
-const FRACTION_GLYPHS = [[1/8,'⅛'],[1/4,'¼'],[1/3,'⅓'],[1/2,'½'],[2/3,'⅔'],[3/4,'¾']];
-function parseMeasureQty(str){
-  if(str===null||str===undefined) return null;
-  let t = String(str).trim().replace(/⅛/g,' 1/8').replace(/¼/g,' 1/4').replace(/⅓/g,' 1/3').replace(/½/g,' 1/2').replace(/⅔/g,' 2/3').replace(/¾/g,' 3/4').trim();
+   and 1 g = 1 mL for gram-shopped ingredients.
+
+   v24.1: there were three quantity systems and every seam between them was a defect.
+   Recipe entry had this section. Shopping totals had parseQty/fmtQty/UNIT_ROLLUP two
+   thousand lines up, with a thinner parser: "1 1/2" was summable here and text there,
+   and "1/0" was null here and Infinity there. Staples had a third copy inside
+   stapleQtyToShopping that multiplied where UNIT_ROLLUP divided, and reached into the
+   measure table from its mL branch only — so "1 tsp" typed against a gram-shopped
+   staple was silently dropped, having already deleted the previous amount.
+
+   `per` is always TO BASE. Read it as a multiplier going down to the base unit and as a
+   divisor coming back up. That is the whole reason the kilo factor now exists once. */
+const UNITS = {
+  g:    { base:'g',   per:1,    discrete:false },
+  kg:   { base:'g',   per:1000, discrete:false },
+  mL:   { base:'mL',  per:1,    discrete:false },
+  L:    { base:'mL',  per:1000, discrete:false },
+  cup:  { base:'mL',  per:250,  discrete:false, measure:true },
+  TBsp: { base:'mL',  per:20,   discrete:false, measure:true },
+  tsp:  { base:'mL',  per:5,    discrete:false, measure:true },
+  qty:  { base:'qty', per:1,    discrete:true  }
+};
+/* Every spelling the app has ever written or a person has ever typed, resolved to one
+   key. The counted spellings are COUNT_UNITS, which displayUnit already blanks; they
+   are here too so a unit is normalised in exactly one place. */
+const UNIT_ALIASES = {
+  g:'g', gram:'g', grams:'g', kg:'kg', kilo:'kg', kilos:'kg',
+  ml:'mL', millilitre:'mL', millilitres:'mL', l:'L', litre:'L', litres:'L',
+  cup:'cup', cups:'cup', tbsp:'TBsp', tablespoon:'TBsp', tablespoons:'TBsp',
+  tsp:'tsp', teaspoon:'tsp', teaspoons:'tsp',
+  qty:'qty', each:'qty', ea:'qty', count:'qty', pc:'qty', pcs:'qty'
+};
+function unitKey(u){
+  return UNIT_ALIASES[String(u == null ? '' : u).trim().toLowerCase()] || null;
+}
+function isMeasure(u){ const k = unitKey(u); return !!(k && UNITS[k].measure); }
+function measureNames(){ return Object.keys(UNITS).filter(k=> UNITS[k].measure); }
+
+/* The one reading of a typed amount. Strict on purpose: "1-2", "to taste" and
+   "2 apples" are not numbers, they are text the shopping list keeps verbatim, and a
+   bare parseFloat here would sum the leading digits and throw the words away. */
+function parseAmount(raw){
+  if(raw === null || raw === undefined || raw === '') return null;
+  if(typeof raw === 'number') return isFinite(raw) ? raw : null;
+  const t = String(raw).trim().replace(/⅛/g,' 1/8').replace(/¼/g,' 1/4').replace(/⅓/g,' 1/3').replace(/½/g,' 1/2').replace(/⅔/g,' 2/3').replace(/¾/g,' 3/4').trim();
   if(!t) return null;
   const m = t.match(/^(\d+)?\s*(\d+)\s*\/\s*(\d+)$/);
-  if(m){ const den=parseInt(m[3],10); if(!den) return null; return (m[1]?parseInt(m[1],10):0) + parseInt(m[2],10)/den; }
+  if(m){
+    const den = parseInt(m[3],10);
+    if(!den) return null;             // "1/0" is not Infinity; it is not a number at all
+    return (m[1] ? parseInt(m[1],10) : 0) + parseInt(m[2],10)/den;
+  }
+  if(!/^\d*[.,]?\d*$/.test(t) || !/\d/.test(t)) return null;   // full string, or it is text
   const f = parseFloat(t.replace(',','.'));
   return isNaN(f) ? null : f;
 }
+
+/* Convert between units, or null when the conversion is not defined.
+
+   The 1 g = 1 mL in the basis above applies to KITCHEN MEASURES only — a teaspoon of
+   something shopped in grams, which is the case it was agreed for and the only case
+   where the approximation is small enough to be harmless. It deliberately does NOT
+   extend to the bulk units: "2 L" against a gram-shopped ingredient stays null, because
+   two litres of flour is not two kilos and putting 2000 on the list would be a wrong
+   number rather than a missing one. That refusal predates v24.1 and is kept on purpose.
+
+   'qty' converts to nothing: a count is not a weight. */
+function convertAmount(n, from, to){
+  if(n === null || n === undefined || typeof n !== 'number' || !isFinite(n)) return null;
+  const a = unitKey(from), b = unitKey(to);
+  if(!a || !b) return null;
+  if(a === b) return n;
+  const ua = UNITS[a], ub = UNITS[b];
+  if(ua.base !== ub.base){
+    const massVolume = (ub.base === 'g' || ub.base === 'mL');
+    if(!ua.measure || !massVolume) return null;
+  }
+  return n * ua.per / ub.per;
+}
+
+const MEASURE_FRACTIONS = { cup:[1/8,1/4,1/3,1/2,2/3,3/4], tsp:[1/8,1/4,1/2,3/4], TBsp:[1/2] };
+const FRACTION_GLYPHS = [[1/8,'⅛'],[1/4,'¼'],[1/3,'⅓'],[1/2,'½'],[2/3,'⅔'],[3/4,'¾']];
+// The recipe editor's name for parseAmount. Both names are kept: between them they have
+// five call sites, and a rename is a wide diff in this file for no change in behaviour.
+function parseMeasureQty(str){ return parseAmount(str); }
 function validMeasureQty(num, unit){
   if(num===null || num<=0) return false;
   const fr = MEASURE_FRACTIONS[unit]; if(!fr) return true;
@@ -5604,13 +5665,16 @@ function formatMeasureQty(num){
   for(const [v,g] of FRACTION_GLYPHS){ if(Math.abs(rem-v)<0.02) return (whole? whole+' ':'')+g; }
   return String(Math.round(num*100)/100);
 }
-function measureToShoppingQty(num, measureUnit){ return Math.round(num * MEASURE_ML[measureUnit]); }
+function measureToShoppingQty(num, measureUnit, shopUnit){
+  const n = convertAmount(num, measureUnit, shopUnit || 'mL');
+  return n === null ? null : Math.round(n);
+}
 
 function wireUnitControls(name, qty, unit, unitSel, hint, presetDisplayUnit){
   function showMeasureSelect(shopUnit, preferred){
     const cur = unitSel.getAttribute('data-shop')===shopUnit ? unitSel.value : null;
     unitSel.innerHTML='';
-    [shopUnit,'cup','TBsp','tsp'].forEach(u=> unitSel.appendChild(el('option',{value:u},[u])));
+    [shopUnit].concat(measureNames()).forEach(u=> unitSel.appendChild(el('option',{value:u},[u])));
     unitSel.setAttribute('data-shop', shopUnit);
     unitSel.value = preferred || cur || shopUnit;
     if(!unitSel.value) unitSel.value = shopUnit;
@@ -5633,11 +5697,11 @@ function wireUnitControls(name, qty, unit, unitSel, hint, presetDisplayUnit){
     }
   }
   function conversionNote(meta){
-    if(unitSel.style.display==='none' || !MEASURE_ML[unitSel.value]) return '';
+    if(unitSel.style.display==='none' || !isMeasure(unitSel.value)) return '';
     const n = parseMeasureQty(qty.value);
     if(n===null) return '';
     if(!validMeasureQty(n, unitSel.value)) return ' · that fraction isn\'t allowed for '+unitSel.value;
-    return ' · = '+measureToShoppingQty(n, unitSel.value)+' '+meta.shoppingUnit+' for shopping';
+    return ' · = '+measureToShoppingQty(n, unitSel.value, meta.shoppingUnit)+' '+meta.shoppingUnit+' for shopping';
   }
   function updateHint(preferredUnit){
     const meta = findIngredientMeta(name.value);
@@ -5717,14 +5781,14 @@ function collectIngredientRows(wrap){
     const unitVal = useSel ? unitSel.value
                   : (unitInput.dataset.unit !== undefined ? unitInput.dataset.unit
                                                           : unitInput.value.trim());
-    if(useSel && MEASURE_ML[unitVal]){
+    if(useSel && isMeasure(unitVal)){
       const num = parseMeasureQty(qtyStr);
       if(num===null || !validMeasureQty(num, unitVal)){
         const allowed = unitVal==='cup' ? 'whole numbers and ⅛ ¼ ⅓ ½ ⅔ ¾' : unitVal==='tsp' ? 'whole numbers and ⅛ ¼ ½ ¾' : 'whole numbers and ½';
         return {error:'"'+nameV+'": quantity "'+qtyStr+'" isn\'t valid for '+unitVal+'. Allowed: '+allowed+' (e.g. 1 ½).'};
       }
       const meta = findIngredientMeta(nameV);
-      const entry = {ingredientName:nameV, quantity: measureToShoppingQty(num, unitVal),
+      const entry = {ingredientName:nameV, quantity: measureToShoppingQty(num, unitVal, meta&&meta.shoppingUnit),
                 unit:(meta&&meta.shoppingUnit)||'', displayQty: formatMeasureQty(num), displayUnit: unitVal};
       if(currentSection) entry.section = currentSection;
       if(descV) entry.descriptor = descV;

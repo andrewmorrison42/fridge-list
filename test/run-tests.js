@@ -70,6 +70,9 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProg
                'recipeSelectionsSignature', 'shoppingListIsStale',
                'featureOn', 'stapleQtyFor', 'stapleQtyToShopping', 'parseQty', 'fmtQty',
                'displayUnit', 'unitLabel', 'stapleUnitLabel', 'lineQtyText', 'findIngredientMeta', 'rollUpQty', 'fmtExactQty',
+               'unitKey', 'isMeasure', 'measureNames', 'parseAmount', 'convertAmount',
+               'parseMeasureQty', 'validMeasureQty', 'formatMeasureQty', 'measureToShoppingQty',
+               'kitchenMeasureCanon',
                'ingredientLineText', 'recipeToPlainText', 'recipeToHtml', 'buildShareBundle',
                'tripRecordFromShopping', 'mergeTripHistory', 'pruneTripHistory',
                'recipeHistoryLabel', 'recipeHistoryTime', 'daysSinceStamp', 'daysSinceCooked',
@@ -108,8 +111,9 @@ vm.runInContext(
   'function setStatus(){}\n' +
   'let recipesData = { recipes: [], ingredients: [], settings: { features: {}, staples: [], stapleQty: {} } };\n' +
   extractConst('COUNT_UNITS') + '\n' +
-  extractConst('MEASURE_ML') + '\n' +
-  extractConst('UNIT_ROLLUP') + '\n' +
+  extractConst('UNITS') + '\n' +
+  extractConst('UNIT_ALIASES') + '\n' +
+  extractConst('ROLLUP_TO') + '\n' +
   extractConst('TRIP_LIVE_WINDOW_MS') + '\n' +
   extractConst('SHARE_MARKER') + '\n' +
   extractConst('APP_VERSION') + '\n' +
@@ -129,7 +133,10 @@ vm.runInContext(
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
   '             ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,' +
-  '             unitLabel, stapleUnitLabel, SHOPPING_UNIT_OPTIONS, MEASURE_ML,' +
+  '             unitLabel, stapleUnitLabel, SHOPPING_UNIT_OPTIONS, UNITS,' +
+  '             unitKey, isMeasure, measureNames, parseAmount, convertAmount, rollUpQty,' +
+  '             parseMeasureQty, validMeasureQty, formatMeasureQty, measureToShoppingQty,' +
+  '             kitchenMeasureCanon,' +
   '             tripProgress, tripDecisions, tripHasProgress, tripIsLive, tripIsWorkedOn,' +
   '             chooseTripWinner, TRIP_LIVE_WINDOW_MS,' +
   '             sameTripRebuild, stashReplacedTrip, generateShoppingList,' +
@@ -156,7 +163,10 @@ vm.runInContext(
 const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,
         ingredientLineText, recipeToPlainText, recipeToHtml, buildShareBundle, SHARE_MARKER,
-        unitLabel, stapleUnitLabel, SHOPPING_UNIT_OPTIONS, MEASURE_ML,
+        unitLabel, stapleUnitLabel, SHOPPING_UNIT_OPTIONS, UNITS,
+        unitKey, isMeasure, measureNames, parseAmount, convertAmount, rollUpQty,
+        parseMeasureQty, validMeasureQty, formatMeasureQty, measureToShoppingQty,
+        kitchenMeasureCanon,
         tripProgress, tripDecisions, tripHasProgress, tripIsLive, tripIsWorkedOn,
         chooseTripWinner, TRIP_LIVE_WINDOW_MS,
         sameTripRebuild, stashReplacedTrip, generateShoppingList,
@@ -475,6 +485,76 @@ group('quantity parsing');
   ok('a lone point is not a number', parseQty('.') === null);
   ok('non-numeric amounts stay text', parseQty('to taste') === null && parseQty('1-2') === null);
   ok('empty stays empty', parseQty('') === null && parseQty(null) === null && parseQty(undefined) === null);
+
+  /* v24.1 — P3-06: a mixed fraction is the commonest way to write an amount in a recipe
+     and the shopping parser could not read one, so "1 1/2 tsp" from two recipes came out
+     as the text "1 1/2, 1 1/2" instead of "3 tsp". The measure parser could read it all
+     along; that was the seam. */
+  ok('a mixed fraction parses', parseQty('1 1/2') === 1.5 && parseQty('2 3/4') === 2.75);
+  ok('a comma decimal parses', parseQty('1,5') === 1.5);
+
+  /* v24.1 — P1-03: "1/0" was Infinity, which fmtQty rendered as the word "Infinity",
+     stapleQtyToShopping admitted because its only test was n > 0, and JSON.stringify
+     then wrote to the synced file as null. */
+  ok('a zero denominator is not a number', parseQty('1/0') === null);
+  ok('...and never reaches the total as Infinity', parseQty('5/0') === null);
+
+  /* The strictness is the point of having one parser rather than the lenient one. A
+     bare parseFloat reads "2 apples" as 2 and throws the word away; both names refuse. */
+  ok('a number with words after it stays text',
+     parseQty('2 apples') === null && parseMeasureQty('2 apples') === null);
+
+  /* v24.1: the structural claim — parseQty and parseMeasureQty are one function under
+     two names. If somebody re-splits them, this fails before any behaviour test does. */
+  ok('the two parser names agree on every case',
+     ['1 1/2', '1,5', '1/0', '½', '1½', '.5', '1.', '2', 'to taste', '1-2', '2 apples',
+      '', '0.35', '3/4', '10'].every(x => {
+        const a = parseQty(x), b = parseMeasureQty(x);
+        return a === b || (a !== a && b !== b);
+      }));
+}
+
+group('one unit table, read both directions');
+{
+  /* v24.1 — P5-07: the kilo/litre factor was written twice, as a divisor in UNIT_ROLLUP
+     and as a multiplier inside stapleQtyToShopping, with nothing tying them together. */
+  ok('the factor converts down and rolls back up',
+     convertAmount(1, 'kg', 'g') === 1000 && rollUpQty(1000, 'g').qty === 1);
+  ok('...and for volume too',
+     convertAmount(1, 'L', 'mL') === 1000 && rollUpQty(1000, 'mL').qty === 1);
+  ok('the rolled unit is named from the table',
+     rollUpQty(1500, 'g').unit === 'kg' && rollUpQty(2125, 'mL').unit === 'L');
+
+  /* v24.1 — P1-10: the measure table was matched against the raw text while the metric
+     suffixes were lowercased first, so "1 Cup" and "1 tbsp" fell through to null and
+     were dropped with no message, the previous amount having already been deleted. */
+  ok('a unit is normalised once, whatever its casing',
+     unitKey('ML') === 'mL' && unitKey('Cup') === 'cup' && unitKey('TBSP') === 'TBsp' &&
+     unitKey('Kg') === 'kg' && unitKey('  tsp ') === 'tsp');
+  ok('an unknown unit is not guessed at', unitKey('loaf') === null && unitKey('') === null);
+
+  ok('kitchen measures are recognised by the table, not a second list',
+     kitchenMeasureCanon('TABLESPOONS') === 'TBsp' && kitchenMeasureCanon('cups') === 'cup' &&
+     kitchenMeasureCanon('loaf') === null);
+  ok('the measure names come off the table',
+     measureNames().sort().join(',') === 'TBsp,cup,tsp');
+
+  /* The cross-base rule is kitchen measures only — see convertAmount's comment. */
+  ok('a kitchen measure crosses into grams', convertAmount(1, 'tsp', 'g') === 5);
+  ok('a bulk volume does not', convertAmount(2, 'L', 'g') === null);
+  ok('a count converts to nothing',
+     convertAmount(3, 'qty', 'g') === null && convertAmount(3, 'g', 'qty') === null);
+
+  /* A source test, because no behaviour test can see this one: a second hardcoded 1000
+     converts identically and passes everything above. The claim being made is that the
+     factor exists once, in UNITS, and that every conversion reads it from there — so
+     the check is that no conversion function contains the number at all. This is the
+     shape of defect P5-07 reported and the shape a "one table" claim can regress into
+     without a single assertion noticing. */
+  ['convertAmount', 'rollUpQty', 'stapleQtyToShopping', 'measureToShoppingQty'].forEach(fn=>{
+    ok(fn + '() reads the factor from UNITS rather than restating it',
+       !/\b1000\b/.test(extract(fn)), extract(fn));
+  });
 }
 
 group('staple amounts are numbers in the shopping unit');
@@ -490,6 +570,15 @@ group('staple amounts are numbers in the shopping unit');
   ok('kilograms become grams', stapleQtyToShopping('1 kg', 'g') === 1000);
   ok('grams stay put', stapleQtyToShopping('250 g', 'g') === 250);
   ok('kitchen measures convert for volumes', stapleQtyToShopping('2 cup', 'mL') === 500);
+
+  /* v24.1 — P3-03: the measure table was consulted from the mL branch only, so a kitchen
+     measure typed against a gram-shopped staple returned null — and setStapleQty deletes
+     the previous entry before it stores, so the amount vanished with no message. The
+     conversion basis says 1 g = 1 mL for exactly this case. */
+  ok('a kitchen measure converts for weights too', stapleQtyToShopping('1 tsp', 'g') === 5);
+  ok('...for cups as well', stapleQtyToShopping('2 cup', 'g') === 500);
+  ok('...and the casing does not matter',
+     stapleQtyToShopping('1 Cup', 'mL') === 250 && stapleQtyToShopping('1 tbsp', 'mL') === 20);
 
   // A unit that makes no sense for the ingredient has no numeric reading, and
   // guessing one would put a wrong number on the shopping list.
@@ -1699,7 +1788,7 @@ group('v23.4 — the picker offers only units the app can work with');
      editor's unit box to that measure forever after, which is why saveRecipeFromForm
      converts such lines to mL instead. */
   ok('and never a kitchen measure',
-     !vals.some(v => Object.prototype.hasOwnProperty.call(MEASURE_ML, v)), Object.keys(MEASURE_ML));
+     !vals.some(v => UNITS[v] && UNITS[v].measure), measureNames());
   ok('every option has a label a person can read',
      SHOPPING_UNIT_OPTIONS.every(o => typeof o.label === 'string' && o.label.trim().length > 0));
 }
