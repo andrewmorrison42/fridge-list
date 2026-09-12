@@ -2217,6 +2217,35 @@ group('v24.0 — an answer says what is out there, and nothing about what this d
   ok('holding it does', c.snapshot().behindSince === null);
 }
 
+/* v24.0.1. Every test above drives its events in increasing mtime order, which is how the
+   code was written and therefore how the tests were written. Out of order is not
+   hypothetical: syncInFlight guards the two pollers, but writeShoppingMerged also merges,
+   from the 600 ms autosave timer, and checks nothing — so a write-path merge can land
+   after a poll-path one carrying an older copy. v24.0 guarded `latest` against going
+   backwards and not `held`, one line above it. */
+group('v24.0.1 — neither mtime goes backwards, whatever order the merges land in');
+{
+  const c = makeSyncClock(()=> BASE);
+  c.merged('2026-09-12T10:00:02Z', { lastUpdated: T(2000) });   // the 5s poll, newest copy
+  ok('in step after merging the newest copy', c.snapshot().behindSince === null);
+
+  c.merged('2026-09-12T10:00:01Z', { lastUpdated: T(1000) });   // the write path, older
+  ok('an out-of-order merge does not make it behind itself',
+     c.snapshot().behindSince === null);
+  ok('and the horizon still does not go backwards', c.horizon() === T(2000));
+
+  // A genuinely newer copy out there must still register, or the guard would have bought
+  // silence rather than correctness.
+  c.answered(200, '2026-09-12T10:00:09Z');
+  ok('a real newer copy still reports behind', c.snapshot().behindSince !== null);
+
+  // Same rule for the write path: an out-of-order write echo must not regress it either.
+  const d = makeSyncClock(()=> BASE);
+  d.merged('2026-09-12T10:00:02Z', { lastUpdated: T(2000) });
+  d.wrote('2026-09-12T10:00:01Z');
+  ok('nor does an out-of-order write echo', d.snapshot().behindSince === null);
+}
+
 group('v24.0 — a write is not a way to fall behind yourself');
 {
   // The v23.9 A scenario, end to end, as behaviour rather than as a grep.

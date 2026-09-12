@@ -521,6 +521,62 @@ the guard returns cannot reach it, and the merge cannot touch the horizon. 41 ru
 A refactor that leaves the rule count where it found it has not removed a class of bug; it
 has renamed one.
 
+### v24.0.1 — the review found what the tool could not
+
+v24.0 shipped a sync clock whose stated purpose was that *being behind a copy you are holding
+cannot be expressed*, and a bite runner to prove such claims rather than assert them. An
+adversarial review of the merged release, run because the release had gone out without a
+second pass, found that it could be expressed after all.
+
+```js
+const take = mtime => {
+  held = mtime;                                      // ← unguarded
+  if(!latest || tsOf(mtime) >= tsOf(latest)) latest = mtime;
+};
+```
+
+`latest` guarded against going backwards; `held`, one line above, not. Both lines written in
+one go, one of them guarded. It is reachable because the two merge paths are not mutually
+excluded — `syncInFlight` guards the two pollers, but `writeShoppingMerged` also merges, from
+the 600 ms autosave timer, and checks nothing — so a write-path merge can land after a
+poll-path one carrying an older mtime, leaving the device reporting itself behind a copy it
+is holding a superset of.
+
+Low severity: it self-corrects on the next write or in-order merge, and the visible cost is a
+spurious red card that `lastWriteError` would outrank anyway. **The interesting part is that
+nothing caught it.**
+
+**A bite case only covers a defect somebody thought of.** Every clock test drove its events in
+increasing mtime order, because the same reasoning wrote the code and the tests — the exact
+failure recorded under "Green is not evidence" two entries up, recurring *inside the release
+that added a tool to stop it*. The runner works. It is a ratchet, not a net: it stops a fixed
+bug coming back, and says nothing about the bug nobody has had yet. Treating a green bite run
+as coverage would be the same category error as treating a green suite as evidence.
+
+So the method in "How to review this codebase" earns its place again, and what worked was the
+part that does not read documentation: **follow the data.** Tracing every writer and reader of
+the clock's state turned up an asymmetry between two adjacent lines that no invariant mentions
+and no assertion covers. Tracing the invariants would have found the code and the comment
+agreeing, exactly as it did in v23.2.
+
+Two things were found and deliberately not fixed, recorded so they are not re-discovered as
+novel:
+
+- **`wrote()` records contact, so a successful write resets the read-failure count.** A phone
+  whose PUTs work but whose GETs fail shows neither `unreachable` nor `behind`. Narrow, and
+  half-right: writes *are* reaching the other phones, so the wording `unreachable` would use
+  is false.
+- **`writeShoppingMerged` merges without `syncInFlight`.** The root of the interleaving.
+  Left alone: adding the guard risks a write silently skipping its pre-merge, which is the
+  v15 race the merge-then-write design exists to close. Guarding `held` fixes the symptom
+  without touching that ordering.
+
+And the process point, which is the one worth keeping. This release existed because a release
+went out without review — and the review found something real within the hour. Not because the
+reviewer was expert, but because reviewing is a different act from building, and the same
+reasoning cannot do both. The bite runner is now in the checklist; the review is not, and on
+this evidence it should be.
+
 ### What the arc actually cost
 
 Four structural sync changes in two days, two of them fixing something the previous one

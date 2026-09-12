@@ -345,7 +345,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v24.0';
+const APP_VERSION = 'v24.0.1';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -503,10 +503,22 @@ function makeSyncClock(nowFn){
 
   // Only this knows how to hold something. Both public holders go through it, so they
   // cannot drift apart the way the call sites they replaced did.
+  /* v24.0.1: NEITHER of these goes backwards, and the guard on `held` is the one v24.0
+     forgot — `latest` had it, `held` one line above did not, which is the shape of every
+     defect this object was built to end.
+
+     It is reachable because the two merge paths are not mutually excluded: syncInFlight
+     guards the two pollers, but writeShoppingMerged also merges, from the 600 ms autosave
+     timer, and checks nothing. So a write-path merge can land after a poll-path one
+     carrying an OLDER mtime, and the device would report itself behind while holding a
+     superset of both copies. Merging an older copy into a newer state yields something at
+     least as new as what was already held; understating that is wrong in the only
+     direction that matters.
+
+     Found by review, not by the suite: every clock test drove its events in increasing
+     mtime order, because the same reasoning wrote the code and the tests. */
   const take = mtime => {
-    held = mtime;
-    // Never let `latest` sit behind what we hold: that is the state this object exists
-    // to make impossible.
+    if(!held || tsOf(mtime) >= tsOf(held)) held = mtime;
     if(!latest || tsOf(mtime) >= tsOf(latest)) latest = mtime;
   };
 
