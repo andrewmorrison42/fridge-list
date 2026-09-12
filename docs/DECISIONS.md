@@ -672,6 +672,18 @@ So, in addition to tracing the invariants:
 `mergeAuthored`'s tombstone map is now new evidence-bearing state. It deserves treatment 1
 above before anything else is built on it.
 
+**This is a release step as of v24.0.1** — see `CLAUDE.md`, "Releasing", step 4. It was
+added because v24.0 shipped without it and a review found a real defect within the hour,
+and because method 1 is what found it: two adjacent lines, one guarded and one not, which
+no invariant mentions and no assertion covered. Method 1 has now found something on both
+occasions it has been applied. Tracing the invariants, on both occasions, would have found
+the code and its comment in agreement.
+
+The step asks for a **separate pass** — in practice a fresh session given the branch and
+this section and nothing else. That is not ceremony. The builder re-reading their own diff
+shares the premise that produced the defect, which is the whole finding of the v23.2 entry
+above, restated at the level of who is doing the reading rather than what they are reading.
+
 ---
 
 ## Process decisions
