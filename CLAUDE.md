@@ -56,6 +56,29 @@ Consequences:
 
 Each of these has a bug behind it.
 
+**A Wait List `done` set in the aisle is a TICK, and carries `doneTripId`.** `done` was one
+flag doing two jobs with different lifetimes: `syncNeededFromLine` writes it when somebody
+ticks a line in a shop ("it is in the trolley on this trip"), and the Wait List tab writes
+it when somebody decides they do not need the thing ("a statement about the week"). Nothing
+recorded which was which — and because `neededList` is authored data it merges
+trip-independently while `shoppingList` does not, the two came apart the moment two phones
+held different `tripId`s: one phone's aisle ticks were discarded wholesale with its list,
+while those same ticks crossed the Wait List entries off everywhere. The family sees the
+Wait List items struck through and the recipe ingredients untouched, which is exactly the
+bug as reported. `finishShopping` then deleted every `done` entry, so the shop ended by
+binning Wait List items nobody had bought. `doneCountsHere` is now the single reading of
+"is this done, here, now" — every display, the regeneration filter and the finish sweep go
+through it — and the aisle route stamps `doneTripId` while the Wait List tab deliberately
+does not. Absent means a decision, which is also what every build before v23.5 wrote.
+Do not read `n.done` directly. *(v23.5)*
+
+**A merge that swaps the trip is not "catching up".** `describeMerge` reports
+`tripReplaced` and `ticksLost`, and `mergeReport` gives that its own sentence pointing at
+"Put back the list that was replaced". Two lists generated from the same picks look
+identical and are two different trips; `chooseTripWinner` then discards one of them
+wholesale on every poll, and until v23.5 nothing on screen ever said so. The undo has
+existed since v21.8 — what was missing was any reason to reach for it. *(v23.5)*
+
 **An ingredient's shopping unit must be settable, and `SHOPPING_UNIT_OPTIONS` is the whole
 vocabulary.** Until v23.4 nothing in the app could set `shoppingUnit`: every creation site
 wrote `''` and the master-list row offered name, category, aisle and delete — while the
@@ -89,7 +112,9 @@ pruning must not do that: people prune and then carry on planning. Stamped only,
 pantry default would count as a decision. Two functions on purpose; do not tidy them back
 into one. *(v23.3)*
 
-**A decision outlives its trip. A tick does not.** `checked` means "in the trolley" and
+**A decision outlives its trip. A tick does not.** This is the rule `doneTripId` exists to
+extend to the Wait List — see the v23.5 invariant above, which is what happens when a tick
+is stored on an authored collection. `checked` means "in the trolley" and
 belongs to the trip being shopped — v21.8's rule that last trip's ticks must not leak in
 still holds exactly. `removed` and `atHome` are statements about the week and the cupboard,
 still true whichever generation of the list is on screen. `generateShoppingList` carried
@@ -413,6 +438,13 @@ than working around it.
   keeps rather than loses, which is the side to err on. This replaces the two entries that
   used to sit here, which recorded that the picks and the Wait List were last-writer-wins;
   they no longer are.
+
+- **A phone on v23.4 or earlier still crosses its aisle ticks off everyone's Wait List.**
+  It writes no `doneTripId`, so a `done` that arrived from its trolley reads here as a
+  decision about the week and keeps the item off the next list. That is the pre-v23.5
+  behaviour, and it is the safe half of the bug: the item is left off rather than deleted,
+  because `finishShopping` on THIS device now sweeps only what `doneCountsHere` says is
+  this trip's. It self-corrects as devices update.
 
 - **A mixed fleet pollutes `lastCooked` for as long as it lasts.** A phone still on v21.9
   goes on stamping `lastCooked` when it generates a list, so on a household running both

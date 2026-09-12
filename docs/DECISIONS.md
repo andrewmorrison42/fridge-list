@@ -213,6 +213,67 @@ control exists. Reading the docs finds nothing; enumerating every writer of `sho
 finds it in a minute. That is the method in "How to review this codebase" below, and this
 was its first unprompted success.
 
+### v23.5 — one flag, two lifetimes, and a fork nobody could see
+
+Reported from a shop: two phones, and the items one shopper put in the trolley crossed off
+on the other's phone **only where a Wait List entry was behind them**. Recipe ingredients
+stayed unticked. The family's reading was that both phones were on the same trip and the
+same master list.
+
+The decisive fact is that `neededList` and `shoppingList` travel in the **same file**,
+written by the same save — so the data always arrived. The split is the merge, and only one
+rule in it treats the two collections differently: `shoppingList` is trip-scoped and a
+mismatched `tripId` makes `chooseTripWinner` discard one side wholesale, while `neededList`
+is authored data and merges regardless of the trip. A menu ingredient has one channel; a
+Wait List item has two. So the symptom is the exact fingerprint of two trip ids, and
+nothing else in the code can produce it.
+
+Two things were wrong, and they are worth separating.
+
+**`done` was one flag doing two jobs.** Ticking a line in the aisle and ticking an entry on
+the Wait List tab both set `done`, but the first is a tick (belongs to a trip) and the
+second is a decision (belongs to the week). The app already knew that distinction — *"a
+decision outlives its trip, a tick does not"*, v23.3 — and had simply never applied it to
+the Wait List. So a tick was stored on the one collection that outlives trips.
+
+- **Chosen: stamp the trip on the aisle route only** (`doneTripId`), and route every
+  reading of "is this done" through `doneCountsHere`. Additive field, absent on older
+  copies, which then behave exactly as they did.
+- **Rejected: make `neededList` follow the trip winner.** It would fix this symptom and
+  reintroduce the v23.0 bug the one rule exists to prevent — a Wait List addition made on
+  the losing phone would vanish. Which shopping *list* won says nothing about what somebody
+  added to the Wait List, for the same reason it says nothing about the recipe picks.
+- **Rejected: clear a foreign trip's `done` on this device.** It would write back, and two
+  phones would then fight over the flag. A `doneTripId` that matches nothing here simply
+  reads as not done, and self-corrects with no traffic.
+
+The severity was not the strikethrough. `finishShopping` deleted every `done` entry, so the
+shop ended by **binning Wait List items nobody had bought** — a silent data loss sitting
+behind a cosmetic-looking report. Worth remembering when triaging: the reported symptom was
+the harmless half.
+
+**Two identical-looking lists were two trips, and nothing said so.** Both phones opening the
+Review tab before either had read the folder is enough: `shoppingListIsStale()` is true
+whenever the list is empty (it is, right after "Shopping is done"), and the tab regenerated
+silently. `tripId` appears nowhere in the interface.
+
+- **Chosen: say it out loud.** `mergeReport` gets its own sentence for a replaced trip,
+  naming the ticks it cost and pointing at "Put back the list that was replaced". That undo
+  has existed since v21.8; what was missing was any reason to reach for it.
+- **Chosen: do not mint a trip before this device has read the folder** — but only when
+  there is no list on screen, because holding back a list somebody can already see would
+  replace it with a notice, and hiding what a person is reading is the failure this file
+  keeps circling.
+- **Rejected: offer a choice between the two lists.** v21.8 tried that and v21.9 removed
+  it. Asked to choose between two lists, nobody knew which was which. Waiting one poll is
+  not a choice, which is why this is not the same prompt coming back.
+
+A note on method, since "How to review this codebase" is about exactly this: the first
+diagnosis here was right about the mechanism and wrong to stop there. What settled it was
+driving the real extracted functions with both trip ids and watching the reported symptom
+appear on demand — same trip, everything crosses; different trips, only `done` does. The
+suite had 322 passing assertions over this merge and none of them asked that question.
+
 ### What the arc actually cost
 
 Four structural sync changes in two days, two of them fixing something the previous one

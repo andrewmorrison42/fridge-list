@@ -340,7 +340,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v23.4';
+const APP_VERSION = 'v23.5';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -1814,6 +1814,14 @@ const SELECTION_FIELDS = [
 ];
 const WAITLIST_FIELDS = [
   { name:'done', stamp:'changedAt', whenUnstamped:(a,b)=> !!(a || b) },
+  /* v23.5. `done` alone cannot say whether somebody bought the thing or merely decided
+     they did not need it, and the two have different lifetimes — see doneCountsHere. The
+     trip a tick belonged to has to travel with the tick, or the receiving phone is back to
+     guessing. Resolved on the same stamp as `done` so the pair can never be separated.
+     Undefined rather than null when neither side has one, so an entry authored before
+     v23.5 does not gain a key it never had. (No semicolons in here: test/run-tests.js
+     extracts this constant by reading up to the first one.) */
+  { name:'doneTripId', stamp:'changedAt', whenUnstamped:(a,b)=> a || b || undefined },
   { name:'text', stamp:'changedAt' }
 ];
 
@@ -1996,7 +2004,17 @@ function describeMerge(before, after){
     waitArrived:  count(bNeed, aNeed), waitRemoved:  count(aNeed, bNeed),
     ticksArrived: Math.max(0, ticks(after) - ticks(before))
   };
-  d.changed = !!(d.picksArrived || d.picksRemoved || d.waitArrived || d.waitRemoved || d.ticksArrived);
+  /* v23.5. Two phones that each generated a list from the same picks hold two lists that
+     look identical and are two different trips, and nothing on screen ever showed the
+     difference. chooseTripWinner then discards one of them wholesale on every poll, which
+     is a person's walk round a shop going quietly missing. It is the one merge outcome
+     worth interrupting somebody for, so it gets its own sentence rather than being folded
+     into the tally below. */
+  const bTrip = tripIdOf(before), aTrip = tripIdOf(after);
+  d.tripReplaced = !!(bTrip && aTrip && bTrip !== aTrip);
+  d.ticksLost = d.tripReplaced ? Math.max(0, ticks(before) - ticks(after)) : 0;
+  d.changed = !!(d.picksArrived || d.picksRemoved || d.waitArrived || d.waitRemoved
+                 || d.ticksArrived || d.tripReplaced);
   return d;
 }
 
@@ -2004,6 +2022,14 @@ function describeMerge(before, after){
 function mergeReport(d){
   if(!d || !d.changed) return null;
   const n = (count, one, many) => count + ' ' + (count === 1 ? one : (many || one + 's'));
+  // A replaced list is not "catching up" and must not read like it. Say what happened to
+  // the ticks, and point at the undo that already exists.
+  if(d.tripReplaced){
+    return 'Another phone\u2019s shopping list replaced the one on this device'
+      + (d.ticksLost ? ' \u2014 ' + n(d.ticksLost, 'item') + ' ticked off here '
+                       + (d.ticksLost === 1 ? 'is' : 'are') + ' not on it' : '')
+      + '. Use \u201cPut back the list that was replaced\u201d if that was wrong.';
+  }
   const bits = [];
   if(d.picksArrived) bits.push(n(d.picksArrived, 'recipe') + ' added to the week');
   if(d.picksRemoved) bits.push(n(d.picksRemoved, 'recipe') + ' taken off the week');
@@ -3162,7 +3188,13 @@ function generateShoppingList(){
     const m = findIngredientMeta(n.text);
     return !!prevByKey[m ? ('ing:' + (m.name||'').trim().toLowerCase()) : ('needed:' + n.id)];
   };
-  shoppingData.neededList.filter(n=> !n.done || stillOnTrip(n)).forEach(n=>{
+  /* v23.5: which `done` entries this list is entitled to leave off. On a same-trip rebuild
+     that is the ones done HERE — a tick stamped with this trip, or a Wait List decision.
+     On a new trip only the decision counts: a tick belonged to the list being replaced, so
+     the item goes back on the new one unbought. tripId is still the previous trip at this
+     point, which is exactly the trip doneCountsHere should be judging against. */
+  const doneForThisList = n => sameTrip ? doneCountsHere(n) : !!(n.done && !n.doneTripId);
+  shoppingData.neededList.filter(n=> !doneForThisList(n) || stillOnTrip(n)).forEach(n=>{
     const meta = findIngredientMeta(n.text);
     if(meta){
       const key = meta.name.trim().toLowerCase();
@@ -3302,25 +3334,53 @@ function recipeSelectionsSignature(){
     .sort((a,b)=> a.r < b.r ? -1 : a.r > b.r ? 1 : 0));
 }
 
+/* v23.5: `done` was one flag doing two jobs with different lifetimes.
+
+   Ticking a line in the aisle is a TICK — "it is in the trolley on this trip" — and the
+   app's rule is that a tick does not outlive its trip. Ticking an entry on the Wait List
+   tab is a DECISION about the week — "we do not need that" — and a decision does.
+
+   Nothing recorded which was which, and because neededList is authored data it merges
+   trip-independently while shoppingList does not. So when two phones ended up on
+   different trip ids, one phone's aisle ticks were discarded wholesale with its list
+   while the same ticks crossed the Wait List entries off everywhere — the family sees the
+   Wait List items struck through and the recipe ingredients untouched. Worse,
+   finishShopping deletes every done entry, so the shop ended by binning Wait List items
+   nobody had bought.
+
+   `doneTripId` is stamped by the aisle route only. Absent means a decision, which is also
+   what every build before v23.5 wrote, so an old copy keeps behaving exactly as it did. */
+function doneCountsHere(n, sd){
+  if(!n || !n.done) return false;
+  if(!n.doneTripId) return true;                 // a Wait List decision, or a pre-v23.5 copy
+  return n.doneTripId === tripIdOf(sd || shoppingData);
+}
+
 // Marks the Wait List entries behind a shopping line as done / not done, so
 // ticking something off in the aisle ticks it off the Wait List as well.
 function syncNeededFromLine(line, done){
   const ids = (line.neededIds && line.neededIds.length) ? line.neededIds
             : (line.neededId ? [line.neededId] : []);
   if(!ids.length) return;
+  const trip = tripIdOf(shoppingData);
   shoppingData.neededList.forEach(n=>{
-    if(ids.indexOf(n.id) !== -1){ n.done = done; n.changedAt = new Date().toISOString(); }
+    if(ids.indexOf(n.id) === -1) return;
+    n.done = done;
+    n.changedAt = new Date().toISOString();
+    // Which trip's trolley this went into. Untick clears it: there is nothing to scope.
+    if(done && trip) n.doneTripId = trip; else delete n.doneTripId;
   });
 }
 
-// Shopping trip finished: clear the shopping list, and drop every ticked Wait List
-// entry. `done` is the single source of truth and both routes set it: ticking the
-// line in the aisle (via syncNeededFromLine — the item was bought, regardless of
-// whether the line came from a recipe or the Wait List), or ticking the entry
-// directly on the Wait List tab (not required, or already bought). Either way the
-// entry has served its purpose and goes.
+// Shopping trip finished: clear the shopping list, and drop the Wait List entries this
+// trip is entitled to drop. Both routes set `done` — ticking the line in the aisle (via
+// syncNeededFromLine: it was bought) and ticking the entry on the Wait List tab (not
+// required, or already bought) — and either way the entry has served its purpose.
+// v23.5: "this trip is entitled to" is doneCountsHere. A tick that arrived from a phone
+// on a DIFFERENT trip is not this shop's, and deleting on it is how Wait List items
+// nobody bought were silently binned.
 function finishShopping(){
-  const going = shoppingData.neededList.filter(n=> n.done);
+  const going = shoppingData.neededList.filter(n=> doneCountsHere(n));
   const names = going.slice(0,8).map(n=>'  \u2022 ' + n.text).join('\n')
     + (going.length > 8 ? '\n  \u2026and ' + (going.length-8) + ' more' : '');
   const msg = 'Mark this shopping as done?\n\nThe shopping list will be cleared — including on anyone else’s phone shopping from the same list.'
@@ -3331,7 +3391,7 @@ function finishShopping(){
   if(!confirm(msg)) return;
   shoppingData.neededRemoved = noteRemoved(shoppingData.neededRemoved,
     going.map(n=> n.id), new Date().toISOString());
-  shoppingData.neededList = shoppingData.neededList.filter(n=> !n.done);
+  shoppingData.neededList = shoppingData.neededList.filter(n=> !doneCountsHere(n));
   shoppingData.weekPlan.shoppingDoneAt = new Date().toISOString();
   // Order matters: the trip goes into the archive while the list it is made of still
   // exists. The next line is where a week's worth of ticks used to vanish for good.
@@ -4203,10 +4263,38 @@ function renderReviewTab(){
      is progress to lose, the refresh waits for a deliberate tap. Same-trip refreshes (a
      Wait List addition, a staple amount) carry every tick across, so those still happen
      on their own — that is how "grab shampoo too" reaches someone already in the shop. */
-  let heldBackRefresh = false;
+  /* v23.5: and with a second exception. Minting a NEW trip is the act that forks the
+     family's list in two, and a device that has not yet read the shared folder cannot
+     know whether there is already a trip to join. Both phones opening this tab before
+     either had caught up is how two identical-looking lists ended up as two trips, one of
+     which was then discarded wholesale on every poll. Waiting costs one poll; it is not a
+     choice between two lists, so unlike v21.8's rejected prompt there is nothing to
+     understand — and the button is there for anyone who does not want to wait.
+     Only when there is no list on screen at all, which is the case that forks: holding a
+     list back that somebody can already see would replace it with a notice, and hiding
+     what a person is reading is the failure mode this whole file exists to avoid. */
+  let heldBackRefresh = false, waitingForFirstSync = false;
   if(shoppingListIsStale()){
     if(!sameTripRebuild() && shoppingInProgress()) heldBackRefresh = true;
+    else if(!sameTripRebuild() && localStorage.getItem(LS_ONEDRIVE_FLAG) === '1'
+            && !shoppingSeenRemoteAt
+            && !(shoppingData.shoppingList || []).length) waitingForFirstSync = true;
     else generateShoppingList();
+  }
+
+  if(waitingForFirstSync){
+    const card = el('div',{class:'card notice-card'});
+    card.appendChild(el('p',{style:'margin-top:0;'},[
+      el('strong',{},['Checking the family\u2019s list first.'])
+    ]));
+    card.appendChild(el('p',{class:'muted'},[
+      'This device has not read the shared folder yet. Making a list now would start a '
+      + 'second one, and whichever list loses is thrown away with everything ticked on '
+      + 'it. This page updates on its own as soon as the folder has been read.'
+    ]));
+    card.appendChild(generateNowButton('Make the list now without waiting'));
+    container.appendChild(card);
+    return container;
   }
 
   /* The week's recipes are fixed on this build while a shop is under way, so reaching
@@ -4542,13 +4630,24 @@ function renderNeededTab(){
   const ul = el('ul',{class:'needed-list', style:'list-style:none;margin:0;padding:0;'});
   if(shoppingData.neededList.length===0) ul.appendChild(el('div',{class:'empty-state'},['Nothing on the list right now.']));
   shoppingData.neededList.slice().reverse().forEach(item=>{
-    const li = el('li',{class:item.done?'done':''});
+    /* v23.5: shown as done only if it is done HERE. An entry ticked in the aisle on a
+       phone whose trip lost the merge is not this device's shop, and striking it through
+       was the visible half of the bug — see doneCountsHere. */
+    const doneHere = doneCountsHere(item);
+    const li = el('li',{class:doneHere?'done':''});
     const cb = el('input',{type:'checkbox'});
-    cb.checked = item.done;
+    cb.checked = doneHere;
     cb.addEventListener('change', ()=>{
       // Resolve by id at tap time — a sync may have replaced the entry object.
       const live = shoppingData.neededList.find(n=> n.id === item.id);
-      if(live){ live.done = cb.checked; live.changedAt = new Date().toISOString(); persist('shopping'); }
+      if(live){
+        live.done = cb.checked;
+        live.changedAt = new Date().toISOString();
+        // Ticking here is a decision about the week, not a trolley tick, so it is not
+        // scoped to a trip — and unticking clears any scope the aisle route had set.
+        delete live.doneTripId;
+        persist('shopping');
+      }
       render();
     });
     const label = el('label',{},[item.text]);

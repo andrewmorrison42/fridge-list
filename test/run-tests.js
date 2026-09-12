@@ -80,7 +80,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProg
                'effectiveAddedAt', 'authoredHorizons', 'describeMerge', 'mergeReport',
                'lastAuthoredAt', 'noteRemoved', 'mergeTombstones', 'pruneTombstones',
                'backfillAuthoredStamps',
-               'syncAlertState', 'lastContactText'];
+               'syncAlertState', 'lastContactText',
+               'doneCountsHere', 'syncNeededFromLine'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -128,6 +129,7 @@ vm.runInContext(
   '             noteRemoved, mergeTombstones, pruneTombstones, lastAuthoredAt, TOMBSTONE_MAX_AGE_MS,' +
   '             backfillAuthoredStamps,' +
   '             syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,' +
+  '             doneCountsHere, syncNeededFromLine,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -148,6 +150,7 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         noteRemoved, mergeTombstones, pruneTombstones, lastAuthoredAt, TOMBSTONE_MAX_AGE_MS,
         backfillAuthoredStamps,
         syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,
+        doneCountsHere, syncNeededFromLine,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -1676,6 +1679,171 @@ group('v23.4 — the picker offers only units the app can work with');
      !vals.some(v => Object.prototype.hasOwnProperty.call(MEASURE_ML, v)), Object.keys(MEASURE_ML));
   ok('every option has a label a person can read',
      SHOPPING_UNIT_OPTIONS.every(o => typeof o.label === 'string' && o.label.trim().length > 0));
+}
+
+/* ================= v23.5: a tick on the Wait List is still a tick =================
+
+   The bug this group exists for, reported from a real shop: two phones, and the items
+   one shopper put in the trolley crossed off on the other's phone ONLY where a Wait List
+   entry was behind them. Recipe ingredients stayed unticked.
+
+   Both collections travel in the same file, so the data always arrived. The split is the
+   merge: shoppingList is trip-scoped and a mismatched tripId makes chooseTripWinner throw
+   one side's list away wholesale, while neededList is authored data and merges regardless
+   of the trip. `done` therefore crossed and `checked` did not. And because finishShopping
+   deleted every done entry, the shop then binned Wait List items nobody had bought.
+
+   The discarded ticks are deliberate and stay that way. What is fixed is that a `done`
+   set in the aisle now records the trip it belonged to, so a phone on another trip stops
+   treating somebody else's trolley as a decision about the week. */
+
+const waitItem = (o) => Object.assign(
+  { id: 'n1', text: 'Milk', done: false, addedAt: T(0) }, o || {});
+
+group('v23.5 — a done that came from the aisle knows which trip it came from');
+{
+  setShoppingData(listFor([], T(0), { tripId: 'trip:here' }));
+  ok('an entry nobody has ticked is not done',
+     doneCountsHere(waitItem()) === false);
+  ok('a Wait List decision counts — no trip, because it is about the week',
+     doneCountsHere(waitItem({ done: true })) === true);
+  ok('so does a copy from a build before v23.5, which stamped no trip',
+     doneCountsHere(waitItem({ done: true, changedAt: T(10) })) === true);
+  ok('a tick made on THIS trip counts',
+     doneCountsHere(waitItem({ done: true, doneTripId: 'trip:here' })) === true);
+  ok('a tick made on ANOTHER phone’s trip does not',
+     doneCountsHere(waitItem({ done: true, doneTripId: 'trip:elsewhere' })) === false);
+  ok('and the trip can be named explicitly rather than read off shoppingData',
+     doneCountsHere(waitItem({ done: true, doneTripId: 'trip:elsewhere' }),
+                    { weekPlan: { tripId: 'trip:elsewhere' } }) === true);
+}
+
+group('v23.5 — ticking a line in the aisle stamps the trip, unticking clears it');
+{
+  const sd = listFor([line('Milk', { neededIds: ['n1'] })], T(0), { tripId: 'trip:here' });
+  sd.neededList = [waitItem()];
+  setShoppingData(sd);
+  syncNeededFromLine(sd.shoppingList[0], true);
+  ok('the Wait List entry is done', sd.neededList[0].done === true);
+  ok('and carries the trip it was ticked on', sd.neededList[0].doneTripId === 'trip:here');
+  syncNeededFromLine(sd.shoppingList[0], false);
+  ok('unticking clears the flag', sd.neededList[0].done === false);
+  ok('and the trip with it, so nothing stale is left behind',
+     Object.prototype.hasOwnProperty.call(sd.neededList[0], 'doneTripId') === false);
+
+  // A recipe-only line has no Wait List entry behind it and must not touch one.
+  const other = listFor([line('Rice')], T(0), { tripId: 'trip:here' });
+  other.neededList = [waitItem({ done: false })];
+  setShoppingData(other);
+  syncNeededFromLine(other.shoppingList[0], true);
+  ok('a line with no Wait List entry behind it changes nothing',
+     other.neededList[0].done === false);
+}
+
+group('v23.5 — the reported shop: two phones, two trips');
+{
+  // Phone 2 ticks Onions (recipe only) and Milk (a Wait List entry folded into the
+  // ingredient line) on ITS trip. Phone 1 is on a different one.
+  const mk = (trip) => {
+    const d = listFor([line('Onions'), line('Milk', { neededIds: ['n1'] })], T(0),
+                      { tripId: trip, basedOn: T(0) });
+    d.neededList = [waitItem()];
+    d.seenRemoteAt = T(0);
+    return d;
+  };
+  const mine = mk('trip:phone-1');
+  const theirs = mk('trip:phone-2');
+  theirs.shoppingList.forEach(l => { l.checked = true; l.checkedAt = T(9000); l.changedAt = T(9000); });
+  theirs.neededList[0] = waitItem({ done: true, changedAt: T(9000), doneTripId: 'trip:phone-2' });
+  mine.lastUpdated = T(9500);   // phone 1's copy is the newer file, and its trip wins
+  theirs.lastUpdated = T(9000);
+
+  const r = mergeShoppingData(mine, theirs);
+  ok('phone 1 keeps its own list, as chooseTripWinner intends',
+     tripIdOf(r) === 'trip:phone-1');
+  ok('the other trip’s ticks do not leak onto it — the rule this all rests on',
+     r.shoppingList.every(l => !l.checked));
+  // The bug: the same tick used to cross the Wait List entry off here anyway.
+  ok('the Wait List entry still carries the other phone’s done flag',
+     r.neededList[0].done === true);
+  setShoppingData(r);
+  ok('but it does NOT read as done on this phone',
+     doneCountsHere(r.neededList[0]) === false);
+  ok('and the trip it belonged to travelled with it',
+     r.neededList[0].doneTripId === 'trip:phone-2');
+}
+
+group('v23.5 — on ONE trip, both kinds of tick still cross as they always did');
+{
+  const mk = () => {
+    const d = listFor([line('Onions'), line('Milk', { neededIds: ['n1'] })], T(0),
+                      { tripId: 'trip:shared' });
+    d.neededList = [waitItem()];
+    d.seenRemoteAt = T(0);
+    return d;
+  };
+  const mine = mk(); mine.lastUpdated = T(1000);
+  const theirs = mk(); theirs.lastUpdated = T(9000);
+  theirs.shoppingList.forEach(l => { l.checked = true; l.checkedAt = T(9000); l.changedAt = T(9000); });
+  theirs.neededList[0] = waitItem({ done: true, changedAt: T(9000), doneTripId: 'trip:shared' });
+
+  const r = mergeShoppingData(mine, theirs);
+  ok('the recipe ingredient is ticked', byName(r, 'Onions').checked === true);
+  ok('the Wait List line is ticked', byName(r, 'Milk').checked === true);
+  setShoppingData(r);
+  ok('and the Wait List entry reads as done here', doneCountsHere(r.neededList[0]) === true);
+}
+
+group('v23.5 — a foreign trip’s tick does not keep an item off the next list');
+{
+  setRecipesData({
+    recipes: [{ id: 'r1', name: 'Curry', servings: 2,
+                ingredients: [{ ingredientName: 'Onions', quantity: '2', unit: 'qty' }] }],
+    ingredients: [{ name: 'Onions', aisle: 'Veg', shoppingCategory: 'Fresh', shoppingUnit: 'qty' },
+                  { name: 'Milk', aisle: 'Dairy', shoppingCategory: 'Dairy', shoppingUnit: 'mL' }],
+    settings: { features: { staples: false, pantryAtHome: false }, staples: [], stapleQty: {} }
+  });
+  const sd = listFor([], T(0), { tripId: 'trip:here', selections: [{ recipeId: 'r1', servings: 2 }] });
+  sd.neededList = [waitItem({ done: true, changedAt: T(9000), doneTripId: 'trip:elsewhere' })];
+  setShoppingData(sd);
+  generateShoppingList();
+  ok('the Wait List item is back on the list, unbought',
+     !!sandbox.api.currentLines().find(l => l.ingredientName === 'Milk'));
+  ok('and it is not ticked',
+     sandbox.api.currentLines().every(l => !l.checked));
+
+  // A decision — ticked on the Wait List tab, no trip — still keeps it off.
+  const sd2 = listFor([], T(0), { tripId: 'trip:here', selections: [{ recipeId: 'r1', servings: 2 }] });
+  sd2.neededList = [waitItem({ done: true, changedAt: T(9000) })];
+  setShoppingData(sd2);
+  generateShoppingList();
+  ok('a Wait List decision still keeps the item off',
+     !sandbox.api.currentLines().find(l => l.ingredientName === 'Milk'));
+  noStaples();
+}
+
+group('v23.5 — a replaced list says so, in its own words');
+{
+  const before = listFor([line('Onions', { checked: true, checkedAt: T(9000) })], T(9000),
+                         { tripId: 'trip:phone-1' });
+  const after  = listFor([line('Onions')], T(9500), { tripId: 'trip:phone-2' });
+  const d = describeMerge(before, after);
+  ok('the swap is noticed', d.tripReplaced === true);
+  ok('and the ticks it cost are counted', d.ticksLost === 1);
+  ok('it counts as a change even when nothing else moved', d.changed === true);
+  const line1 = mergeReport(d);
+  ok('the sentence does not pretend this is catching up',
+     line1.indexOf('Caught up') === -1, line1);
+  ok('it says another phone’s list replaced this one',
+     line1.indexOf('replaced the one on this device') !== -1, line1);
+  ok('it names the ticks that are not on it', line1.indexOf('1 item ticked off here') !== -1, line1);
+  ok('and points at the undo that already exists',
+     line1.indexOf('Put back the list that was replaced') !== -1, line1);
+
+  const same = describeMerge(before, listFor([line('Onions', { checked: true, checkedAt: T(9000) })],
+                                             T(9500), { tripId: 'trip:phone-1' }));
+  ok('an ordinary merge on one trip is not reported as a replacement',
+     same.tripReplaced === false && mergeReport(same) === null);
 }
 
 /* ---------- result ---------- */
