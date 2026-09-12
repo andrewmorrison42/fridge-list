@@ -345,7 +345,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v23.9';
+const APP_VERSION = 'v23.8';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -479,21 +479,6 @@ function noteRemoteShoppingStamp(modified, merged){
 function noteRemoteCheckFailed(){
   shoppingCheckFailures++;
 }
-
-/* v23.9: how caught-up this device is, for the one field that claims it.
-
-   weekPlan.basedOn is the only input to chooseTripWinner's third rule — "the one
-   generated from fresher shared data wins ... the stale device losing on the only ground
-   that distinguishes it". Five sites used to fall back to shoppingData.lastUpdated when
-   this device had no horizon, and saveShoppingLocal bumps lastUpdated on EVERY save. So a
-   phone that had never once read the folder wrote the NEWEST basedOn in the household and
-   won rule 3 against every phone that had. The rule inverted, by the same moving-clock
-   fallback that made effectiveAddedAt wrong until v23.2 — and for the same reason: a
-   local save time is not a fact about the shared folder.
-
-   A device with no horizon makes no claim, exactly as a device with no horizon can delete
-   nothing. Rule 3 then ties and the decision falls to rule 4, which is the safe side. */
-function syncHorizon(){ return shoppingSeenRemoteAt || null; }
 let currentTab = 'recipes';
 let editingRecipeId = null; // null = not editing, 'new' = creating
 
@@ -2299,13 +2284,7 @@ function mergeRemoteShopping(remote, modifiedAt){
   if(conflict && tripHasProgress(conflict.loser)){
     tripDisagreement = { iWon: conflict.iWon, at: new Date().toISOString() };
     if(conflict.iWon) stashReplacedTrip(remote);
-  } else {
-    /* v23.9: cleared whenever there is nothing left to report, which includes a fork whose
-       loser has no work on it — the case the previous `else if(!conflict)` fell straight
-       through. A banner claiming "two phones have different shopping lists" about an
-       argument that has already settled is worse than no banner: it is the top-priority
-       case in syncAlertState, so it sits above everything on every tab saying nothing
-       true. */
+  } else if(!conflict){
     tripDisagreement = null;
   }
   const merged = mergeShoppingData(shoppingData, remote);
@@ -2429,17 +2408,7 @@ async function writeShoppingMerged(token){
       // state object out from under a list somebody is actively ticking.
       try{
         const wrote = await res.json();
-        if(wrote && wrote.lastModifiedDateTime){
-          shoppingFastPollStamp = wrote.lastModifiedDateTime;
-          /* v23.9: and record it as SEEN, not merely as the newest thing out there. Until
-             now shoppingRemoteModifiedSeen advanced in mergeRemoteShopping and nowhere
-             else, so after every write the folder's newest mtime was this device's own and
-             nothing ever matched it back: listFreshness read `behind` from the next poll
-             onwards, for ever. The red card v23.8 exists to keep rare became the resting
-             state of any phone somebody was shopping from. A write is not a way to fall
-             behind yourself. */
-          noteRemoteShoppingStamp(wrote.lastModifiedDateTime, wrote.lastModifiedDateTime);
-        }
+        if(wrote && wrote.lastModifiedDateTime) shoppingFastPollStamp = wrote.lastModifiedDateTime;
       }catch(e){ /* body already consumed or not JSON — harmless */ }
       return true;
     }
@@ -2476,23 +2445,11 @@ async function pollShoppingNow(force){
     if(!token) return;
     const { driveId, itemId } = oneDriveFolderRef;
     const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/shopping-list.json?$select=lastModifiedDateTime', token);
-    /* 404 is "not created yet" — what fetchRemoteShopping has always called it — and the
-       folder was reached and answered. Counting it as a failed read is how a household
-       that has not written the file yet gets told, in red, that its phone cannot reach a
-       list which does not exist. Only a genuine read failure may reach
-       noteRemoteCheckFailed; that distinction is the whole of v23.8. */
-    if(res.status === 404){ noteRemoteShoppingStamp(null, null); return; }
     if(res.status !== 200){ noteRemoteCheckFailed(); return; }
     const meta = await res.json();
     /* v23.7: record what the folder says BEFORE the unchanged-stamp return. A poll that
        finds nothing new is exactly the poll that proves this phone is in step, and
        returning first threw that fact away. */
-    /* v23.9: `null`, deliberately, and it must stay null. shoppingFastPollStamp is the
-       mtime this poll ACTED ON, not the copy this device holds — it is set below, before
-       the download, so a fetch that then fails leaves it ahead of anything merged.
-       Stamping it as seen here would silence `behind` in precisely the case it exists for.
-       Only whoever actually has the copy may say so: mergeRemoteShopping when it reads
-       one, and writeShoppingMerged for the one it just sent. */
     noteRemoteShoppingStamp(meta.lastModifiedDateTime, null);
     if(!force && shoppingFastPollStamp === meta.lastModifiedDateTime){ updateListFreshness(); return; }
     shoppingFastPollStamp = meta.lastModifiedDateTime;
@@ -2871,7 +2828,7 @@ function adoptImportedShopping(parsed){
                                     parsed.weekPlan || {}, {
     tripId: 'trip:' + now + ':' + deviceId(),
     supersedes: tripIdOf(shoppingData),
-    basedOn: syncHorizon(),
+    basedOn: shoppingSeenRemoteAt || shoppingData.lastUpdated || null,
     generatedAt: now
   });
   // The horizon is this device's, never the imported file's — same rule as the merge.
@@ -3590,19 +3547,13 @@ function generateShoppingList(){
     const p = prevByKey[lineMergeKey(l)];
     if(!p || shopFinished) return;
     l.removed = !!p.removed;
-    /* Absent, never an explicit null: mergeShoppingLine DELETES a stamp it cannot resolve,
-       so writing `removedAt: null` here made the first merge of an otherwise identical line
-       read as a change to applyMergedShopping's stringify-compare, and cost a repaint for
-       nothing. flagStamp reads both the same way; the object graph should too. */
-    const rAt = p.removedAt || (p.removed ? (p.changedAt || null) : null);
-    if(rAt) l.removedAt = rAt; else delete l.removedAt;
+    l.removedAt = p.removedAt || (p.removed ? (p.changedAt || null) : null);
     if(p.atHomeAt){ l.atHome = !!p.atHome; l.atHomeAt = p.atHomeAt; }
     else if(p.atHome === false && l.atHome){ l.atHome = false; } // pre-v21 "Need it"
     if(p.changedAt) l.changedAt = p.changedAt;
     if(!sameTrip) return;
     l.checked = !!p.checked;
-    const cAt = p.checkedAt || (p.checked ? (p.changedAt || null) : null);
-    if(cAt) l.checkedAt = cAt; else delete l.checkedAt;
+    l.checkedAt = p.checkedAt || (p.checked ? (p.changedAt || null) : null);
   });
   shoppingData.shoppingList = arr;
   shoppingData.weekPlan.generatedAt = generatedNow;
@@ -3616,7 +3567,7 @@ function generateShoppingList(){
        generated by a phone that had never seen the one it is about to overwrite —
        see chooseTripWinner. */
     shoppingData.weekPlan.supersedes = prevTripId || null;
-    shoppingData.weekPlan.basedOn = syncHorizon();
+    shoppingData.weekPlan.basedOn = shoppingSeenRemoteAt || shoppingData.lastUpdated || null;
   }
   shoppingData.weekPlan.shoppingDoneAt = null; // a fresh list is an unfinished list
   shoppingData.weekPlan.lastGeneratedRecipeSignature = recipeSelectionsSignature();
@@ -3755,7 +3706,7 @@ function clearedWeekPlan(sd, now, byDevice, seenRemoteAt){
     generatedAt: now,
     tripId: 'trip:' + now + ':' + byDevice,
     supersedes: tripIdOf(sd),
-    basedOn: seenRemoteAt || null,
+    basedOn: seenRemoteAt || (sd && sd.lastUpdated) || null,
     shoppingDoneAt: null,
     // An empty week is not stale — shoppingListIsStale returns false with no selections —
     // so nothing regenerates off these, and the next real generate mints its own trip.
@@ -3799,7 +3750,7 @@ function putBackReplacedList(){
   shoppingData.weekPlan = Object.assign({}, replacedTrip.weekPlan, {
     tripId: 'trip:' + now + ':' + deviceId(),
     supersedes: tripIdOf(shoppingData),
-    basedOn: syncHorizon(),
+    basedOn: shoppingSeenRemoteAt || shoppingData.lastUpdated || null,
     generatedAt: now,
     shoppingDoneAt: null
   });
@@ -3825,38 +3776,18 @@ function putBackReplacedList(){
    one. */
 function keepThisList(){
   if(!replacedTrip) return;
-  /* v23.9: mint a superseding trip only when there is still an argument to end.
-
-     Superseding is right when THIS phone won a disagreement: the other phone holds the
-     losing trip and goes on offering it every poll until something outranks it. But the
-     button was minting in every case, and in the other two that is wrong. When this phone
-     LOST, the list on screen IS the other phone's trip and the stash is this device's own
-     dead one — so it superseded a trip nobody holds, left the winner unsuperseded, and put
-     a third trip id into a household that was already arguing about two. And when the
-     replacement was local — a generate, a clear, an import — the trip on screen already
-     names what it replaced, because generateShoppingList and clearedWeekPlan set
-     supersedes themselves.
-
-     In both of those, keeping this list is settled by letting the stash go. tripDisagreement
-     is the only thing that knows which case this is, and it travels with replacedTrip:
-     both are in-session, both set and cleared together. */
-  const contested = !!(tripDisagreement && tripDisagreement.iWon);
-  if(contested){
-    const now = new Date().toISOString();
-    shoppingData.weekPlan = Object.assign({}, shoppingData.weekPlan, {
-      tripId: 'trip:' + now + ':' + deviceId(),
-      supersedes: replacedTrip.tripId,
-      basedOn: syncHorizon(),
-      generatedAt: now
-    });
-  }
+  const now = new Date().toISOString();
+  shoppingData.weekPlan = Object.assign({}, shoppingData.weekPlan, {
+    tripId: 'trip:' + now + ':' + deviceId(),
+    supersedes: replacedTrip.tripId,
+    basedOn: shoppingSeenRemoteAt || shoppingData.lastUpdated || null,
+    generatedAt: now
+  });
   replacedTrip = null;
   tripDisagreement = null;
-  if(contested) persist('shopping');
+  persist('shopping');
   render();
-  setStatus(contested
-    ? 'Kept this list. The other one is replaced on every phone.'
-    : 'Kept this list. The other copy is not offered here again.', 'ok');
+  setStatus('Kept this list. The other one is replaced on every phone.', 'ok');
 }
 
 function shoppingListIsStale(){
@@ -4737,10 +4668,8 @@ function renderReviewTab(){
      once for a device that had not read the folder yet — and both fences were patches on
      the same mistake. Opening a tab is not asking for a new list, and a list minted
      because somebody opened a tab is how two phones ended up holding two trips for what
-     everyone thought was one shop. generateShoppingList has exactly TWO callers: the
-     button's click handler, which is a tap, and the Wait List exception immediately below,
-     which is the one automatic rebuild that is safe by CONSTRUCTION rather than by a
-     fence. A source test asserts that count. Do not add a third.
+     everyone thought was one shop. generateShoppingList now has exactly ONE caller,
+     generateNowButton, and that is a tap. Do not add a second.
 
      What the tab does instead is say which state the list is in and what the button would
      cost, using the same sameTripRebuild() the rebuild itself will use, so the sentence
