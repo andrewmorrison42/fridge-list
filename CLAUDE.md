@@ -14,8 +14,8 @@ before proposing a feature or starting a review; read this one before changing c
 ## Commands
 
 ```
-npm test                # 322 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 203 browser assertions — needs playwright-core + Chromium
+npm test                # 433 logic assertions — no dependencies, no browser, ~1s
+npm run test:browser    # 210 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -482,7 +482,11 @@ for the app to have painted.
 
 ## Releasing
 
-1. Bump `APP_VERSION` — it shows in Settings and is how two phones get compared.
+1. Bump `APP_VERSION` **and `CACHE` in `sw.js`**. `APP_VERSION` shows in Settings and is
+   how two phones get compared; `CACHE` is what drops the previous build's precached
+   manifest and icons. `sw.js` has said "bump CACHE on every release" in a comment since
+   v21.2 and four releases went past it in one session, because this list only ever named
+   `APP_VERSION`. Two version strings, one step.
 2. Both suites green.
 3. Open a PR naming the rollback commit.
 4. Merge to `main`; GitHub Pages publishes it.
