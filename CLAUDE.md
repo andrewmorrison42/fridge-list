@@ -289,18 +289,38 @@ already needs Milk folds onto that existing line, and until the line carries the
 crosses nothing off. A name check calls that case satisfied and leaves the two permanently
 out of step. *(v23.7)*
 
-**The shared file is the list; a phone holds a cache, and one strip says whether that cache
-is current.** Four ways to be wrong used to live in three places — two cards on the Review
-tab, one in the sync banner, and "you are behind the shared copy" nowhere at all — so
-nobody could look in one place and know. `listFreshness` ranks them: `behind`, `unchecked`,
-`frozen`, `picks`, `local`, `current`. `behind` outranks everything because rebuilding from
-a stale base is the act that mints a rival trip. It is pure, like `syncAlertState`, because
-the wording is the feature. The comparison is **mtime against mtime** —
-`shoppingRemoteModifiedLatest` (what a metadata poll saw) against
-`shoppingRemoteModifiedSeen` (what was merged). `shoppingSeenRemoteAt` is a stamp from
-INSIDE the file and mixing the two invents staleness that is not there. `behind` waits out
-`FRESHNESS_GRACE_MS` because the 5s poll normally fixes it and a warning on every tick the
-other shopper makes is noise. *(v23.7)*
+**The shared file is the list; a phone holds a cache, and one strip says when that cache is
+wrong.** Ways to be wrong used to live in three places — two cards on the Review tab, one
+in the sync banner, and "you are behind the shared copy" nowhere at all — so nobody could
+look in one place and know. `listFreshness` ranks them: `behind`, `unreachable`, `frozen`,
+`picks`. `behind` outranks everything because rebuilding from a stale base is the act that
+mints a rival trip. It is pure, like `syncAlertState`, because the wording is the feature.
+The comparison is **mtime against mtime** — `shoppingRemoteModifiedLatest` (what a metadata
+poll saw) against `shoppingRemoteModifiedSeen` (what was merged). `shoppingSeenRemoteAt` is
+a stamp from INSIDE the file and mixing the two invents staleness that is not there.
+`behind` waits out `FRESHNESS_GRACE_MS` because the 5s poll normally fixes it and a warning
+on every tick the other shopper makes is noise. *(v23.7)*
+
+**Silence is the in-step state, and red means the two sync cases and nothing else.**
+`listFreshness` returns null when there is nothing wrong and `renderListFreshness` appends
+nothing — v23.7 kept a permanent line above the trolley saying "in step", which earns
+nothing on a screen people stare at for 45 minutes and dilutes the cases that matter. It
+also had a `local` line for a phone that shares with nobody; that phone is not out of step
+with anybody and `syncAlertState`'s `unlinked` already says it on every tab, so two places
+were saying one thing. `behind` and `unreachable` render as `.alert-card` (red — something
+is wrong with what you are looking at); `frozen` and `picks` stay `.notice-card` (amber —
+there is an update available). Keep red rare or it stops meaning anything. *(v23.8)*
+
+**A warning follows a FAILED attempt, never a missing one.** `unreachable` needs
+`FRESHNESS_MIN_FAILURES` consecutive failures from `noteRemoteCheckFailed` AND
+`FRESHNESS_UNREACHABLE_MS` since the last success — the count rules out a blip, the elapsed
+time rules out three fast retries in one bad second. v23.7 measured time since the last
+success alone, and `pollShoppingNow` returns early while the screen is off, so a phone in a
+pocket between aisles was indistinguishable from one that could not reach the folder and
+flashed red every time somebody picked it up. Only the two genuine read failures in each
+poll — a non-200 and the `catch` — may call `noteRemoteCheckFailed`; the guard returns
+above them (hidden tab, wrong tab, no account, a poll in flight) are not failures, and that
+distinction is the whole fix. *(v23.8)*
 
 **The card that offers a choice between two lists renders before anything that can return
 early.** An import lands on an empty list, which is the branch that returns — and the

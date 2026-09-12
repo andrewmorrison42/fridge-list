@@ -117,7 +117,8 @@ vm.runInContext(
   extractConst('WAITLIST_FIELDS') + '\n' +
   extractConst('SYNC_UNLINKED_GRACE_MS') + '\n' +
   extractConst('FRESHNESS_GRACE_MS') + '\n' +
-  extractConst('FRESHNESS_UNCHECKED_MS') + '\n' +
+  extractConst('FRESHNESS_UNREACHABLE_MS') + '\n' +
+  extractConst('FRESHNESS_MIN_FAILURES') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
@@ -140,7 +141,7 @@ vm.runInContext(
   '             doneCountsHere, syncNeededFromLine,' +
   '             tripParts, tripCode, tripLabel, tripConflict, keepThisList,' +
   '             pendingWaitListLines, listFreshness, agoText,' +
-  '             FRESHNESS_GRACE_MS, FRESHNESS_UNCHECKED_MS,' +
+  '             FRESHNESS_GRACE_MS, FRESHNESS_UNREACHABLE_MS, FRESHNESS_MIN_FAILURES,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -164,7 +165,7 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         doneCountsHere, syncNeededFromLine,
         tripParts, tripCode, tripLabel, tripConflict, keepThisList,
         pendingWaitListLines, listFreshness, agoText,
-        FRESHNESS_GRACE_MS, FRESHNESS_UNCHECKED_MS,
+        FRESHNESS_GRACE_MS, FRESHNESS_UNREACHABLE_MS, FRESHNESS_MIN_FAILURES,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -2038,29 +2039,31 @@ group('v23.7 — a Wait List entry is "on the list" only when a line carries its
   noStaples();
 }
 
-group('v23.7 — one strip says where this list stands, and in what order');
+group('v23.8 — the strip is silent unless something is wrong');
 {
   const shared = { backend: 'onedrive', signedIn: true, lastCheckedAt: BASE, now: BASE };
   const at = (o) => listFreshness(Object.assign({}, shared, o));
 
-  ok('a phone in step says so quietly', at({}).kind === 'current');
-  ok('and says when it last looked', at({}).hint.indexOf('just now') !== -1, at({}).hint);
+  /* v23.7 always said something, including "in step". A permanent line above the trolley
+     on a screen people stare at for 45 minutes earns nothing when the news is good, and
+     it dilutes the cases that do. */
+  ok('a phone in step says nothing at all', at({}) === null);
+  ok('and a phone that shares with nobody says nothing here either — the banner has it',
+     listFreshness({ backend: null, now: BASE }) === null);
+  ok('nor a signed-out OneDrive phone',
+     listFreshness({ backend: 'onedrive', signedIn: false, now: BASE }) === null);
 
   /* Being behind for a moment is normal — the 5s poll fixes it. Warning inside the grace
      would cry wolf every time the other shopper ticked something. */
   ok('a copy that has just fallen behind is not yet worth saying',
-     at({ behindSince: BASE - (FRESHNESS_GRACE_MS - 1000) }).kind === 'current');
+     at({ behindSince: BASE - (FRESHNESS_GRACE_MS - 1000) }) === null);
   const behind = at({ behindSince: BASE - 5 * 60 * 1000 });
   ok('one that has stayed behind is', behind.kind === 'behind');
-  ok('it says plainly that this is not the family’s list',
-     behind.head.indexOf('not the family’s latest list') !== -1, behind.head);
+  ok('it says plainly that this is not the family\u2019s list',
+     behind.head.indexOf('not the family\u2019s latest list') !== -1, behind.head);
   ok('it warns that acting on it forks the list',
      behind.hint.indexOf('second list') !== -1, behind.hint);
   ok('and the button says what it does', behind.action === 'Catch up now');
-
-  const unchecked = at({ lastCheckedAt: BASE - 10 * 60 * 1000 });
-  ok('a phone that has not managed to look says how long', unchecked.kind === 'unchecked');
-  ok('naming the gap', unchecked.head.indexOf('10 minutes ago') !== -1, unchecked.head);
 
   /* Order matters: behind outranks everything, because rebuilding from a stale base is
      the act that mints a rival trip. */
@@ -2068,8 +2071,6 @@ group('v23.7 — one strip says where this list stands, and in what order');
      at({ behindSince: BASE - 5 * 60 * 1000, picksChanged: true, keepsTicks: true }).kind === 'behind');
   ok('and outranks a frozen week',
      at({ behindSince: BASE - 5 * 60 * 1000, picksChanged: true, shopLive: true }).kind === 'behind');
-  ok('unchecked outranks a picks change too',
-     at({ lastCheckedAt: BASE - 10 * 60 * 1000, picksChanged: true, keepsTicks: true }).kind === 'unchecked');
 
   const frozen = at({ picksChanged: true, keepsTicks: false, shopLive: true });
   ok('a live shop with changed recipes is frozen, not offered a rebuild', frozen.kind === 'frozen');
@@ -2083,14 +2084,44 @@ group('v23.7 — one strip says where this list stands, and in what order');
   ok('and that the old list is recoverable', fresh.hint.indexOf('put back') !== -1, fresh.hint);
   ok('a staple change is not reported as a recipe change',
      at({ picksChanged: true, keepsTicks: true, recipesChanged: false }).head.indexOf('recipes') === -1);
-
-  const local = listFreshness({ backend: null, now: BASE });
-  ok('an unshared phone says so rather than claiming to be in step', local.kind === 'local');
-  ok('and has nothing to press', !local.action);
-  ok('a signed-out OneDrive phone counts as unshared',
-     listFreshness({ backend: 'onedrive', signedIn: false, now: BASE }).kind === 'local');
-  ok('but a picks change still outranks being unshared — it is actionable here',
+  ok('a picks change on an unshared phone is still worth saying — it is actionable here',
      listFreshness({ backend: null, picksChanged: true, keepsTicks: true, now: BASE }).kind === 'picks');
+}
+
+/* v23.8. The v23.7 version of this counted time since the last SUCCESSFUL read, and
+   pollShoppingNow returns early while the screen is off — so a phone in a pocket between
+   aisles was indistinguishable from one that could not reach the folder, and flashed a
+   warning every time somebody picked it up. A warning follows a failed attempt, never a
+   missing one. */
+group('v23.8 — "cannot reach" counts failed attempts, not elapsed time');
+{
+  const stale = BASE - 10 * 60 * 1000;   // well past FRESHNESS_UNREACHABLE_MS
+  const at = (o) => listFreshness(Object.assign(
+    { backend: 'onedrive', signedIn: true, now: BASE }, o));
+
+  ok('a long silence with no failed attempt says nothing — the phone was in a pocket',
+     at({ lastCheckedAt: stale, checkFailures: 0 }) === null);
+  ok('nor does one failure', at({ lastCheckedAt: stale, checkFailures: 1 }) === null);
+  ok('nor two', at({ lastCheckedAt: stale, checkFailures: 2 }) === null);
+
+  const gone = at({ lastCheckedAt: stale, checkFailures: FRESHNESS_MIN_FAILURES });
+  ok('three failures and a real gap does', gone.kind === 'unreachable');
+  ok('it says what is actually wrong', gone.head.indexOf('reach the family') !== -1, gone.head);
+  ok('and both directions of the cost', gone.hint.indexOf('not on here') !== -1
+     && gone.hint.indexOf('reaching them') !== -1, gone.hint);
+  ok('with a button worth pressing', gone.action === 'Try again');
+
+  /* The other half of the pair: three failures inside one bad second is a blip, not an
+     outage. */
+  ok('three failures without a real gap is still a blip',
+     at({ lastCheckedAt: BASE - 1000, checkFailures: 5 }) === null);
+
+  ok('behind still outranks it',
+     at({ lastCheckedAt: stale, checkFailures: 5, behindSince: BASE - 5 * 60 * 1000 }).kind === 'behind');
+  ok('but it outranks a picks change',
+     at({ lastCheckedAt: stale, checkFailures: 5, picksChanged: true, keepsTicks: true }).kind === 'unreachable');
+  ok('and an unshared phone never reports it — there is nothing to reach',
+     listFreshness({ backend: null, lastCheckedAt: stale, checkFailures: 9, now: BASE }) === null);
 }
 
 group('v23.7 — the "how long ago" wording is coarse on purpose');

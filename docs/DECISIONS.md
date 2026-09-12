@@ -386,6 +386,49 @@ Two details worth keeping:
   every time the other shopper ticks something would be worse than saying nothing — the
   banner would be permanently on during exactly the situation it exists for.
 
+### v23.8 — a threshold that could not be justified, and what that exposed
+
+Two corrections to v23.7's freshness strip, and the second is the interesting one.
+
+**Silence is the in-step state.** The strip always said something, including "In step with
+the family's list" when all was well. On a screen people stare at for 45 minutes, a
+permanent line of good news earns nothing and dilutes the one case that matters. It now
+renders only when something is wrong, and the two sync cases render in red against the
+amber the picks cases already used. Red is worth keeping rare.
+
+The `local` line went with it. A phone that shares with nobody is not out of step with
+anybody, and the sync banner's `unlinked` case already says so on every tab in the
+strongest terms the app has. Two places saying one thing is what the strip was written to
+end, so having it say that thing twice over was the feature eating itself.
+
+**A warning follows a failed attempt, never a missing one.** v23.7's `unchecked` case fired
+after four minutes without a successful read. Asked to justify that number — a supermarket
+has bad signal, would this be on for most of a shop? — the honest answer turned out not to
+be about the number at all.
+
+`pollShoppingNow` returns early on `document.hidden`. A phone in a pocket between aisles is
+not polling, so the clock kept running, and a phone with perfect signal in someone's pocket
+was indistinguishable from one that could not reach the folder. Worse:
+`visibilitychange` fires a poll on wake, but the strip renders before that poll completes,
+so the shopper got a flash of red **every time they picked their phone up**. No threshold
+fixes that; the signal was measuring the wrong thing.
+
+It now counts consecutive *failed* attempts, and requires elapsed time as well — the count
+rules out a single blip, the time rules out three fast retries inside one bad second. The
+call sites matter as much as the rule: only a non-200 and the `catch` in each poll count,
+never the guard returns above them, because those are the pocket.
+
+Worth recording as method rather than as a fix. **A question about a constant is often a
+question about the variable it is applied to.** The tuning question ("is four minutes
+right?") had no good answer because the quantity being thresholded was not the quantity
+anyone cared about. Two of the last four defects in this file have that shape:
+`effectiveAddedAt` measured a bound that moved, and this measured a silence that was not a
+failure. When a threshold cannot be defended, check what it is measuring before picking a
+new number.
+
+A smaller thing the rewrite caught: the old wording read "Not checked for 10 minutes ago."
+It had a passing test — which asserted the substring, not the sentence.
+
 ### What the arc actually cost
 
 Four structural sync changes in two days, two of them fixing something the previous one

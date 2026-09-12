@@ -233,16 +233,14 @@ async function suiteTicksSurviveRebuild(browser) {
 
     await page.click('#mainNav button[data-tab="review"]');
     await page.waitForTimeout(600);
-    /* v23.7: and the strip that says where this list stands is on the tab. These runs
-       never reach OneDrive, so the honest reading is "this phone's own list" — the case
-       that used to be said nowhere at all. */
+    /* v23.8: the strip is silent unless something is wrong. These runs never reach
+       OneDrive and have nothing stale, so there should be nothing there at all — v23.7
+       put a permanent line above the trolley, which is what this replaces. */
     const fresh = await page.evaluate(() => {
       const b = document.getElementById('listFreshness');
       return b ? { kind: b.dataset.kind, text: b.innerText } : null;
     });
-    ok('the freshness strip is on the Review tab', !!fresh, fresh);
-    ok('and an unshared phone is told so rather than left to assume',
-       fresh && fresh.kind === 'local' && /not shared with anyone/i.test(fresh.text), fresh);
+    ok('a healthy Review tab shows no freshness strip at all', fresh === null, fresh);
 
     /* v23.7: a Wait List addition is the ONE rebuild that happens without being asked —
        always a same-trip rebuild, so it cannot mint a trip or cost a tick. Everything
