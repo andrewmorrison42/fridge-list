@@ -233,13 +233,22 @@ async function suiteTicksSurviveRebuild(browser) {
 
     await page.click('#mainNav button[data-tab="review"]');
     await page.waitForTimeout(600);
-    /* v23.6: the tab no longer rebuilds on its own. It offers, and says the update keeps
-       every tick — which is the whole point of a same-trip rebuild. */
-    ok('the tab offers the update rather than performing it',
-       await page.evaluate(() => /something new to add/i.test(document.getElementById('app').innerText)));
-    ok('and the item is not on the list until somebody asks',
-       !(await readShopping(page)).shoppingList.some(l => /kitchen roll/i.test(l.ingredientName)));
-    ok('the update button is there', await clickButtonByText(page, 'Update the list'));
+    /* v23.7: and the strip that says where this list stands is on the tab. These runs
+       never reach OneDrive, so the honest reading is "this phone's own list" — the case
+       that used to be said nowhere at all. */
+    const fresh = await page.evaluate(() => {
+      const b = document.getElementById('listFreshness');
+      return b ? { kind: b.dataset.kind, text: b.innerText } : null;
+    });
+    ok('the freshness strip is on the Review tab', !!fresh, fresh);
+    ok('and an unshared phone is told so rather than left to assume',
+       fresh && fresh.kind === 'local' && /not shared with anyone/i.test(fresh.text), fresh);
+
+    /* v23.7: a Wait List addition is the ONE rebuild that happens without being asked —
+       always a same-trip rebuild, so it cannot mint a trip or cost a tick. Everything
+       else still waits for a tap. */
+    ok('and the tab says what arrived rather than changing in silence',
+       await page.evaluate(() => /added from the wait list/i.test(document.getElementById('app').innerText)));
 
     const after = await readShopping(page);
     ok('the list really was rebuilt (the new item is on it)',
@@ -900,12 +909,11 @@ async function suiteLiveListNotWiped(browser) {
     await page.waitForTimeout(400);
     await page.click('#mainNav button[data-tab="review"]');
     await page.waitForTimeout(700);
-    /* v23.6: "grab shampoo too" no longer lands on the shopper's list unannounced — the
-       tab says there is something to add and the shopper taps. That tap is safe by
-       construction: it is a same-trip rebuild, so nothing in the trolley is lost. */
-    ok('the shopper is told there is something new rather than the list changing under them',
-       await page.evaluate(() => /something new to add/i.test(document.getElementById('app').innerText)));
-    ok('and the update is one tap', await clickButtonByText(page, 'Update the list'));
+    /* v23.7: "grab shampoo too" reaches the shopper on its own again — the one automatic
+       rebuild in the app, and safe by construction because it is always a same-trip one.
+       What it must never do is change the list in silence. */
+    ok('the shopper is told what arrived rather than the list changing under them',
+       await page.evaluate(() => /added from the wait list/i.test(document.getElementById('app').innerText)));
     ok('a Wait List item still reaches the list mid-shop',
        await page.evaluate(() => window.__t.data().shoppingList.some(l => /kitchen roll/i.test(l.ingredientName))));
     ok('without ending the trip', await trip() === liveTrip, { was: liveTrip, now: await trip() });

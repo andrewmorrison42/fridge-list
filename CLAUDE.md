@@ -265,17 +265,42 @@ nothing to choose now. The Wait List is the way to add something mid-shop (a sam
 rebuild, so ticks survive), and "Shopping is done" is the way to free the picks again.
 Anything switched off must also LOOK switched off — see `.btn:disabled`. *(v21.9)*
 
-**Exactly one thing builds a shopping list, and it is a tap.** `generateShoppingList()`
-has one caller, `generateNowButton`. The Review tab used to rebuild on entry; that was
-fenced in v21.8 for a live trip and again in v23.5 for a device that had not read the
-folder, and both fences were patches on the same mistake — opening a tab is not asking
-for a list, and a list minted because somebody opened a tab is how two phones ended up
-holding a trip each for what everyone thought was one shop. The tab now says which state
-the list is in and what the button would cost, deciding with the same `sameTripRebuild()`
-the rebuild will use so the sentence and the outcome cannot disagree; and it says what
-actually changed, because most staleness is a Wait List addition or a staple amount and
-"the recipes have changed" would be untrue in front of somebody in an aisle. A source
-test asserts the caller count. Do not add a second. *(v21.8, v21.9, replaced v23.6)*
+**Two things build a shopping list: a tap, and a Wait List addition.**
+`generateShoppingList()` has exactly two callers and a source test asserts the count and
+the guards. The Review tab used to rebuild on entry; that was fenced in v21.8 for a live
+trip and again in v23.5 for a device that had not read the folder, and both fences were
+patches on the same mistake — opening a tab is not asking for a list, and a list minted
+because somebody opened a tab is how two phones ended up holding a trip each for what
+everyone thought was one shop. v23.6 removed it; v23.7 put back the single case that is
+safe by CONSTRUCTION rather than by a fence. All four conditions must hold:
+`shoppingListIsStale()`, `sameTripRebuild()` (so the trip and every tick survive, and a
+finished shop is not quietly restarted), an unchanged recipe signature, and
+`pendingWaitListLines()` non-empty. Together they mean this rebuild cannot mint a trip and
+cannot drop a tick — where the old auto-refresh could do anything the button could. Do not
+widen it: a staple amount is edited by the person who then walks to this tab. The tab
+otherwise says which state the list is in and what the button would cost, and says what
+arrived when the exception fires — something appearing under a shopper's thumb unexplained
+is the v21.5 failure in a different coat. *(v21.8, v21.9, v23.6, v23.7)*
+
+**A Wait List entry is "on the list" when a LINE CARRIES ITS ID, not when its name is
+there.** `pendingWaitListLines` checks `neededIds`. A Wait List "milk" added while a recipe
+already needs Milk folds onto that existing line, and until the line carries the entry's id
+`syncNeededFromLine` has nothing to look the entry up by — so ticking it off in the aisle
+crosses nothing off. A name check calls that case satisfied and leaves the two permanently
+out of step. *(v23.7)*
+
+**The shared file is the list; a phone holds a cache, and one strip says whether that cache
+is current.** Four ways to be wrong used to live in three places — two cards on the Review
+tab, one in the sync banner, and "you are behind the shared copy" nowhere at all — so
+nobody could look in one place and know. `listFreshness` ranks them: `behind`, `unchecked`,
+`frozen`, `picks`, `local`, `current`. `behind` outranks everything because rebuilding from
+a stale base is the act that mints a rival trip. It is pure, like `syncAlertState`, because
+the wording is the feature. The comparison is **mtime against mtime** —
+`shoppingRemoteModifiedLatest` (what a metadata poll saw) against
+`shoppingRemoteModifiedSeen` (what was merged). `shoppingSeenRemoteAt` is a stamp from
+INSIDE the file and mixing the two invents staleness that is not there. `behind` waits out
+`FRESHNESS_GRACE_MS` because the 5s poll normally fixes it and a warning on every tick the
+other shopper makes is noise. *(v23.7)*
 
 **The card that offers a choice between two lists renders before anything that can return
 early.** An import lands on an empty list, which is the branch that returns — and the

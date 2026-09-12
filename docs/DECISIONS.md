@@ -333,6 +333,59 @@ to the app version — the place you already go to compare two phones — and a 
 shopping list is clutter ninety-nine weeks in a hundred. The card does not use the code
 either: "made 18:42, 12 ticked" answers *which is which* and a hash does not.
 
+### v23.7 — the exception worth making, and what "the list" actually means
+
+Two follow-ups to v23.6, and they pull in opposite directions on purpose.
+
+**Put back one automatic rebuild — the only one that is safe by construction.** v23.6's
+rule was "nothing builds a list unless somebody asks", and the price was that a Wait List
+addition made at home no longer reached the person already in the aisle. That was the one
+automatic behaviour in the app that was doing real work.
+
+The distinction that makes this an exception rather than a relapse: the old auto-refresh
+could do *anything the button could*, including mint a trip on a phone that had not caught
+up. This can do exactly one thing. Four conditions must hold — stale, `sameTripRebuild()`,
+recipe signature unchanged, and a Wait List entry genuinely missing — and together they
+mean the rebuild **cannot mint a trip and cannot drop a tick**. That is a guarantee about
+what the code is able to do, not a promise about when it will run, which is what both
+earlier fences were and why both leaked.
+
+Deliberately not widened to staple amounts. A staple is edited by the person who then
+walks to the Review tab, so a tap costs them nothing, and every extra case is a step back
+towards "the tab rebuilds when it feels like it".
+
+A subtlety found writing it: **membership has to be checked by the entry's id, not its
+name.** A Wait List "milk" added while a recipe already needs Milk folds onto that existing
+line. A name check calls that satisfied — but until the line carries the entry's id,
+`syncNeededFromLine` cannot find the entry, so ticking it off in the aisle crosses nothing
+off and the two stay out of step for the whole shop.
+
+**Make the shared copy canonical — visibly.** Asked whether one version of the list could
+be canonical so that a stale one is obvious.
+
+- **Chosen: the folder copy is the list, and each phone holds a cache.** No data-model
+  change. It was already true; nothing on screen had ever said so, which is why "am I
+  looking at the list?" had no answer — the same gap the two-trip fork came through.
+- **Rejected: blessing a trip as canonical.** A new synced field, an answer needed for two
+  phones blessing at once, and it largely duplicates `supersedes`, which already expresses
+  "this replaces that" and is what `keepThisList` and `putBackReplacedList` write.
+
+Four ways to be wrong were scattered across three places — two cards on the Review tab, one
+in the sync banner, and "you are behind the shared copy" said *nowhere at all*.
+`listFreshness` ranks them into one strip. `behind` outranks everything, including a picks
+change, because rebuilding from a stale base is precisely the act that mints a rival trip:
+the most dangerous thing a person can do while behind is press the button that looks like
+the fix.
+
+Two details worth keeping:
+
+- The comparison is **mtime against mtime**. `shoppingSeenRemoteAt` is a stamp from inside
+  the file and is not comparable with a file's modified time; using it would have invented
+  staleness on every write.
+- `behind` waits out a 45-second grace. The 5s poll normally closes the gap, and a warning
+  every time the other shopper ticks something would be worse than saying nothing — the
+  banner would be permanently on during exactly the situation it exists for.
+
 ### What the arc actually cost
 
 Four structural sync changes in two days, two of them fixing something the previous one

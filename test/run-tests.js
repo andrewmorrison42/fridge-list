@@ -82,7 +82,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProg
                'backfillAuthoredStamps',
                'syncAlertState', 'lastContactText',
                'doneCountsHere', 'syncNeededFromLine',
-               'tripParts', 'tripCode', 'tripLabel', 'tripConflict', 'keepThisList'];
+               'tripParts', 'tripCode', 'tripLabel', 'tripConflict', 'keepThisList',
+               'pendingWaitListLines', 'listFreshness', 'agoText'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -115,6 +116,8 @@ vm.runInContext(
   extractConst('SHOPPING_UNIT_OPTIONS') + '\n' +
   extractConst('WAITLIST_FIELDS') + '\n' +
   extractConst('SYNC_UNLINKED_GRACE_MS') + '\n' +
+  extractConst('FRESHNESS_GRACE_MS') + '\n' +
+  extractConst('FRESHNESS_UNCHECKED_MS') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
@@ -136,6 +139,8 @@ vm.runInContext(
   '             syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,' +
   '             doneCountsHere, syncNeededFromLine,' +
   '             tripParts, tripCode, tripLabel, tripConflict, keepThisList,' +
+  '             pendingWaitListLines, listFreshness, agoText,' +
+  '             FRESHNESS_GRACE_MS, FRESHNESS_UNCHECKED_MS,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -158,6 +163,8 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,
         doneCountsHere, syncNeededFromLine,
         tripParts, tripCode, tripLabel, tripConflict, keepThisList,
+        pendingWaitListLines, listFreshness, agoText,
+        FRESHNESS_GRACE_MS, FRESHNESS_UNCHECKED_MS,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -1963,13 +1970,22 @@ group('v23.6 — keeping a list settles it, rather than pausing the argument');
    many ways there are to reach generateShoppingList, which no runtime test can see. The
    auto-refresh was added in v21.8 and fenced twice before it was removed; a third fence
    would be somebody re-adding the call, and this is what notices. */
-group('v23.6 — exactly one thing builds a shopping list, and it is a tap');
+group('v23.7 — exactly two things build a shopping list: a tap, and the Wait List');
 {
   const calls = (html.match(/(?<!function )\bgenerateShoppingList\(\)/g) || []).length;
-  ok('generateShoppingList() is called from exactly one place', calls === 1, calls);
+  ok('generateShoppingList() is called from exactly two places', calls === 2, calls);
   const btn = html.slice(html.indexOf('function generateNowButton('));
-  ok('and that place is the button\u2019s click handler',
+  ok('one is the button\u2019s click handler',
      btn.slice(0, btn.indexOf('\n}')).indexOf("addEventListener('click'") !== -1);
+  /* v23.7: and the other is the Wait List exception, fenced by all four conditions. A
+     third caller, or this one losing a guard, is the auto-refresh coming back. */
+  const exc = html.slice(html.indexOf('const arrivedFromWaitList'),
+                         html.indexOf('const noListYet'));
+  ok('the other is the Wait List exception', exc.indexOf('generateShoppingList()') !== -1);
+  ok('fenced by staleness, the same trip, and an unchanged recipe signature',
+     /listIsStale && keepsTicks && !recipesChanged/.test(exc));
+  ok('and by a Wait List entry actually being missing',
+     exc.indexOf('pendingWaitListLines(shoppingData)') !== -1);
 }
 
 group('v23.6 — the banner puts a disagreement above everything but a failed write');
@@ -1994,7 +2010,101 @@ group('v23.6 — the banner puts a disagreement above everything but a failed wr
      syncAlertState(base) === null);
 }
 
+/* ================= v23.7: the one exception, and where this list stands ================= */
+
+group('v23.7 — a Wait List entry is "on the list" only when a line carries its id');
+{
+  setRecipesData({
+    recipes: [], settings: { features: {}, staples: [], stapleQty: {} },
+    ingredients: [{ name: 'Milk', aisle: 'Dairy', shoppingCategory: 'Dairy', shoppingUnit: 'mL' }]
+  });
+  const sd = (lines, needed) => Object.assign(listFor(lines, T(0), { tripId: 'trip:here' }),
+                                              { neededList: needed });
+
+  ok('an entry with no line at all is pending',
+     pendingWaitListLines(sd([], [waitItem({ text: 'Shampoo' })])).length === 1);
+  ok('an entry whose line carries its id is not',
+     pendingWaitListLines(sd([line('Milk', { neededIds: ['n1'] })], [waitItem()])).length === 0);
+  /* The case name-matching gets wrong: "milk" added to the Wait List while a recipe
+     already needs Milk. The line exists, so a name check calls it done — but until that
+     line carries the entry's id, ticking it off in the aisle crosses nothing off. */
+  ok('an entry folded onto an existing line is pending until that line carries its id',
+     pendingWaitListLines(sd([line('Milk', { neededIds: [] })], [waitItem()])).length === 1);
+  ok('an entry already done here is not pending',
+     pendingWaitListLines(sd([], [waitItem({ done: true })])).length === 0);
+  ok('but one ticked on ANOTHER phone’s trip is — that tick is not this list’s',
+     pendingWaitListLines(sd([], [waitItem({ done: true, doneTripId: 'trip:elsewhere' })])).length === 1);
+  ok('nothing at all is handled', pendingWaitListLines(null).length === 0);
+  noStaples();
+}
+
+group('v23.7 — one strip says where this list stands, and in what order');
+{
+  const shared = { backend: 'onedrive', signedIn: true, lastCheckedAt: BASE, now: BASE };
+  const at = (o) => listFreshness(Object.assign({}, shared, o));
+
+  ok('a phone in step says so quietly', at({}).kind === 'current');
+  ok('and says when it last looked', at({}).hint.indexOf('just now') !== -1, at({}).hint);
+
+  /* Being behind for a moment is normal — the 5s poll fixes it. Warning inside the grace
+     would cry wolf every time the other shopper ticked something. */
+  ok('a copy that has just fallen behind is not yet worth saying',
+     at({ behindSince: BASE - (FRESHNESS_GRACE_MS - 1000) }).kind === 'current');
+  const behind = at({ behindSince: BASE - 5 * 60 * 1000 });
+  ok('one that has stayed behind is', behind.kind === 'behind');
+  ok('it says plainly that this is not the family’s list',
+     behind.head.indexOf('not the family’s latest list') !== -1, behind.head);
+  ok('it warns that acting on it forks the list',
+     behind.hint.indexOf('second list') !== -1, behind.hint);
+  ok('and the button says what it does', behind.action === 'Catch up now');
+
+  const unchecked = at({ lastCheckedAt: BASE - 10 * 60 * 1000 });
+  ok('a phone that has not managed to look says how long', unchecked.kind === 'unchecked');
+  ok('naming the gap', unchecked.head.indexOf('10 minutes ago') !== -1, unchecked.head);
+
+  /* Order matters: behind outranks everything, because rebuilding from a stale base is
+     the act that mints a rival trip. */
+  ok('behind outranks a picks change',
+     at({ behindSince: BASE - 5 * 60 * 1000, picksChanged: true, keepsTicks: true }).kind === 'behind');
+  ok('and outranks a frozen week',
+     at({ behindSince: BASE - 5 * 60 * 1000, picksChanged: true, shopLive: true }).kind === 'behind');
+  ok('unchecked outranks a picks change too',
+     at({ lastCheckedAt: BASE - 10 * 60 * 1000, picksChanged: true, keepsTicks: true }).kind === 'unchecked');
+
+  const frozen = at({ picksChanged: true, keepsTicks: false, shopLive: true });
+  ok('a live shop with changed recipes is frozen, not offered a rebuild', frozen.kind === 'frozen');
+  ok('and is given no button at all', !frozen.action);
+
+  const upd = at({ picksChanged: true, keepsTicks: true, recipesChanged: true });
+  ok('a same-trip picks change offers an update', upd.action === 'Update the list');
+  ok('and promises the ticks survive', upd.hint.indexOf('already ticked off') !== -1, upd.hint);
+  const fresh = at({ picksChanged: true, keepsTicks: false, recipesChanged: true });
+  ok('a new-trip one says it costs the ticks', fresh.action === 'Make a new list');
+  ok('and that the old list is recoverable', fresh.hint.indexOf('put back') !== -1, fresh.hint);
+  ok('a staple change is not reported as a recipe change',
+     at({ picksChanged: true, keepsTicks: true, recipesChanged: false }).head.indexOf('recipes') === -1);
+
+  const local = listFreshness({ backend: null, now: BASE });
+  ok('an unshared phone says so rather than claiming to be in step', local.kind === 'local');
+  ok('and has nothing to press', !local.action);
+  ok('a signed-out OneDrive phone counts as unshared',
+     listFreshness({ backend: 'onedrive', signedIn: false, now: BASE }).kind === 'local');
+  ok('but a picks change still outranks being unshared — it is actionable here',
+     listFreshness({ backend: null, picksChanged: true, keepsTicks: true, now: BASE }).kind === 'picks');
+}
+
+group('v23.7 — the "how long ago" wording is coarse on purpose');
+{
+  ok('seconds read as just now', agoText(8000) === 'just now');
+  ok('so does anything inside the poll grace', agoText(44000) === 'just now');
+  ok('a minute is a minute', agoText(60 * 1000) === '1 minute ago');
+  ok('and plurals are respected', agoText(90 * 1000) === '2 minutes ago');
+  ok('hours', agoText(3 * 60 * 60 * 1000) === '3 hours ago');
+  ok('and days', agoText(72 * 60 * 60 * 1000) === '3 days ago');
+}
+
 /* ---------- result ---------- */
+
 
 console.log('\n' + '-'.repeat(48));
 if (fail) {
