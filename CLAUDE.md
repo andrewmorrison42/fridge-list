@@ -15,7 +15,7 @@ before proposing a feature or starting a review; read this one before changing c
 
 ```
 npm test                # 433 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 210 browser assertions — needs playwright-core + Chromium
+npm run test:browser    # 212 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -23,16 +23,20 @@ Both suites must pass before pushing. The logic suite is cheap enough to run
 constantly; run the browser suite before any commit that touches rendering, sync or
 the service worker.
 
-## Working in a 1.3 MB file
+## Working in a 445 KB file
 
-`index.html` holds the whole application *and* the bundled recipe seed. About 80% of
-the file is a single `<script type="application/json">` block roughly a million
-characters long, on one line.
+`index.html` holds the whole application *and* the bundled seed. Until v23.9 it was
+1.3 MB, 0.90 MB of which was 635 of one family's recipes; the seed is now a dozen. What
+remains is ~359 KB of app and ~95 KB of seed, of which the 446-entry **ingredient master
+is 64 KB and is the part worth keeping** — it carries the aisle, category and
+shopping-unit knowledge, and `migrateIngredientsIfStale` reads it to repair existing
+households.
 
 Consequences:
 
-- Plain `grep` over patterns that also occur in recipe data floods the terminal.
-  Search the code with `awk 'length($0)<600 {print NR": "$0}' index.html | grep '…'`.
+- The `#seed-recipes` block is still one line of ~95,000 characters. Plain `grep` over
+  patterns that also occur in seed data still floods the terminal; search the code with
+  `awk 'length($0)<600 {print NR": "$0}' index.html | grep '…'`.
 - `git diff` on this file is awkward. Keep edits surgical; never reformat.
 - Reading the whole file into context is wasteful. Locate first, then read the region.
 
@@ -42,7 +46,10 @@ Consequences:
   current tab from scratch.
 - **Two data objects, plus an archive.** `recipesData` (recipes, ingredient master,
   settings) and `shoppingData` (week's picks, generated list, Wait List). Each is
-  persisted to localStorage and to a JSON file in the OneDrive `FridgeList` folder.
+  persisted to localStorage and to a JSON file in the OneDrive `FridgeList` folder. The
+  bundled seed is a **fallback only** — reached when there is no local and no remote copy.
+  A household's real collection lives in OneDrive, which is why v23.9 could cut the seed
+  from 635 recipes to a dozen without touching anyone's data.
   Since v22.0 there is a third file, `trip-history.json` — one record per finished shop,
   written once, read lazily. It is not a third live object: nothing renders from it
   directly, and it never touches the merge.
@@ -471,6 +478,13 @@ covers were written together, ask separately whether the thing they agree on is 
 Browser suites needing internals serve a temporary instrumented copy from `test/.tmp/`.
 Production code carries no test hooks.
 
+**The seed is a fixture, and tests must not depend on what is in it.** v23.9 cut it from
+635 recipes to 12 and two suites broke: one asserted `recipeCount() > 100`, and
+`suiteBulkDelete` searched for "chicken" to find three recipes to tick. Both were testing
+the fixture rather than the app. `suiteShareOneRecipe` still matches **"Mushroom Risotto"
+by name** — the one content dependency left, and the reason that recipe is in the seed. If
+you trim the seed again, that is what to check first. *(v23.9)*
+
 **Never wait a fixed time after `goto()` — use `waitForApp(page)`.** Startup begins at
 DOMContentLoaded, which waits on the MSAL script from a CDN that sandboxes block, so how
 long that request takes to *fail* decides how long startup takes. Worse, on a fresh
@@ -557,12 +571,6 @@ than working around it.
   check on the local copy and a periodic forced refresh.
 
 ## Open work worth considering
-
-- **Ship a small starter seed.** The bundled 635 recipes are one family's collection.
-  A dozen generic recipes instead would make forking sensible and drop `index.html`
-  from 1.3 MB to roughly 200 KB — the largest single win available on load time, and it
-  narrows the sync window that caused the typing bug. The full collection would live in
-  OneDrive like anyone else's data.
 
 - **The archive is written but barely read.** Four features come off it so far. The
   obvious next ones, in rough order of value per line: a spend figure typed in at the

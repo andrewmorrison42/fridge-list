@@ -545,17 +545,23 @@ async function suiteBulkDelete(browser) {
   try {
     await page.goto('http://localhost:8178/', { waitUntil: 'domcontentloaded' });
     await waitForApp(page);
+    /* v23.9: the seed is a dozen recipes, not a family's collection, so its size is no
+       longer the thing worth asserting — its coverage is. These suites need enough
+       recipes to pick three, and the seed is chosen to keep that true. */
     const total = await page.evaluate(() => window.__t.recipeCount());
-    ok('the seed has recipes to work with', total > 100, total);
+    ok('the seed has enough recipes for the suites to pick from', total >= 6, total);
 
     await openPicker();
     ok('both actions are disabled with nothing ticked',
        await page.evaluate(() => [...document.querySelectorAll('button')]
          .filter(b => /ticked/i.test(b.textContent)).every(b => b.disabled)));
 
-    await page.fill('#app input[type=search]', 'chicken');
-    await page.waitForTimeout(300);
+    /* v23.9: this used to narrow 635 recipes with a search for "chicken". The seed is
+       now a dozen, so the picker already shows them all — and searching was a dependency
+       on the seed's CONTENT hiding inside a test about bulk delete. Assert the row count
+       instead, so a future trim fails with a sentence rather than "undefined". */
     const boxes = await page.$$('#app .checkbox-row input[type=checkbox]');
+    ok('the picker lists at least three recipes to tick', boxes.length >= 3, boxes.length);
     for (let i = 0; i < 3; i++) await boxes[i].check();
     await page.waitForTimeout(200);
 
@@ -580,9 +586,8 @@ async function suiteBulkDelete(browser) {
     await page.reload({ waitUntil: 'domcontentloaded' });
     await waitForApp(page);
     await openPicker();
-    await page.fill('#app input[type=search]', 'chicken');
-    await page.waitForTimeout(300);
     const boxes2 = await page.$$('#app .checkbox-row input[type=checkbox]');
+    ok('and still does on the second pass', boxes2.length >= 3, boxes2.length);
     for (let i = 0; i < 3; i++) await boxes2[i].check();
     await page.waitForTimeout(200);
     await page.click('button:has-text("Delete the 3 ticked")');

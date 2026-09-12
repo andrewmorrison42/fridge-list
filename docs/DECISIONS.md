@@ -429,6 +429,48 @@ new number.
 A smaller thing the rewrite caught: the old wording read "Not checked for 10 minutes ago."
 It had a passing test — which asserted the substring, not the sentence.
 
+### v23.9 — the recipes went, the ingredient master stayed
+
+`index.html` was 1.31 MB and **0.90 MB of it was 635 of one family's recipes**. The service
+worker is network-first for the page, so every launch pulled all of that before the app
+could even ask OneDrive for the household's actual data — including a launch in a
+supermarket on one bar. Listed as open work since v23.0 and finally done: 635 recipes down
+to 12, and the file to **445 KB, a 67% cut**.
+
+The decision that mattered was what *not* to cut.
+
+- **Kept: the whole 446-entry ingredient master.** 64 KB — a twentieth of the saving — and
+  it carries the aisle, category and shopping-unit knowledge that makes a list group the
+  way a shop is walked. `migrateIngredientsIfStale` also reads it to repair households
+  whose entries lost a unit or a category. Cutting it would have degraded every phone in
+  the fleet to save almost nothing.
+- **Kept `meta.version` at 8.** Bumping it makes `migrateIngredientsIfStale` run its
+  add-new-ingredients pass on every device. Nothing about shrinking a fallback warrants
+  that, and a version bump on a release that removes data is how deleted ingredients come
+  back from the dead.
+- **Dropped "Regular items".** A pseudo-recipe holding this family's cornflakes, bread and
+  deodorant. Useful to them, in OneDrive where it belongs, and exactly the thing a starter
+  seed should not ship to a stranger.
+
+The twelve were **selected programmatically against the properties the app needs
+exercised**, not chosen by taste: all three shopping units, four shopping categories
+including Pantry (for `pantryAtHome`), 45 ingredients shared across more than one recipe so
+the fold and dedup paths have real work, one slow-cooker recipe, and a spread of recipe
+categories for the filters. Two were forced by the browser suite, which had quietly grown
+dependencies on the seed's *content*: `suiteShareOneRecipe` matches **"Mushroom Risotto" by
+name**, and the recipe-finder suite searches for **"chicken"**. Worth knowing before anyone
+trims the seed again.
+
+One assertion changed rather than being deleted: the suite used to check
+`recipeCount() > 100`. Volume was the thing this release removed, so it now asserts the
+coverage the seed exists for. A test that asserts the size of a fixture is testing the
+fixture.
+
+**Safety.** The seed is a fallback, reached only when there is no local and no remote copy.
+Every device that has ever synced holds the full collection in OneDrive, and this release
+writes nothing to that file. Git history keeps the 635 regardless. The only household this
+could strand is one that never synced.
+
 ### What the arc actually cost
 
 Four structural sync changes in two days, two of them fixing something the previous one
