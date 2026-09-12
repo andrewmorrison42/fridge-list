@@ -340,7 +340,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v23.5';
+const APP_VERSION = 'v23.6';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -810,6 +810,24 @@ function syncAlertState(s){
   const now = s.now || Date.now();
   if(s.lastWriteError) return { kind: 'error', writeError: s.lastWriteError };
 
+  /* v23.6. Above every other case except a failed write, and on every tab, because this
+     is the one thing the app knows that the family cannot possibly work out for
+     themselves: somebody's list is being discarded right now. It was previously said once
+     in a status line that scrolls away — see mergeReport — which is not the same as being
+     told. A device that is not connected at all cannot have this, so the ordering costs
+     the cases below nothing. */
+  if(s.tripConflict){
+    return { kind: 'conflict',
+             head: 'Two phones have different shopping lists.',
+             hint: s.tripConflict.iWon
+               ? 'This phone\u2019s list won, so the other one \u2014 which has work on it \u2014 '
+                 + 'is being dropped everywhere. Decide which one the family is using.'
+               : 'The other phone\u2019s list won, so the one you had \u2014 with your work on it \u2014 '
+                 + 'has been replaced. It is kept until this page is closed.',
+             action: 'Sort this out',
+             actionKind: 'review' };
+  }
+
   // Don't accuse a device that is still starting up.
   const settled = (now - (s.startedAt || 0)) > (s.graceMs || SYNC_UNLINKED_GRACE_MS);
   const consequence = 'Anything you add here stays on this phone. Nobody else will see it, '
@@ -862,6 +880,7 @@ function renderSyncAlert(){
     pendingSince: syncPendingSince,
     seenRemoteAt: shoppingSeenRemoteAt,
     startedAt: appStartedAt,
+    tripConflict: tripDisagreement,
     now: Date.now()
   });
   // A write failure is never silenced. Everything else can be put aside for the session:
@@ -882,7 +901,11 @@ function renderSyncAlert(){
   if(st.action){
     const actions = el('div',{class:'alert-actions'});
     const go = el('button',{class:'alert-btn'},[st.action]);
-    go.addEventListener('click', showSyncModal);   // the fix, where the complaint is
+    // The fix, where the complaint is. For a trip disagreement that is the Review tab,
+    // where both lists are described and either can be settled — not the sync modal.
+    go.addEventListener('click', ()=>{
+      if(st.actionKind === 'review') goToTab('review'); else showSyncModal();
+    });
     actions.appendChild(go);
     const later = el('button',{class:'alert-btn quiet'},['Not now']);
     later.addEventListener('click', ()=>{ syncAlertMuted = st.kind; renderSyncAlert(); });
@@ -1454,6 +1477,49 @@ function tripIdOf(sd){
   return wp.tripId || (wp.generatedAt ? 'gen:' + wp.generatedAt : null);
 }
 
+/* ---- v23.6: a trip id somebody can read out ----
+
+   Two lists generated from the same picks are identical on screen and are two different
+   trips. That is the fork the family could not see, and it is the reason a whole release
+   went into explaining a symptom that a four-character code would have made obvious. The
+   code is derived from the WHOLE id, so it changes exactly when the trip does — and
+   nothing ever parses it back, so it is a label and not an identifier.
+
+   Pure, and it must stay that way: the device id is passed in, the way
+   tripRecordFromShopping already takes it, rather than reached for. */
+function tripParts(tripId){
+  if(!tripId) return { at: null, device: null };
+  // The id is 'trip:<iso>:<device>' and an ISO timestamp contains colons of its own, so
+  // the device is what follows the LAST one. 'gen:<iso>', from a pre-v21 file, has none.
+  if(tripId.indexOf('gen:') === 0) return { at: tripId.slice(4), device: null };
+  if(tripId.indexOf('trip:') === 0){
+    const rest = tripId.slice(5);
+    const cut = rest.lastIndexOf(':');
+    return cut < 0 ? { at: rest, device: null }
+                   : { at: rest.slice(0, cut), device: rest.slice(cut + 1) };
+  }
+  return { at: null, device: null };
+}
+
+function tripCode(tripId){
+  if(!tripId) return '----';
+  let h = 5381;
+  for(let i = 0; i < tripId.length; i++) h = (((h << 5) + h) ^ tripId.charCodeAt(i)) >>> 0;
+  return h.toString(36).toUpperCase().slice(-4).padStart(4, '0');
+}
+
+function tripLabel(sd, myDeviceId){
+  const id = tripIdOf(sd);
+  if(!id) return 'No shopping list has been made on this phone yet.';
+  const p = tripParts(id);
+  const at = tsOf(p.at) || tsOf(sd && sd.weekPlan && sd.weekPlan.generatedAt);
+  const when = at ? new Date(at) : null;
+  return 'List ' + tripCode(id)
+    + (when ? ' \u2014 made ' + when.toLocaleDateString() + ' '
+              + when.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' }) : '')
+    + (p.device ? (p.device === myDeviceId ? ', on this phone' : ', on another phone') : '');
+}
+
 /* ---- v21.8: is anyone actually shopping from this list? ----
    Ticks are the only honest signal available. A list with recent ticks on it is a
    trolley somewhere in a supermarket, and nothing generated elsewhere gets to replace
@@ -1568,6 +1634,27 @@ function chooseTripWinner(a, b, aGen, bGen, primary, now){
   // 4. Nothing to tell them apart — both from builds that recorded none of this.
   //    The old rule, which is still right when there is no better information.
   return aGen === bGen ? primary : (aGen > bGen ? a : b);
+}
+
+/* v23.6. Two phones on two trips is a disagreement, and the app used to settle it in
+   silence: chooseTripWinner picked one, somebody's walk round a shop went with the loser,
+   and the WINNING phone was never told there had been an argument at all. That is the
+   half nobody could act on — the family reported the symptom from the losing side and had
+   no way to connect it to anything.
+
+   This names the disagreement, and names it by asking chooseTripWinner, so the card can
+   never claim an outcome the merge did not reach. The primary/aGen/bGen it computes are
+   the same three mergeShoppingData computes, deliberately: if those ever drift the two
+   would disagree, which is the bug this function exists to prevent. Pure. */
+function tripConflict(local, remote, now){
+  const mine = tripIdOf(local), theirs = tripIdOf(remote);
+  if(!mine || !theirs || mine === theirs) return null;
+  const aGen = tsOf(local.weekPlan && local.weekPlan.generatedAt);
+  const bGen = tsOf(remote.weekPlan && remote.weekPlan.generatedAt);
+  const primary = tsOf(local.lastUpdated) >= tsOf(remote.lastUpdated) ? local : remote;
+  const winner = chooseTripWinner(local, remote, aGen, bGen, primary, now);
+  const iWon = winner === local;
+  return { mineTrip: mine, theirsTrip: theirs, iWon: iWon, loser: iWon ? remote : local };
 }
 
 /* Resolve one boolean across two copies of the same line.
@@ -2049,6 +2136,20 @@ function mergeRemoteShopping(remote){
   // Stamp the incoming copy's legacy items against ITS lastUpdated, not ours — the bound
   // has to come from the file the item actually arrived in.
   backfillAuthoredStamps(remote);
+  /* v23.6: before merging, while both copies still exist, work out whether this is a
+     disagreement and keep whichever list is about to be thrown away. applyMergedShopping
+     already stashes when THIS device's trip is the one being replaced; when it WINS, the
+     copy about to be discarded is the remote one and until now nothing kept it, so the
+     winning phone had nothing to offer and nothing to say. Gated on the loser actually
+     having work on it: a fork where neither side has done anything self-heals in silence
+     and is not worth interrupting a shop for. */
+  const conflict = tripConflict(shoppingData, remote);
+  if(conflict && tripHasProgress(conflict.loser)){
+    tripDisagreement = { iWon: conflict.iWon, at: new Date().toISOString() };
+    if(conflict.iWon) stashReplacedTrip(remote);
+  } else if(!conflict){
+    tripDisagreement = null;
+  }
   const merged = mergeShoppingData(shoppingData, remote);
   shoppingSeenRemoteAt = advanced;
   if(merged) merged.seenRemoteAt = advanced || null;
@@ -2066,6 +2167,12 @@ function mergeRemoteShopping(remote){
    undo: it covers the minutes in which anyone would notice, and it costs nothing in
    the synced file. */
 let replacedTrip = null;
+
+/* v23.6: set while this device knows of two live trips, cleared the moment they agree, so
+   the banner cannot outlive the problem it is reporting. In-session only, like the stash
+   it travels with — a fork that nobody is losing work to is not worth a word, and one
+   that is gets settled in the minutes anybody would notice. */
+let tripDisagreement = null;
 
 function stashReplacedTrip(sd){
   if(!tripHasProgress(sd)) return;
@@ -3446,6 +3553,11 @@ function clearedWeekPlan(sd, now, byDevice, seenRemoteAt){
    to it. v23.3: before this, the card always said "N item(s) ticked", which read as "0
    item(s) ticked" for a list somebody had spent an evening pruning — the exact work this
    release exists to stop losing. */
+// Joining one sentence onto another without shouting mid-line.
+function lowerFirst(str){
+  return str ? str.charAt(0).toLowerCase() + str.slice(1) : str;
+}
+
 function replacedTripSummary(t){
   const ticks = (t && t.ticks) || 0;
   const others = Math.max(0, ((t && t.decisions) || 0) - ticks);
@@ -3477,9 +3589,38 @@ function putBackReplacedList(){
   });
   shoppingData.shoppingList = replacedTrip.shoppingList.map(l=> Object.assign({}, l));
   replacedTrip = null;
+  tripDisagreement = null;
   persist('shopping');
   render();
   setStatus('Put the previous list back, ticks and all.', 'ok');
+}
+
+/* v23.6: the other half of putBackReplacedList, and the reason the pair exists.
+
+   "Keep this one" used to just drop the local stash, which settles nothing — the phone
+   holding the other list goes on offering it every poll until something supersedes it,
+   and two phones can sit disagreeing indefinitely with each side believing it had
+   decided. Keeping a list is as deliberate an act as putting one back, so it is expressed
+   the same way: a new trip id naming the one it replaces, which wins outright everywhere
+   by chooseTripWinner's first rule instead of arguing on.
+
+   The lines and their ticks are untouched — only the trip's identity and lineage change,
+   so lastGeneratedRecipeSignature still matches and the next rebuild is still a same-trip
+   one. */
+function keepThisList(){
+  if(!replacedTrip) return;
+  const now = new Date().toISOString();
+  shoppingData.weekPlan = Object.assign({}, shoppingData.weekPlan, {
+    tripId: 'trip:' + now + ':' + deviceId(),
+    supersedes: replacedTrip.tripId,
+    basedOn: shoppingSeenRemoteAt || shoppingData.lastUpdated || null,
+    generatedAt: now
+  });
+  replacedTrip = null;
+  tripDisagreement = null;
+  persist('shopping');
+  render();
+  setStatus('Kept this list. The other one is replaced on every phone.', 'ok');
 }
 
 function shoppingListIsStale(){
@@ -3496,14 +3637,22 @@ function shoppingListIsStale(){
 
 /* ---------------- rendering ---------------- */
 
+/* v23.6: switching tab from somewhere other than the nav — the sync banner's "Sort this
+   out" — has to move the nav highlight too, or the app says it is on one tab and shows
+   another. One definition so the two routes cannot drift. */
+function goToTab(name){
+  currentTab = name;
+  saveUiState();
+  document.querySelectorAll('#mainNav button').forEach(b=>
+    b.classList.toggle('active', b.dataset.tab === name));
+  render();
+}
+
 function bindNav(){
   document.getElementById('mainNav').addEventListener('click', (e)=>{
     const btn = e.target.closest('button[data-tab]');
     if(!btn) return;
-    currentTab = btn.dataset.tab;
-    saveUiState();
-    document.querySelectorAll('#mainNav button').forEach(b=>b.classList.toggle('active', b===btn));
-    render();
+    goToTab(btn.dataset.tab);
   });
 }
 
@@ -4255,54 +4404,64 @@ function renderReviewTab(){
     container.appendChild(el('div',{class:'empty-state'},['No recipes picked yet. Go to "Start New Shopping List" first.']));
     return container;
   }
-  /* Review Shopping List reflects the current picks, refreshed on the way in rather
-     than behind a button nobody would think to press.
-     v21.8: with one exception. A refresh that starts a NEW trip throws away every tick
-     on the current one, and this line runs merely because somebody opened a tab — which
-     is exactly how a phone that had not caught up wiped a trolley mid-shop. When there
-     is progress to lose, the refresh waits for a deliberate tap. Same-trip refreshes (a
-     Wait List addition, a staple amount) carry every tick across, so those still happen
-     on their own — that is how "grab shampoo too" reaches someone already in the shop. */
-  /* v23.5: and with a second exception. Minting a NEW trip is the act that forks the
-     family's list in two, and a device that has not yet read the shared folder cannot
-     know whether there is already a trip to join. Both phones opening this tab before
-     either had caught up is how two identical-looking lists ended up as two trips, one of
-     which was then discarded wholesale on every poll. Waiting costs one poll; it is not a
-     choice between two lists, so unlike v21.8's rejected prompt there is nothing to
-     understand — and the button is there for anyone who does not want to wait.
-     Only when there is no list on screen at all, which is the case that forks: holding a
-     list back that somebody can already see would replace it with a notice, and hiding
-     what a person is reading is the failure mode this whole file exists to avoid. */
-  let heldBackRefresh = false, waitingForFirstSync = false;
-  if(shoppingListIsStale()){
-    if(!sameTripRebuild() && shoppingInProgress()) heldBackRefresh = true;
-    else if(!sameTripRebuild() && localStorage.getItem(LS_ONEDRIVE_FLAG) === '1'
-            && !shoppingSeenRemoteAt
-            && !(shoppingData.shoppingList || []).length) waitingForFirstSync = true;
-    else generateShoppingList();
-  }
+  /* The two lists, and the choice between them.
 
-  if(waitingForFirstSync){
+     v21.8 kept the displaced list so it could be put back. v23.6 keeps whichever list
+     lost — including when it is the OTHER phone's and this one won, which until now was
+     invisible here — and turns the card into the place a disagreement gets settled rather
+     than merely noticed.
+
+     v21.9 removed a prompt like this because "asked to choose between two lists, nobody
+     knew which was which". That was true, and it is the reason this card describes each
+     list by what is actually ON it — when it was made, how much is ticked, how much was
+     pruned — instead of asking people to tell two identical things apart. Both buttons
+     now WRITE: keeping a list is as deliberate as putting one back, and a decision that
+     does not supersede the other trip is not a decision, it is a pause. */
+  if(replacedTrip && tripIdOf(shoppingData) !== replacedTrip.tripId){
+    const iWon = !!(tripDisagreement && tripDisagreement.iWon);
     const card = el('div',{class:'card notice-card'});
-    card.appendChild(el('p',{style:'margin-top:0;'},[
-      el('strong',{},['Checking the family\u2019s list first.'])
+    card.appendChild(el('p',{style:'margin-top:0;'},[ el('strong',{},[ iWon
+      ? 'Another phone has a different shopping list.'
+      : 'The list you had been working on was replaced.' ])]));
+    card.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[ iWon
+      ? 'This phone\u2019s list is the one on screen and is the one being used. The other '
+        + 'one is kept until this page is closed \u2014 ' + lowerFirst(replacedTripSummary(replacedTrip)) + '.'
+      : replacedTripSummary(replacedTrip) + ', and is kept until this page is closed \u2014 whether it was replaced here or from another phone.'
     ]));
-    card.appendChild(el('p',{class:'muted'},[
-      'This device has not read the shared folder yet. Making a list now would start a '
-      + 'second one, and whichever list loses is thrown away with everything ticked on '
-      + 'it. This page updates on its own as soon as the folder has been read.'
-    ]));
-    card.appendChild(generateNowButton('Make the list now without waiting'));
+    const backBtn = el('button',{class:'btn'},[ iWon
+      ? 'Use the other phone\u2019s list instead' : 'Put back the list that was replaced' ]);
+    backBtn.addEventListener('click', putBackReplacedList);
+    card.appendChild(backBtn);
+    const keepBtn = el('button',{class:'btn secondary', style:'margin-left:8px;'},['Keep this one']);
+    keepBtn.addEventListener('click', keepThisList);
+    card.appendChild(keepBtn);
     container.appendChild(card);
-    return container;
   }
+  /* v23.6: opening this tab no longer builds anything. This block sits AFTER the card
+     above on purpose — it can return early, and the one path that most needs the undo on
+     screen (an import that landed on an empty list) is exactly the path that returns.
 
-  /* The week's recipes are fixed on this build while a shop is under way, so reaching
-     here means they were changed somewhere this device cannot see — a phone on an older
-     build, or one that was offline when they were changed. The list stays as it is
-     either way. There is deliberately no button offering to rebuild it: that offer was
-     the confusing part, and "Shopping is done" is the honest way out. */
-  if(heldBackRefresh){
+     The auto-refresh dated from v21.8 and had been fenced twice — once for a live trip,
+     once for a device that had not read the folder yet — and both fences were patches on
+     the same mistake. Opening a tab is not asking for a new list, and a list minted
+     because somebody opened a tab is how two phones ended up holding two trips for what
+     everyone thought was one shop. generateShoppingList now has exactly ONE caller,
+     generateNowButton, and that is a tap. Do not add a second.
+
+     What the tab does instead is say which state the list is in and what the button would
+     cost, using the same sameTripRebuild() the rebuild itself will use, so the sentence
+     and the outcome cannot disagree. */
+  const listIsStale = shoppingListIsStale();
+  const keepsTicks = sameTripRebuild();
+  const noListYet = !(shoppingData.shoppingList || []).length
+                    && !shoppingData.weekPlan.shoppingDoneAt;
+
+  /* The week's recipes are fixed while a shop is under way, so reaching here means they
+     were changed somewhere this device cannot see — a phone on an older build, or one
+     that was offline. The list stays as it is either way, and there is deliberately no
+     button: that offer was the confusing part in v21.8, and "Shopping is done" is the
+     honest way out. */
+  if(listIsStale && !keepsTicks && shoppingInProgress()){
     const card = el('div',{class:'card notice-card'});
     card.appendChild(el('p',{style:'margin-top:0;'},[
       el('strong',{},['The week’s recipes were changed somewhere else.'])
@@ -4313,26 +4472,40 @@ function renderReviewTab(){
       + 'for the next list.'
     ]));
     container.appendChild(card);
-  }
-
-  /* The undo for a trip that was replaced — whether that happened here or arrived from
-     another phone mid-shop, which is the case nobody is watching for. */
-  if(replacedTrip && tripIdOf(shoppingData) !== replacedTrip.tripId){
+  } else if(noListYet){
+    const card = el('div',{class:'card'});
+    card.appendChild(el('h4',{style:'margin-top:0;'},['No shopping list yet']));
+    card.appendChild(el('p',{class:'muted'},[
+      'The week’s recipes are picked. Nothing is built until you ask — so two phones '
+      + 'cannot quietly end up with a list each.'
+    ]));
+    card.appendChild(generateNowButton('Make the shopping list'));
+    container.appendChild(card);
+    return container;
+  } else if(listIsStale){
+    /* Say what actually changed. Most of what makes a list stale is not a recipe at all —
+       a Wait List addition, a staple amount — and "the week's recipes have changed" would
+       be a plain untruth in front of somebody standing in an aisle wondering what they
+       missed. The recipe signature is the one that answers it. */
+    const recipesChanged =
+      shoppingData.weekPlan.lastGeneratedRecipeSignature !== recipeSelectionsSignature();
     const card = el('div',{class:'card notice-card'});
-    card.appendChild(el('p',{style:'margin-top:0;'},[
-      el('strong',{},['The list you had been working on was replaced.'])
+    card.appendChild(el('p',{style:'margin-top:0;'},[ el('strong',{},[ recipesChanged
+      ? 'The week’s recipes have changed since this list was made.'
+      : 'There is something new to add to this list.' ])]));
+    card.appendChild(el('p',{class:'muted'},[ keepsTicks
+      ? (recipesChanged
+          ? 'Updating adds what the new recipes need and keeps everything already ticked off.'
+          : 'Somebody has added to the Wait List, or changed a staple amount. Updating '
+            + 'brings it onto this list and keeps everything already ticked off.')
+      : 'A recipe was taken off, or its servings changed, so this would be a new list — '
+        + 'everything ticked on this one is cleared. The list it replaces is kept until '
+        + 'this page is closed, so it can be put back.'
     ]));
-    card.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[
-      replacedTripSummary(replacedTrip) + ', and is kept until this page is closed \u2014 whether it was replaced here or from another phone.'
-    ]));
-    const backBtn = el('button',{class:'btn'},['Put back the list that was replaced']);
-    backBtn.addEventListener('click', putBackReplacedList);
-    card.appendChild(backBtn);
-    const dropBtn = el('button',{class:'btn secondary', style:'margin-left:8px;'},['Keep this one']);
-    dropBtn.addEventListener('click', ()=>{ replacedTrip = null; render(); });
-    card.appendChild(dropBtn);
+    card.appendChild(generateNowButton(keepsTicks ? 'Update the list' : 'Make a new list'));
     container.appendChild(card);
   }
+
   // Print just the shopping list, straight from here. The printable layout is rendered
   // hidden alongside the screen list; printSection('shopping') reveals only it.
   const printRow = el('div',{class:'row', style:'margin-bottom:12px;'});
@@ -4911,6 +5084,11 @@ function showSyncModal(){
   const body = el('div',{});
   body.appendChild(el('h2',{},['Sync options']));
   body.appendChild(el('p',{class:'small-note', style:'margin-top:-6px;'},['App version: ' + APP_VERSION]));
+  /* v23.6: the trip this phone is on, in a form two people can compare out loud. Two
+     lists built from the same picks look identical and are different trips — that is the
+     fork the family could not see, and this is where you check. */
+  body.appendChild(el('p',{class:'small-note', style:'margin-top:-10px;'},
+                       [tripLabel(shoppingData, deviceId())]));
   body.appendChild(el('p',{class:'muted'},['This app keeps a copy on this device automatically. For sync that works on every device, including Android — sign in with Microsoft below to sync through OneDrive. On desktop Chrome/Edge you can alternatively link a local folder directly.']));
 
   /* -------- OneDrive sync (works on any device, incl. Android) -------- */

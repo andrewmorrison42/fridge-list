@@ -77,7 +77,11 @@ Do not read `n.done` directly. *(v23.5)*
 "Put back the list that was replaced". Two lists generated from the same picks look
 identical and are two different trips; `chooseTripWinner` then discards one of them
 wholesale on every poll, and until v23.5 nothing on screen ever said so. The undo has
-existed since v21.8 — what was missing was any reason to reach for it. *(v23.5)*
+existed since v21.8 — what was missing was any reason to reach for it. v23.6 adds the
+surface a status line could not be: `syncAlertState` returns a `conflict` kind, above
+every case but a failed write and on every tab, whose action goes to the Review tab rather
+than the sync modal. A line that scrolls away is not the same as being told. *(v23.5,
+v23.6)*
 
 **An ingredient's shopping unit must be settable, and `SHOPPING_UNIT_OPTIONS` is the whole
 vocabulary.** Until v23.4 nothing in the app could set `shoppingUnit`: every creation site
@@ -261,15 +265,40 @@ nothing to choose now. The Wait List is the way to add something mid-shop (a sam
 rebuild, so ticks survive), and "Shopping is done" is the way to free the picks again.
 Anything switched off must also LOOK switched off — see `.btn:disabled`. *(v21.9)*
 
-**Opening the Review tab must not rebuild a live list.** The auto-refresh on entry runs
-because somebody opened a tab, and a refresh that starts a new trip discards every tick
-on the current one — that is how a phone that had not caught up wiped a trolley
-mid-shop. `renderReviewTab` refreshes on its own only when the rebuild stays on the same
-trip (which carries ticks across) or there is no progress to lose; otherwise it leaves
-the list alone and says so. `sameTripRebuild()` is shared with `generateShoppingList` so
-the two can never disagree about what is about to happen. Since v21.9 froze the picks,
-reaching that state at all means another device changed them — an older build, or one
-that was offline — so the note explains and offers no button. *(v21.8, v21.9)*
+**Exactly one thing builds a shopping list, and it is a tap.** `generateShoppingList()`
+has one caller, `generateNowButton`. The Review tab used to rebuild on entry; that was
+fenced in v21.8 for a live trip and again in v23.5 for a device that had not read the
+folder, and both fences were patches on the same mistake — opening a tab is not asking
+for a list, and a list minted because somebody opened a tab is how two phones ended up
+holding a trip each for what everyone thought was one shop. The tab now says which state
+the list is in and what the button would cost, deciding with the same `sameTripRebuild()`
+the rebuild will use so the sentence and the outcome cannot disagree; and it says what
+actually changed, because most staleness is a Wait List addition or a staple amount and
+"the recipes have changed" would be untrue in front of somebody in an aisle. A source
+test asserts the caller count. Do not add a second. *(v21.8, v21.9, replaced v23.6)*
+
+**The card that offers a choice between two lists renders before anything that can return
+early.** An import lands on an empty list, which is the branch that returns — and the
+import is the single path where the undo most needs to be on screen. *(v23.6)*
+
+**Whichever trip loses is stashed, on both phones, and choosing is a WRITE.**
+`stashReplacedTrip` used to run only when THIS device's trip was the one replaced, so the
+winning phone had nothing to offer and nothing to say; `mergeRemoteShopping` now stashes
+the remote copy when this device wins, gated on the loser actually having work on it.
+`tripConflict` names the disagreement by calling `chooseTripWinner`, so the card can never
+claim an outcome the merge did not reach. Both buttons supersede: `putBackReplacedList`
+always did, and `keepThisList` is its mirror — "Keep this one" used to only drop the local
+stash, which settles nothing, because the phone holding the other list goes on offering it
+every poll until something supersedes it. A decision that does not supersede is a pause.
+*(v23.6)*
+
+**`tripCode` is a label, never an identifier.** Nothing parses it back, nothing stores it,
+and it is derived from the whole trip id so it changes exactly when the trip does. It
+exists because two lists built from the same picks are identical on screen and are
+different trips — the fork a family could not see, and a whole release went into
+explaining a symptom that four characters would have made obvious. Shown in Sync options
+beside the app version. `tripLabel` takes the device id as an argument rather than reaching
+for `deviceId()`, so it stays pure. *(v23.6)*
 
 **A device that cannot reach the folder has to say so, and the wording is the feature.**
 The sync banner covered a sync that *broke* and could not cover one that was never there:

@@ -81,7 +81,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProg
                'lastAuthoredAt', 'noteRemoved', 'mergeTombstones', 'pruneTombstones',
                'backfillAuthoredStamps',
                'syncAlertState', 'lastContactText',
-               'doneCountsHere', 'syncNeededFromLine'];
+               'doneCountsHere', 'syncNeededFromLine',
+               'tripParts', 'tripCode', 'tripLabel', 'tripConflict', 'keepThisList'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -94,6 +95,10 @@ vm.runInContext(
   // still the real function out of index.html.
   'function persist(){}\n' +
   'function deviceId(){ return "test-device"; }\n' +
+  // v23.6: keepThisList decides, writes and then repaints. The deciding is the part worth
+  // testing; the repaint and the status line are the same kind of I/O as persist().
+  'function render(){}\n' +
+  'function setStatus(){}\n' +
   'let recipesData = { recipes: [], ingredients: [], settings: { features: {}, staples: [], stapleQty: {} } };\n' +
   extractConst('COUNT_UNITS') + '\n' +
   extractConst('MEASURE_ML') + '\n' +
@@ -130,6 +135,7 @@ vm.runInContext(
   '             backfillAuthoredStamps,' +
   '             syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,' +
   '             doneCountsHere, syncNeededFromLine,' +
+  '             tripParts, tripCode, tripLabel, tripConflict, keepThisList,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -151,6 +157,7 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         backfillAuthoredStamps,
         syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,
         doneCountsHere, syncNeededFromLine,
+        tripParts, tripCode, tripLabel, tripConflict, keepThisList,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -1844,6 +1851,147 @@ group('v23.5 — a replaced list says so, in its own words');
                                              T(9500), { tripId: 'trip:phone-1' }));
   ok('an ordinary merge on one trip is not reported as a replacement',
      same.tripReplaced === false && mergeReport(same) === null);
+}
+
+/* ================= v23.6: a name, a tap, and an argument that ends =================
+
+   v23.5 fixed the damage a fork did. These three close the fork itself: the trip has a
+   name two people can compare, nothing builds a list without somebody asking, and a
+   disagreement is raised on BOTH phones and settled by whichever one acts. */
+
+group('v23.6 — a trip id somebody can read out');
+{
+  const A = 'trip:2026-08-15T10:00:00.000Z:d-phone1';
+  const B = 'trip:2026-08-15T10:00:00.001Z:d-phone1';
+  ok('a code is four characters', tripCode(A).length === 4, tripCode(A));
+  ok('the same id always gives the same code', tripCode(A) === tripCode(A));
+  ok('a different trip gives a different code — one millisecond apart',
+     tripCode(A) !== tripCode(B), [tripCode(A), tripCode(B)]);
+  ok('no id at all still returns something printable', tripCode(null) === '----');
+  ok('the code is upper case and unambiguous to read out',
+     /^[0-9A-Z-]{4}$/.test(tripCode(A)), tripCode(A));
+
+  // The id embeds an ISO timestamp, which contains colons of its own.
+  ok('the device is what follows the LAST colon', tripParts(A).device === 'd-phone1');
+  ok('and the timestamp survives intact', tripParts(A).at === '2026-08-15T10:00:00.000Z');
+  ok('a pre-v21 gen: id has a time and no device',
+     tripParts('gen:2026-08-15T10:00:00.000Z').at === '2026-08-15T10:00:00.000Z'
+     && tripParts('gen:2026-08-15T10:00:00.000Z').device === null);
+  ok('and nothing at all is handled', tripParts(null).device === null);
+}
+
+group('v23.6 — the label says whose phone made the list');
+{
+  const sd = listFor([], T(0), { tripId: 'trip:2026-08-15T10:00:00.000Z:d-mine' });
+  const label = tripLabel(sd, 'd-mine');
+  ok('it leads with the code', label.indexOf('List ' + tripCode(tripIdOf(sd))) === 0, label);
+  ok('it says this phone when the device matches',
+     label.indexOf('on this phone') !== -1, label);
+  ok('and another phone when it does not',
+     tripLabel(sd, 'd-theirs').indexOf('on another phone') !== -1, tripLabel(sd, 'd-theirs'));
+  ok('a phone with no list says so rather than showing a code',
+     tripLabel(listFor([], T(0), { tripId: null, generatedAt: null }), 'd-mine')
+       .indexOf('No shopping list') === 0);
+  ok('a pre-v21 file gets a code and no phone claim',
+     tripLabel({ weekPlan: { generatedAt: '2026-08-15T10:00:00.000Z' } }, 'd-mine')
+       .indexOf('phone') === -1);
+}
+
+/* The card must never claim an outcome the merge did not reach, so tripConflict decides
+   by calling chooseTripWinner rather than by reasoning about it a second time. These
+   assert the agreement directly, across every case chooseTripWinner distinguishes. */
+group('v23.6 — a disagreement is named, and names the same winner the merge will');
+{
+  const trip = (id, o) => listFor((o && o.lines) || [line('milk')], (o && o.at) || T(0),
+    Object.assign({ tripId: id }, o && o.wp));
+  ok('one trip is not a disagreement',
+     tripConflict(trip('t1'), trip('t1')) === null);
+  ok('nor is a copy with no trip at all',
+     tripConflict(trip('t1'), listFor([], T(0), { tripId: null, generatedAt: null })) === null);
+
+  // 1. a deliberate replacement
+  {
+    const mine = trip('t1', { wp: { supersedes: 't2' }, at: T(100) });
+    const theirs = trip('t2', { at: T(200) });
+    const c = tripConflict(mine, theirs);
+    ok('superseding wins even from the older file', c.iWon === true);
+    ok('and the loser handed back is the other copy', c.loser === theirs);
+  }
+  // 2. work beats no work
+  {
+    const mine = trip('t1', { at: T(200) });
+    const theirs = trip('t2', { lines: [line('milk', { checked: true, checkedAt: T(150) })],
+                                at: T(100) });
+    const c = tripConflict(mine, theirs, BASE + 1000);
+    ok('a list somebody has worked on beats an untouched newer one', c.iWon === false);
+    ok('and this side is what would be lost', c.loser === mine);
+  }
+  // 3. neither worked on: the fresher basedOn
+  {
+    const mine = trip('t1', { wp: { basedOn: T(50) }, at: T(100) });
+    const theirs = trip('t2', { wp: { basedOn: T(10) }, at: T(200) });
+    ok('the device that had caught up wins', tripConflict(mine, theirs).iWon === true);
+  }
+  ok('both trip ids are reported so the caller can tell them apart',
+     tripConflict(trip('t1', { at: T(200) }), trip('t2')).mineTrip === 't1'
+     && tripConflict(trip('t1', { at: T(200) }), trip('t2')).theirsTrip === 't2');
+}
+
+group('v23.6 — keeping a list settles it, rather than pausing the argument');
+{
+  const mine = listFor([line('milk', { checked: true, checkedAt: T(100) })], T(200),
+                       { tripId: 'trip:mine', basedOn: T(0) });
+  setShoppingData(mine);
+  setReplacedTrip({ tripId: 'trip:theirs', ticks: 3, decisions: 3,
+                    weekPlan: { tripId: 'trip:theirs' }, shoppingList: [] });
+  keepThisList();
+  const after = sandbox.api.currentShopping();
+  ok('a new trip is minted', tripIdOf(after) !== 'trip:mine');
+  ok('and it names the list it replaces', after.weekPlan.supersedes === 'trip:theirs');
+  ok('the lines and their ticks are untouched',
+     after.shoppingList.length === 1 && after.shoppingList[0].checked === true);
+  ok('the stash is cleared', getReplacedTrip() === null);
+  // The point of minting rather than dismissing: it now WINS, so the other phone stops
+  // offering its copy on every poll.
+  const theirs = listFor([line('milk')], T(300), { tripId: 'trip:theirs', basedOn: T(0) });
+  const c = tripConflict(after, theirs);
+  ok('and it beats the other list outright, even from the older file', c.iWon === true);
+  setReplacedTrip(null);
+}
+
+/* A source assertion, not a behaviour one, and deliberately so: the rule is about how
+   many ways there are to reach generateShoppingList, which no runtime test can see. The
+   auto-refresh was added in v21.8 and fenced twice before it was removed; a third fence
+   would be somebody re-adding the call, and this is what notices. */
+group('v23.6 — exactly one thing builds a shopping list, and it is a tap');
+{
+  const calls = (html.match(/(?<!function )\bgenerateShoppingList\(\)/g) || []).length;
+  ok('generateShoppingList() is called from exactly one place', calls === 1, calls);
+  const btn = html.slice(html.indexOf('function generateNowButton('));
+  ok('and that place is the button\u2019s click handler',
+     btn.slice(0, btn.indexOf('\n}')).indexOf("addEventListener('click'") !== -1);
+}
+
+group('v23.6 — the banner puts a disagreement above everything but a failed write');
+{
+  const base = { backend: 'onedrive', signedIn: true, startedAt: 0, now: 10 * 60 * 1000 };
+  const won = syncAlertState(Object.assign({}, base, { tripConflict: { iWon: true } }));
+  ok('it fires', won && won.kind === 'conflict');
+  ok('and says two phones disagree', won.head.indexOf('different shopping lists') !== -1, won.head);
+  ok('the winning side is told the other list is being dropped',
+     won.hint.indexOf('is being dropped') !== -1, won.hint);
+  const lost = syncAlertState(Object.assign({}, base, { tripConflict: { iWon: false } }));
+  ok('the losing side is told its own list went',
+     lost.hint.indexOf('has been replaced') !== -1, lost.hint);
+  ok('the action goes to the list, not the sync modal', lost.actionKind === 'review');
+
+  ok('a failed write still outranks it',
+     syncAlertState(Object.assign({}, base, {
+       tripConflict: { iWon: true }, lastWriteError: { status: 412, name: 'x' } })).kind === 'error');
+  ok('an unconnected phone is still told that first when there is no conflict',
+     syncAlertState(Object.assign({}, base, { backend: null })).kind === 'unlinked');
+  ok('and no conflict means the old cases are untouched',
+     syncAlertState(base) === null);
 }
 
 /* ---------- result ---------- */

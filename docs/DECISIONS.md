@@ -274,6 +274,65 @@ driving the real extracted functions with both trip ids and watching the reporte
 appear on demand — same trip, everything crosses; different trips, only `done` does. The
 suite had 322 passing assertions over this merge and none of them asked that question.
 
+### v23.6 — a name, a tap, and an argument that ends
+
+v23.5 fixed what a fork did. This closes the fork itself, and does it by reversing two
+earlier decisions rather than fencing them again.
+
+**Reversed: the Review tab refreshing on entry.** *(v21.8)* The idea was that the list
+should reflect the current picks "rather than sitting behind a button nobody would think
+to press". It was fenced twice — v21.8 for a live trip, v23.5 for a device that had not
+read the folder — and the second fence is what gave it away. Two patches on one call are
+not a hardening, they are a signal that the call is wrong. Opening a tab is not asking for
+a list, and a list minted because somebody opened a tab is precisely how two phones came
+to hold a trip each. `generateShoppingList()` now has exactly one caller and a source test
+asserts it, because the rule is about *how many ways in there are*, which no runtime test
+can see.
+
+The cost is real and worth naming: **"grab shampoo too" no longer lands on the shopper's
+list by itself.** A Wait List addition made at home now shows the shopper a line saying
+there is something new and a one-tap update. That tap is safe by construction — a
+same-trip rebuild, so nothing in the trolley is lost — but it is a tap that did not used
+to exist, and it is the one thing in this release that a family might miss. It was chosen
+deliberately over keeping an automatic path for same-trip rebuilds only: a rule with an
+exception is how the auto-refresh survived two fences, and "nothing builds a list unless
+somebody asks" is a sentence anyone can hold in their head.
+
+A smaller thing found while writing it: the staleness card first said "the week's recipes
+have changed", which is untrue for the commonest cause. Most staleness is a Wait List
+addition or a staple amount. It now checks `lastGeneratedRecipeSignature` and says which.
+
+**Reversed: offering no choice between two lists.** *(v21.9)* v21.8 offered "Make a new
+list anyway" and v21.9 removed it, because "asked to choose between two lists, nobody knew
+which was which". That objection was correct, and it was about *labelling*, not about
+choice — so the fix is to make the two answerable rather than to keep hiding one:
+
+- The card describes each list by what is on it — when it was made, how much is ticked,
+  how much was pruned — reusing `replacedTripSummary` rather than asking anyone to tell
+  two identical things apart.
+- Whichever trip loses is stashed. `stashReplacedTrip` previously ran only when THIS
+  device's trip was replaced, so the phone that *won* saw nothing at all — which is the
+  side the original report came from and the reason nobody could connect the two halves.
+- Both buttons write. "Keep this one" used to drop the local stash and nothing else, which
+  settles nothing: the phone holding the other list goes on offering it every poll.
+  `keepThisList` mints a superseding trip, exactly as `putBackReplacedList` does. **A
+  decision that does not supersede is a pause, not a decision.**
+- `syncAlertState` gains a `conflict` kind, above everything but a failed write and on
+  every tab. v23.5 said this once in a status line, which scrolls away; being told once in
+  passing is not being told.
+
+**Rejected: holding both lists until somebody chooses.** Neither list discarded, the merge
+refused, both phones showing the choice. Stronger in principle, and it leaves a phone
+sitting on a stale list until a human acts — in a supermarket, with the other shopper
+already walking. `chooseTripWinner` still decides immediately so nobody is ever stuck, and
+the choice is offered on top of a working list rather than instead of one.
+
+**Rejected: the trip code in the shop toolbar.** Proposed there first, on the grounds that
+it is what two people would read to each other mid-shop. It belongs in Sync options next
+to the app version — the place you already go to compare two phones — and a code above a
+shopping list is clutter ninety-nine weeks in a hundred. The card does not use the code
+either: "made 18:42, 12 ticked" answers *which is which* and a hash does not.
+
 ### What the arc actually cost
 
 Four structural sync changes in two days, two of them fixing something the previous one

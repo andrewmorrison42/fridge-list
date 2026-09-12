@@ -159,6 +159,22 @@ async function waitForApp(page) {
 }
 
 // Pick two recipes and land on the shopping list.
+/* v23.6: click a button by its exact label and say whether one was found. Returning the
+   hit rather than swallowing it matters here — CLAUDE.md records a session where a test
+   passed against the bug it was written for because the label did not match and nothing
+   was ever clicked. Every caller asserts the result. */
+async function clickButtonByText(page, label) {
+  const hit = await page.evaluate((want) => {
+    const b = [...document.querySelectorAll('#app button')]
+      .find(x => x.textContent.trim() === want);
+    if (!b) return false;
+    b.click();
+    return true;
+  }, label);
+  await page.waitForTimeout(600);
+  return hit;
+}
+
 async function buildAList(page) {
   await page.click('#mainNav button[data-tab="start"]');
   // Wait for the grid rather than guessing at it: 635 recipe cards do not always
@@ -171,6 +187,11 @@ async function buildAList(page) {
   await page.waitForTimeout(400);
   await page.click('#mainNav button[data-tab="review"]');
   await page.waitForTimeout(600);
+  /* v23.6: opening this tab no longer builds anything — that automatic path is exactly
+     how two phones ended up holding a list each. The button is now the only way in, so
+     every suite that wants a list has to ask for one like a person does. */
+  const built = await clickButtonByText(page, 'Make the shopping list');
+  if (!built) throw new Error('buildAList: no "Make the shopping list" button on the Review tab');
 }
 
 const readShopping = page => page.evaluate(() => JSON.parse(localStorage.getItem('fma_shopping_v4')));
@@ -212,6 +233,13 @@ async function suiteTicksSurviveRebuild(browser) {
 
     await page.click('#mainNav button[data-tab="review"]');
     await page.waitForTimeout(600);
+    /* v23.6: the tab no longer rebuilds on its own. It offers, and says the update keeps
+       every tick — which is the whole point of a same-trip rebuild. */
+    ok('the tab offers the update rather than performing it',
+       await page.evaluate(() => /something new to add/i.test(document.getElementById('app').innerText)));
+    ok('and the item is not on the list until somebody asks',
+       !(await readShopping(page)).shoppingList.some(l => /kitchen roll/i.test(l.ingredientName)));
+    ok('the update button is there', await clickButtonByText(page, 'Update the list'));
 
     const after = await readShopping(page);
     ok('the list really was rebuilt (the new item is on it)',
@@ -384,6 +412,7 @@ async function suiteStapleQuantities(browser) {
 
     await page.click('#mainNav button[data-tab="review"]');
     await page.waitForTimeout(700);
+    ok('the tab offers the update', await clickButtonByText(page, 'Update the list'));
     const after = await readShopping(page);
     const updated = after.shoppingList.find(l => /kitchen roll/i.test(l.ingredientName));
     ok('the edited amount reaches the existing list', updated && updated.totalQty === 5, updated);
@@ -408,6 +437,7 @@ async function suiteStapleQuantities(browser) {
       await page.waitForTimeout(500);
       await page.click('#mainNav button[data-tab="review"]');
       await page.waitForTimeout(700);
+      ok('the new staple is offered to the list', await clickButtonByText(page, 'Update the list'));
       const merged = await page.evaluate(n => {
         const sd = JSON.parse(localStorage.getItem('fma_shopping_v4'));
         return sd.shoppingList.find(x => x.ingredientName === n) || null;
@@ -870,6 +900,12 @@ async function suiteLiveListNotWiped(browser) {
     await page.waitForTimeout(400);
     await page.click('#mainNav button[data-tab="review"]');
     await page.waitForTimeout(700);
+    /* v23.6: "grab shampoo too" no longer lands on the shopper's list unannounced — the
+       tab says there is something to add and the shopper taps. That tap is safe by
+       construction: it is a same-trip rebuild, so nothing in the trolley is lost. */
+    ok('the shopper is told there is something new rather than the list changing under them',
+       await page.evaluate(() => /something new to add/i.test(document.getElementById('app').innerText)));
+    ok('and the update is one tap', await clickButtonByText(page, 'Update the list'));
     ok('a Wait List item still reaches the list mid-shop',
        await page.evaluate(() => window.__t.data().shoppingList.some(l => /kitchen roll/i.test(l.ingredientName))));
     ok('without ending the trip', await trip() === liveTrip, { was: liveTrip, now: await trip() });
@@ -933,6 +969,8 @@ async function suiteLiveListNotWiped(browser) {
     await page.waitForTimeout(400);
     await page.click('#mainNav button[data-tab="review"]');
     await page.waitForTimeout(700);
+    ok('a finished shop offers the next list rather than starting one',
+       await clickButtonByText(page, 'Start a new shopping list from the current picks'));
     ok('and the next list is generated from the new picks',
        await page.evaluate(() => window.__t.data().shoppingList.length) > 0);
     ok('on a trip of its own', await trip() !== 'trip:replacement');
@@ -1500,6 +1538,8 @@ async function suitePruningSurvivesAddingARecipe(browser) {
 
     await page.click('#mainNav button[data-tab="review"]');
     await page.waitForTimeout(700);
+    ok('adding a recipe offers an update rather than taking one',
+       await clickButtonByText(page, 'Update the list'));
 
     const after = await readShopping(page);
     ok('the added recipe reached the list',
