@@ -213,6 +213,222 @@ control exists. Reading the docs finds nothing; enumerating every writer of `sho
 finds it in a minute. That is the method in "How to review this codebase" below, and this
 was its first unprompted success.
 
+### v23.5 — one flag, two lifetimes, and a fork nobody could see
+
+Reported from a shop: two phones, and the items one shopper put in the trolley crossed off
+on the other's phone **only where a Wait List entry was behind them**. Recipe ingredients
+stayed unticked. The family's reading was that both phones were on the same trip and the
+same master list.
+
+The decisive fact is that `neededList` and `shoppingList` travel in the **same file**,
+written by the same save — so the data always arrived. The split is the merge, and only one
+rule in it treats the two collections differently: `shoppingList` is trip-scoped and a
+mismatched `tripId` makes `chooseTripWinner` discard one side wholesale, while `neededList`
+is authored data and merges regardless of the trip. A menu ingredient has one channel; a
+Wait List item has two. So the symptom is the exact fingerprint of two trip ids, and
+nothing else in the code can produce it.
+
+Two things were wrong, and they are worth separating.
+
+**`done` was one flag doing two jobs.** Ticking a line in the aisle and ticking an entry on
+the Wait List tab both set `done`, but the first is a tick (belongs to a trip) and the
+second is a decision (belongs to the week). The app already knew that distinction — *"a
+decision outlives its trip, a tick does not"*, v23.3 — and had simply never applied it to
+the Wait List. So a tick was stored on the one collection that outlives trips.
+
+- **Chosen: stamp the trip on the aisle route only** (`doneTripId`), and route every
+  reading of "is this done" through `doneCountsHere`. Additive field, absent on older
+  copies, which then behave exactly as they did.
+- **Rejected: make `neededList` follow the trip winner.** It would fix this symptom and
+  reintroduce the v23.0 bug the one rule exists to prevent — a Wait List addition made on
+  the losing phone would vanish. Which shopping *list* won says nothing about what somebody
+  added to the Wait List, for the same reason it says nothing about the recipe picks.
+- **Rejected: clear a foreign trip's `done` on this device.** It would write back, and two
+  phones would then fight over the flag. A `doneTripId` that matches nothing here simply
+  reads as not done, and self-corrects with no traffic.
+
+The severity was not the strikethrough. `finishShopping` deleted every `done` entry, so the
+shop ended by **binning Wait List items nobody had bought** — a silent data loss sitting
+behind a cosmetic-looking report. Worth remembering when triaging: the reported symptom was
+the harmless half.
+
+**Two identical-looking lists were two trips, and nothing said so.** Both phones opening the
+Review tab before either had read the folder is enough: `shoppingListIsStale()` is true
+whenever the list is empty (it is, right after "Shopping is done"), and the tab regenerated
+silently. `tripId` appears nowhere in the interface.
+
+- **Chosen: say it out loud.** `mergeReport` gets its own sentence for a replaced trip,
+  naming the ticks it cost and pointing at "Put back the list that was replaced". That undo
+  has existed since v21.8; what was missing was any reason to reach for it.
+- **Chosen: do not mint a trip before this device has read the folder** — but only when
+  there is no list on screen, because holding back a list somebody can already see would
+  replace it with a notice, and hiding what a person is reading is the failure this file
+  keeps circling.
+- **Rejected: offer a choice between the two lists.** v21.8 tried that and v21.9 removed
+  it. Asked to choose between two lists, nobody knew which was which. Waiting one poll is
+  not a choice, which is why this is not the same prompt coming back.
+
+A note on method, since "How to review this codebase" is about exactly this: the first
+diagnosis here was right about the mechanism and wrong to stop there. What settled it was
+driving the real extracted functions with both trip ids and watching the reported symptom
+appear on demand — same trip, everything crosses; different trips, only `done` does. The
+suite had 322 passing assertions over this merge and none of them asked that question.
+
+### v23.6 — a name, a tap, and an argument that ends
+
+v23.5 fixed what a fork did. This closes the fork itself, and does it by reversing two
+earlier decisions rather than fencing them again.
+
+**Reversed: the Review tab refreshing on entry.** *(v21.8)* The idea was that the list
+should reflect the current picks "rather than sitting behind a button nobody would think
+to press". It was fenced twice — v21.8 for a live trip, v23.5 for a device that had not
+read the folder — and the second fence is what gave it away. Two patches on one call are
+not a hardening, they are a signal that the call is wrong. Opening a tab is not asking for
+a list, and a list minted because somebody opened a tab is precisely how two phones came
+to hold a trip each. `generateShoppingList()` now has exactly one caller and a source test
+asserts it, because the rule is about *how many ways in there are*, which no runtime test
+can see.
+
+The cost is real and worth naming: **"grab shampoo too" no longer lands on the shopper's
+list by itself.** A Wait List addition made at home now shows the shopper a line saying
+there is something new and a one-tap update. That tap is safe by construction — a
+same-trip rebuild, so nothing in the trolley is lost — but it is a tap that did not used
+to exist, and it is the one thing in this release that a family might miss. It was chosen
+deliberately over keeping an automatic path for same-trip rebuilds only: a rule with an
+exception is how the auto-refresh survived two fences, and "nothing builds a list unless
+somebody asks" is a sentence anyone can hold in their head.
+
+A smaller thing found while writing it: the staleness card first said "the week's recipes
+have changed", which is untrue for the commonest cause. Most staleness is a Wait List
+addition or a staple amount. It now checks `lastGeneratedRecipeSignature` and says which.
+
+**Reversed: offering no choice between two lists.** *(v21.9)* v21.8 offered "Make a new
+list anyway" and v21.9 removed it, because "asked to choose between two lists, nobody knew
+which was which". That objection was correct, and it was about *labelling*, not about
+choice — so the fix is to make the two answerable rather than to keep hiding one:
+
+- The card describes each list by what is on it — when it was made, how much is ticked,
+  how much was pruned — reusing `replacedTripSummary` rather than asking anyone to tell
+  two identical things apart.
+- Whichever trip loses is stashed. `stashReplacedTrip` previously ran only when THIS
+  device's trip was replaced, so the phone that *won* saw nothing at all — which is the
+  side the original report came from and the reason nobody could connect the two halves.
+- Both buttons write. "Keep this one" used to drop the local stash and nothing else, which
+  settles nothing: the phone holding the other list goes on offering it every poll.
+  `keepThisList` mints a superseding trip, exactly as `putBackReplacedList` does. **A
+  decision that does not supersede is a pause, not a decision.**
+- `syncAlertState` gains a `conflict` kind, above everything but a failed write and on
+  every tab. v23.5 said this once in a status line, which scrolls away; being told once in
+  passing is not being told.
+
+**Rejected: holding both lists until somebody chooses.** Neither list discarded, the merge
+refused, both phones showing the choice. Stronger in principle, and it leaves a phone
+sitting on a stale list until a human acts — in a supermarket, with the other shopper
+already walking. `chooseTripWinner` still decides immediately so nobody is ever stuck, and
+the choice is offered on top of a working list rather than instead of one.
+
+**Rejected: the trip code in the shop toolbar.** Proposed there first, on the grounds that
+it is what two people would read to each other mid-shop. It belongs in Sync options next
+to the app version — the place you already go to compare two phones — and a code above a
+shopping list is clutter ninety-nine weeks in a hundred. The card does not use the code
+either: "made 18:42, 12 ticked" answers *which is which* and a hash does not.
+
+### v23.7 — the exception worth making, and what "the list" actually means
+
+Two follow-ups to v23.6, and they pull in opposite directions on purpose.
+
+**Put back one automatic rebuild — the only one that is safe by construction.** v23.6's
+rule was "nothing builds a list unless somebody asks", and the price was that a Wait List
+addition made at home no longer reached the person already in the aisle. That was the one
+automatic behaviour in the app that was doing real work.
+
+The distinction that makes this an exception rather than a relapse: the old auto-refresh
+could do *anything the button could*, including mint a trip on a phone that had not caught
+up. This can do exactly one thing. Four conditions must hold — stale, `sameTripRebuild()`,
+recipe signature unchanged, and a Wait List entry genuinely missing — and together they
+mean the rebuild **cannot mint a trip and cannot drop a tick**. That is a guarantee about
+what the code is able to do, not a promise about when it will run, which is what both
+earlier fences were and why both leaked.
+
+Deliberately not widened to staple amounts. A staple is edited by the person who then
+walks to the Review tab, so a tap costs them nothing, and every extra case is a step back
+towards "the tab rebuilds when it feels like it".
+
+A subtlety found writing it: **membership has to be checked by the entry's id, not its
+name.** A Wait List "milk" added while a recipe already needs Milk folds onto that existing
+line. A name check calls that satisfied — but until the line carries the entry's id,
+`syncNeededFromLine` cannot find the entry, so ticking it off in the aisle crosses nothing
+off and the two stay out of step for the whole shop.
+
+**Make the shared copy canonical — visibly.** Asked whether one version of the list could
+be canonical so that a stale one is obvious.
+
+- **Chosen: the folder copy is the list, and each phone holds a cache.** No data-model
+  change. It was already true; nothing on screen had ever said so, which is why "am I
+  looking at the list?" had no answer — the same gap the two-trip fork came through.
+- **Rejected: blessing a trip as canonical.** A new synced field, an answer needed for two
+  phones blessing at once, and it largely duplicates `supersedes`, which already expresses
+  "this replaces that" and is what `keepThisList` and `putBackReplacedList` write.
+
+Four ways to be wrong were scattered across three places — two cards on the Review tab, one
+in the sync banner, and "you are behind the shared copy" said *nowhere at all*.
+`listFreshness` ranks them into one strip. `behind` outranks everything, including a picks
+change, because rebuilding from a stale base is precisely the act that mints a rival trip:
+the most dangerous thing a person can do while behind is press the button that looks like
+the fix.
+
+Two details worth keeping:
+
+- The comparison is **mtime against mtime**. `shoppingSeenRemoteAt` is a stamp from inside
+  the file and is not comparable with a file's modified time; using it would have invented
+  staleness on every write.
+- `behind` waits out a 45-second grace. The 5s poll normally closes the gap, and a warning
+  every time the other shopper ticks something would be worse than saying nothing — the
+  banner would be permanently on during exactly the situation it exists for.
+
+### v23.8 — a threshold that could not be justified, and what that exposed
+
+Two corrections to v23.7's freshness strip, and the second is the interesting one.
+
+**Silence is the in-step state.** The strip always said something, including "In step with
+the family's list" when all was well. On a screen people stare at for 45 minutes, a
+permanent line of good news earns nothing and dilutes the one case that matters. It now
+renders only when something is wrong, and the two sync cases render in red against the
+amber the picks cases already used. Red is worth keeping rare.
+
+The `local` line went with it. A phone that shares with nobody is not out of step with
+anybody, and the sync banner's `unlinked` case already says so on every tab in the
+strongest terms the app has. Two places saying one thing is what the strip was written to
+end, so having it say that thing twice over was the feature eating itself.
+
+**A warning follows a failed attempt, never a missing one.** v23.7's `unchecked` case fired
+after four minutes without a successful read. Asked to justify that number — a supermarket
+has bad signal, would this be on for most of a shop? — the honest answer turned out not to
+be about the number at all.
+
+`pollShoppingNow` returns early on `document.hidden`. A phone in a pocket between aisles is
+not polling, so the clock kept running, and a phone with perfect signal in someone's pocket
+was indistinguishable from one that could not reach the folder. Worse:
+`visibilitychange` fires a poll on wake, but the strip renders before that poll completes,
+so the shopper got a flash of red **every time they picked their phone up**. No threshold
+fixes that; the signal was measuring the wrong thing.
+
+It now counts consecutive *failed* attempts, and requires elapsed time as well — the count
+rules out a single blip, the time rules out three fast retries inside one bad second. The
+call sites matter as much as the rule: only a non-200 and the `catch` in each poll count,
+never the guard returns above them, because those are the pocket.
+
+Worth recording as method rather than as a fix. **A question about a constant is often a
+question about the variable it is applied to.** The tuning question ("is four minutes
+right?") had no good answer because the quantity being thresholded was not the quantity
+anyone cared about. Two of the last four defects in this file have that shape:
+`effectiveAddedAt` measured a bound that moved, and this measured a silence that was not a
+failure. When a threshold cannot be defended, check what it is measuring before picking a
+new number.
+
+A smaller thing the rewrite caught: the old wording read "Not checked for 10 minutes ago."
+It had a passing test — which asserted the substring, not the sentence.
+
 ### What the arc actually cost
 
 Four structural sync changes in two days, two of them fixing something the previous one

@@ -80,7 +80,10 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProg
                'effectiveAddedAt', 'authoredHorizons', 'describeMerge', 'mergeReport',
                'lastAuthoredAt', 'noteRemoved', 'mergeTombstones', 'pruneTombstones',
                'backfillAuthoredStamps',
-               'syncAlertState', 'lastContactText'];
+               'syncAlertState', 'lastContactText',
+               'doneCountsHere', 'syncNeededFromLine',
+               'tripParts', 'tripCode', 'tripLabel', 'tripConflict', 'keepThisList',
+               'pendingWaitListLines', 'listFreshness', 'agoText'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -93,6 +96,10 @@ vm.runInContext(
   // still the real function out of index.html.
   'function persist(){}\n' +
   'function deviceId(){ return "test-device"; }\n' +
+  // v23.6: keepThisList decides, writes and then repaints. The deciding is the part worth
+  // testing; the repaint and the status line are the same kind of I/O as persist().
+  'function render(){}\n' +
+  'function setStatus(){}\n' +
   'let recipesData = { recipes: [], ingredients: [], settings: { features: {}, staples: [], stapleQty: {} } };\n' +
   extractConst('COUNT_UNITS') + '\n' +
   extractConst('MEASURE_ML') + '\n' +
@@ -109,6 +116,9 @@ vm.runInContext(
   extractConst('SHOPPING_UNIT_OPTIONS') + '\n' +
   extractConst('WAITLIST_FIELDS') + '\n' +
   extractConst('SYNC_UNLINKED_GRACE_MS') + '\n' +
+  extractConst('FRESHNESS_GRACE_MS') + '\n' +
+  extractConst('FRESHNESS_UNREACHABLE_MS') + '\n' +
+  extractConst('FRESHNESS_MIN_FAILURES') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
@@ -128,6 +138,10 @@ vm.runInContext(
   '             noteRemoved, mergeTombstones, pruneTombstones, lastAuthoredAt, TOMBSTONE_MAX_AGE_MS,' +
   '             backfillAuthoredStamps,' +
   '             syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,' +
+  '             doneCountsHere, syncNeededFromLine,' +
+  '             tripParts, tripCode, tripLabel, tripConflict, keepThisList,' +
+  '             pendingWaitListLines, listFreshness, agoText,' +
+  '             FRESHNESS_GRACE_MS, FRESHNESS_UNREACHABLE_MS, FRESHNESS_MIN_FAILURES,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -148,6 +162,10 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         noteRemoved, mergeTombstones, pruneTombstones, lastAuthoredAt, TOMBSTONE_MAX_AGE_MS,
         backfillAuthoredStamps,
         syncAlertState, lastContactText, SYNC_STALE_MS, SYNC_UNLINKED_GRACE_MS,
+        doneCountsHere, syncNeededFromLine,
+        tripParts, tripCode, tripLabel, tripConflict, keepThisList,
+        pendingWaitListLines, listFreshness, agoText,
+        FRESHNESS_GRACE_MS, FRESHNESS_UNREACHABLE_MS, FRESHNESS_MIN_FAILURES,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -1678,7 +1696,446 @@ group('v23.4 — the picker offers only units the app can work with');
      SHOPPING_UNIT_OPTIONS.every(o => typeof o.label === 'string' && o.label.trim().length > 0));
 }
 
+/* ================= v23.5: a tick on the Wait List is still a tick =================
+
+   The bug this group exists for, reported from a real shop: two phones, and the items
+   one shopper put in the trolley crossed off on the other's phone ONLY where a Wait List
+   entry was behind them. Recipe ingredients stayed unticked.
+
+   Both collections travel in the same file, so the data always arrived. The split is the
+   merge: shoppingList is trip-scoped and a mismatched tripId makes chooseTripWinner throw
+   one side's list away wholesale, while neededList is authored data and merges regardless
+   of the trip. `done` therefore crossed and `checked` did not. And because finishShopping
+   deleted every done entry, the shop then binned Wait List items nobody had bought.
+
+   The discarded ticks are deliberate and stay that way. What is fixed is that a `done`
+   set in the aisle now records the trip it belonged to, so a phone on another trip stops
+   treating somebody else's trolley as a decision about the week. */
+
+const waitItem = (o) => Object.assign(
+  { id: 'n1', text: 'Milk', done: false, addedAt: T(0) }, o || {});
+
+group('v23.5 — a done that came from the aisle knows which trip it came from');
+{
+  setShoppingData(listFor([], T(0), { tripId: 'trip:here' }));
+  ok('an entry nobody has ticked is not done',
+     doneCountsHere(waitItem()) === false);
+  ok('a Wait List decision counts — no trip, because it is about the week',
+     doneCountsHere(waitItem({ done: true })) === true);
+  ok('so does a copy from a build before v23.5, which stamped no trip',
+     doneCountsHere(waitItem({ done: true, changedAt: T(10) })) === true);
+  ok('a tick made on THIS trip counts',
+     doneCountsHere(waitItem({ done: true, doneTripId: 'trip:here' })) === true);
+  ok('a tick made on ANOTHER phone’s trip does not',
+     doneCountsHere(waitItem({ done: true, doneTripId: 'trip:elsewhere' })) === false);
+  ok('and the trip can be named explicitly rather than read off shoppingData',
+     doneCountsHere(waitItem({ done: true, doneTripId: 'trip:elsewhere' }),
+                    { weekPlan: { tripId: 'trip:elsewhere' } }) === true);
+}
+
+group('v23.5 — ticking a line in the aisle stamps the trip, unticking clears it');
+{
+  const sd = listFor([line('Milk', { neededIds: ['n1'] })], T(0), { tripId: 'trip:here' });
+  sd.neededList = [waitItem()];
+  setShoppingData(sd);
+  syncNeededFromLine(sd.shoppingList[0], true);
+  ok('the Wait List entry is done', sd.neededList[0].done === true);
+  ok('and carries the trip it was ticked on', sd.neededList[0].doneTripId === 'trip:here');
+  syncNeededFromLine(sd.shoppingList[0], false);
+  ok('unticking clears the flag', sd.neededList[0].done === false);
+  ok('and the trip with it, so nothing stale is left behind',
+     Object.prototype.hasOwnProperty.call(sd.neededList[0], 'doneTripId') === false);
+
+  // A recipe-only line has no Wait List entry behind it and must not touch one.
+  const other = listFor([line('Rice')], T(0), { tripId: 'trip:here' });
+  other.neededList = [waitItem({ done: false })];
+  setShoppingData(other);
+  syncNeededFromLine(other.shoppingList[0], true);
+  ok('a line with no Wait List entry behind it changes nothing',
+     other.neededList[0].done === false);
+}
+
+group('v23.5 — the reported shop: two phones, two trips');
+{
+  // Phone 2 ticks Onions (recipe only) and Milk (a Wait List entry folded into the
+  // ingredient line) on ITS trip. Phone 1 is on a different one.
+  const mk = (trip) => {
+    const d = listFor([line('Onions'), line('Milk', { neededIds: ['n1'] })], T(0),
+                      { tripId: trip, basedOn: T(0) });
+    d.neededList = [waitItem()];
+    d.seenRemoteAt = T(0);
+    return d;
+  };
+  const mine = mk('trip:phone-1');
+  const theirs = mk('trip:phone-2');
+  theirs.shoppingList.forEach(l => { l.checked = true; l.checkedAt = T(9000); l.changedAt = T(9000); });
+  theirs.neededList[0] = waitItem({ done: true, changedAt: T(9000), doneTripId: 'trip:phone-2' });
+  mine.lastUpdated = T(9500);   // phone 1's copy is the newer file, and its trip wins
+  theirs.lastUpdated = T(9000);
+
+  const r = mergeShoppingData(mine, theirs);
+  ok('phone 1 keeps its own list, as chooseTripWinner intends',
+     tripIdOf(r) === 'trip:phone-1');
+  ok('the other trip’s ticks do not leak onto it — the rule this all rests on',
+     r.shoppingList.every(l => !l.checked));
+  // The bug: the same tick used to cross the Wait List entry off here anyway.
+  ok('the Wait List entry still carries the other phone’s done flag',
+     r.neededList[0].done === true);
+  setShoppingData(r);
+  ok('but it does NOT read as done on this phone',
+     doneCountsHere(r.neededList[0]) === false);
+  ok('and the trip it belonged to travelled with it',
+     r.neededList[0].doneTripId === 'trip:phone-2');
+}
+
+group('v23.5 — on ONE trip, both kinds of tick still cross as they always did');
+{
+  const mk = () => {
+    const d = listFor([line('Onions'), line('Milk', { neededIds: ['n1'] })], T(0),
+                      { tripId: 'trip:shared' });
+    d.neededList = [waitItem()];
+    d.seenRemoteAt = T(0);
+    return d;
+  };
+  const mine = mk(); mine.lastUpdated = T(1000);
+  const theirs = mk(); theirs.lastUpdated = T(9000);
+  theirs.shoppingList.forEach(l => { l.checked = true; l.checkedAt = T(9000); l.changedAt = T(9000); });
+  theirs.neededList[0] = waitItem({ done: true, changedAt: T(9000), doneTripId: 'trip:shared' });
+
+  const r = mergeShoppingData(mine, theirs);
+  ok('the recipe ingredient is ticked', byName(r, 'Onions').checked === true);
+  ok('the Wait List line is ticked', byName(r, 'Milk').checked === true);
+  setShoppingData(r);
+  ok('and the Wait List entry reads as done here', doneCountsHere(r.neededList[0]) === true);
+}
+
+group('v23.5 — a foreign trip’s tick does not keep an item off the next list');
+{
+  setRecipesData({
+    recipes: [{ id: 'r1', name: 'Curry', servings: 2,
+                ingredients: [{ ingredientName: 'Onions', quantity: '2', unit: 'qty' }] }],
+    ingredients: [{ name: 'Onions', aisle: 'Veg', shoppingCategory: 'Fresh', shoppingUnit: 'qty' },
+                  { name: 'Milk', aisle: 'Dairy', shoppingCategory: 'Dairy', shoppingUnit: 'mL' }],
+    settings: { features: { staples: false, pantryAtHome: false }, staples: [], stapleQty: {} }
+  });
+  const sd = listFor([], T(0), { tripId: 'trip:here', selections: [{ recipeId: 'r1', servings: 2 }] });
+  sd.neededList = [waitItem({ done: true, changedAt: T(9000), doneTripId: 'trip:elsewhere' })];
+  setShoppingData(sd);
+  generateShoppingList();
+  ok('the Wait List item is back on the list, unbought',
+     !!sandbox.api.currentLines().find(l => l.ingredientName === 'Milk'));
+  ok('and it is not ticked',
+     sandbox.api.currentLines().every(l => !l.checked));
+
+  // A decision — ticked on the Wait List tab, no trip — still keeps it off.
+  const sd2 = listFor([], T(0), { tripId: 'trip:here', selections: [{ recipeId: 'r1', servings: 2 }] });
+  sd2.neededList = [waitItem({ done: true, changedAt: T(9000) })];
+  setShoppingData(sd2);
+  generateShoppingList();
+  ok('a Wait List decision still keeps the item off',
+     !sandbox.api.currentLines().find(l => l.ingredientName === 'Milk'));
+  noStaples();
+}
+
+group('v23.5 — a replaced list says so, in its own words');
+{
+  const before = listFor([line('Onions', { checked: true, checkedAt: T(9000) })], T(9000),
+                         { tripId: 'trip:phone-1' });
+  const after  = listFor([line('Onions')], T(9500), { tripId: 'trip:phone-2' });
+  const d = describeMerge(before, after);
+  ok('the swap is noticed', d.tripReplaced === true);
+  ok('and the ticks it cost are counted', d.ticksLost === 1);
+  ok('it counts as a change even when nothing else moved', d.changed === true);
+  const line1 = mergeReport(d);
+  ok('the sentence does not pretend this is catching up',
+     line1.indexOf('Caught up') === -1, line1);
+  ok('it says another phone’s list replaced this one',
+     line1.indexOf('replaced the one on this device') !== -1, line1);
+  ok('it names the ticks that are not on it', line1.indexOf('1 item ticked off here') !== -1, line1);
+  ok('and points at the undo that already exists',
+     line1.indexOf('Put back the list that was replaced') !== -1, line1);
+
+  const same = describeMerge(before, listFor([line('Onions', { checked: true, checkedAt: T(9000) })],
+                                             T(9500), { tripId: 'trip:phone-1' }));
+  ok('an ordinary merge on one trip is not reported as a replacement',
+     same.tripReplaced === false && mergeReport(same) === null);
+}
+
+/* ================= v23.6: a name, a tap, and an argument that ends =================
+
+   v23.5 fixed the damage a fork did. These three close the fork itself: the trip has a
+   name two people can compare, nothing builds a list without somebody asking, and a
+   disagreement is raised on BOTH phones and settled by whichever one acts. */
+
+group('v23.6 — a trip id somebody can read out');
+{
+  const A = 'trip:2026-08-15T10:00:00.000Z:d-phone1';
+  const B = 'trip:2026-08-15T10:00:00.001Z:d-phone1';
+  ok('a code is four characters', tripCode(A).length === 4, tripCode(A));
+  ok('the same id always gives the same code', tripCode(A) === tripCode(A));
+  ok('a different trip gives a different code — one millisecond apart',
+     tripCode(A) !== tripCode(B), [tripCode(A), tripCode(B)]);
+  ok('no id at all still returns something printable', tripCode(null) === '----');
+  ok('the code is upper case and unambiguous to read out',
+     /^[0-9A-Z-]{4}$/.test(tripCode(A)), tripCode(A));
+
+  // The id embeds an ISO timestamp, which contains colons of its own.
+  ok('the device is what follows the LAST colon', tripParts(A).device === 'd-phone1');
+  ok('and the timestamp survives intact', tripParts(A).at === '2026-08-15T10:00:00.000Z');
+  ok('a pre-v21 gen: id has a time and no device',
+     tripParts('gen:2026-08-15T10:00:00.000Z').at === '2026-08-15T10:00:00.000Z'
+     && tripParts('gen:2026-08-15T10:00:00.000Z').device === null);
+  ok('and nothing at all is handled', tripParts(null).device === null);
+}
+
+group('v23.6 — the label says whose phone made the list');
+{
+  const sd = listFor([], T(0), { tripId: 'trip:2026-08-15T10:00:00.000Z:d-mine' });
+  const label = tripLabel(sd, 'd-mine');
+  ok('it leads with the code', label.indexOf('List ' + tripCode(tripIdOf(sd))) === 0, label);
+  ok('it says this phone when the device matches',
+     label.indexOf('on this phone') !== -1, label);
+  ok('and another phone when it does not',
+     tripLabel(sd, 'd-theirs').indexOf('on another phone') !== -1, tripLabel(sd, 'd-theirs'));
+  ok('a phone with no list says so rather than showing a code',
+     tripLabel(listFor([], T(0), { tripId: null, generatedAt: null }), 'd-mine')
+       .indexOf('No shopping list') === 0);
+  ok('a pre-v21 file gets a code and no phone claim',
+     tripLabel({ weekPlan: { generatedAt: '2026-08-15T10:00:00.000Z' } }, 'd-mine')
+       .indexOf('phone') === -1);
+}
+
+/* The card must never claim an outcome the merge did not reach, so tripConflict decides
+   by calling chooseTripWinner rather than by reasoning about it a second time. These
+   assert the agreement directly, across every case chooseTripWinner distinguishes. */
+group('v23.6 — a disagreement is named, and names the same winner the merge will');
+{
+  const trip = (id, o) => listFor((o && o.lines) || [line('milk')], (o && o.at) || T(0),
+    Object.assign({ tripId: id }, o && o.wp));
+  ok('one trip is not a disagreement',
+     tripConflict(trip('t1'), trip('t1')) === null);
+  ok('nor is a copy with no trip at all',
+     tripConflict(trip('t1'), listFor([], T(0), { tripId: null, generatedAt: null })) === null);
+
+  // 1. a deliberate replacement
+  {
+    const mine = trip('t1', { wp: { supersedes: 't2' }, at: T(100) });
+    const theirs = trip('t2', { at: T(200) });
+    const c = tripConflict(mine, theirs);
+    ok('superseding wins even from the older file', c.iWon === true);
+    ok('and the loser handed back is the other copy', c.loser === theirs);
+  }
+  // 2. work beats no work
+  {
+    const mine = trip('t1', { at: T(200) });
+    const theirs = trip('t2', { lines: [line('milk', { checked: true, checkedAt: T(150) })],
+                                at: T(100) });
+    const c = tripConflict(mine, theirs, BASE + 1000);
+    ok('a list somebody has worked on beats an untouched newer one', c.iWon === false);
+    ok('and this side is what would be lost', c.loser === mine);
+  }
+  // 3. neither worked on: the fresher basedOn
+  {
+    const mine = trip('t1', { wp: { basedOn: T(50) }, at: T(100) });
+    const theirs = trip('t2', { wp: { basedOn: T(10) }, at: T(200) });
+    ok('the device that had caught up wins', tripConflict(mine, theirs).iWon === true);
+  }
+  ok('both trip ids are reported so the caller can tell them apart',
+     tripConflict(trip('t1', { at: T(200) }), trip('t2')).mineTrip === 't1'
+     && tripConflict(trip('t1', { at: T(200) }), trip('t2')).theirsTrip === 't2');
+}
+
+group('v23.6 — keeping a list settles it, rather than pausing the argument');
+{
+  const mine = listFor([line('milk', { checked: true, checkedAt: T(100) })], T(200),
+                       { tripId: 'trip:mine', basedOn: T(0) });
+  setShoppingData(mine);
+  setReplacedTrip({ tripId: 'trip:theirs', ticks: 3, decisions: 3,
+                    weekPlan: { tripId: 'trip:theirs' }, shoppingList: [] });
+  keepThisList();
+  const after = sandbox.api.currentShopping();
+  ok('a new trip is minted', tripIdOf(after) !== 'trip:mine');
+  ok('and it names the list it replaces', after.weekPlan.supersedes === 'trip:theirs');
+  ok('the lines and their ticks are untouched',
+     after.shoppingList.length === 1 && after.shoppingList[0].checked === true);
+  ok('the stash is cleared', getReplacedTrip() === null);
+  // The point of minting rather than dismissing: it now WINS, so the other phone stops
+  // offering its copy on every poll.
+  const theirs = listFor([line('milk')], T(300), { tripId: 'trip:theirs', basedOn: T(0) });
+  const c = tripConflict(after, theirs);
+  ok('and it beats the other list outright, even from the older file', c.iWon === true);
+  setReplacedTrip(null);
+}
+
+/* A source assertion, not a behaviour one, and deliberately so: the rule is about how
+   many ways there are to reach generateShoppingList, which no runtime test can see. The
+   auto-refresh was added in v21.8 and fenced twice before it was removed; a third fence
+   would be somebody re-adding the call, and this is what notices. */
+group('v23.7 — exactly two things build a shopping list: a tap, and the Wait List');
+{
+  const calls = (html.match(/(?<!function )\bgenerateShoppingList\(\)/g) || []).length;
+  ok('generateShoppingList() is called from exactly two places', calls === 2, calls);
+  const btn = html.slice(html.indexOf('function generateNowButton('));
+  ok('one is the button\u2019s click handler',
+     btn.slice(0, btn.indexOf('\n}')).indexOf("addEventListener('click'") !== -1);
+  /* v23.7: and the other is the Wait List exception, fenced by all four conditions. A
+     third caller, or this one losing a guard, is the auto-refresh coming back. */
+  const exc = html.slice(html.indexOf('const arrivedFromWaitList'),
+                         html.indexOf('const noListYet'));
+  ok('the other is the Wait List exception', exc.indexOf('generateShoppingList()') !== -1);
+  ok('fenced by staleness, the same trip, and an unchanged recipe signature',
+     /listIsStale && keepsTicks && !recipesChanged/.test(exc));
+  ok('and by a Wait List entry actually being missing',
+     exc.indexOf('pendingWaitListLines(shoppingData)') !== -1);
+}
+
+group('v23.6 — the banner puts a disagreement above everything but a failed write');
+{
+  const base = { backend: 'onedrive', signedIn: true, startedAt: 0, now: 10 * 60 * 1000 };
+  const won = syncAlertState(Object.assign({}, base, { tripConflict: { iWon: true } }));
+  ok('it fires', won && won.kind === 'conflict');
+  ok('and says two phones disagree', won.head.indexOf('different shopping lists') !== -1, won.head);
+  ok('the winning side is told the other list is being dropped',
+     won.hint.indexOf('is being dropped') !== -1, won.hint);
+  const lost = syncAlertState(Object.assign({}, base, { tripConflict: { iWon: false } }));
+  ok('the losing side is told its own list went',
+     lost.hint.indexOf('has been replaced') !== -1, lost.hint);
+  ok('the action goes to the list, not the sync modal', lost.actionKind === 'review');
+
+  ok('a failed write still outranks it',
+     syncAlertState(Object.assign({}, base, {
+       tripConflict: { iWon: true }, lastWriteError: { status: 412, name: 'x' } })).kind === 'error');
+  ok('an unconnected phone is still told that first when there is no conflict',
+     syncAlertState(Object.assign({}, base, { backend: null })).kind === 'unlinked');
+  ok('and no conflict means the old cases are untouched',
+     syncAlertState(base) === null);
+}
+
+/* ================= v23.7: the one exception, and where this list stands ================= */
+
+group('v23.7 — a Wait List entry is "on the list" only when a line carries its id');
+{
+  setRecipesData({
+    recipes: [], settings: { features: {}, staples: [], stapleQty: {} },
+    ingredients: [{ name: 'Milk', aisle: 'Dairy', shoppingCategory: 'Dairy', shoppingUnit: 'mL' }]
+  });
+  const sd = (lines, needed) => Object.assign(listFor(lines, T(0), { tripId: 'trip:here' }),
+                                              { neededList: needed });
+
+  ok('an entry with no line at all is pending',
+     pendingWaitListLines(sd([], [waitItem({ text: 'Shampoo' })])).length === 1);
+  ok('an entry whose line carries its id is not',
+     pendingWaitListLines(sd([line('Milk', { neededIds: ['n1'] })], [waitItem()])).length === 0);
+  /* The case name-matching gets wrong: "milk" added to the Wait List while a recipe
+     already needs Milk. The line exists, so a name check calls it done — but until that
+     line carries the entry's id, ticking it off in the aisle crosses nothing off. */
+  ok('an entry folded onto an existing line is pending until that line carries its id',
+     pendingWaitListLines(sd([line('Milk', { neededIds: [] })], [waitItem()])).length === 1);
+  ok('an entry already done here is not pending',
+     pendingWaitListLines(sd([], [waitItem({ done: true })])).length === 0);
+  ok('but one ticked on ANOTHER phone’s trip is — that tick is not this list’s',
+     pendingWaitListLines(sd([], [waitItem({ done: true, doneTripId: 'trip:elsewhere' })])).length === 1);
+  ok('nothing at all is handled', pendingWaitListLines(null).length === 0);
+  noStaples();
+}
+
+group('v23.8 — the strip is silent unless something is wrong');
+{
+  const shared = { backend: 'onedrive', signedIn: true, lastCheckedAt: BASE, now: BASE };
+  const at = (o) => listFreshness(Object.assign({}, shared, o));
+
+  /* v23.7 always said something, including "in step". A permanent line above the trolley
+     on a screen people stare at for 45 minutes earns nothing when the news is good, and
+     it dilutes the cases that do. */
+  ok('a phone in step says nothing at all', at({}) === null);
+  ok('and a phone that shares with nobody says nothing here either — the banner has it',
+     listFreshness({ backend: null, now: BASE }) === null);
+  ok('nor a signed-out OneDrive phone',
+     listFreshness({ backend: 'onedrive', signedIn: false, now: BASE }) === null);
+
+  /* Being behind for a moment is normal — the 5s poll fixes it. Warning inside the grace
+     would cry wolf every time the other shopper ticked something. */
+  ok('a copy that has just fallen behind is not yet worth saying',
+     at({ behindSince: BASE - (FRESHNESS_GRACE_MS - 1000) }) === null);
+  const behind = at({ behindSince: BASE - 5 * 60 * 1000 });
+  ok('one that has stayed behind is', behind.kind === 'behind');
+  ok('it says plainly that this is not the family\u2019s list',
+     behind.head.indexOf('not the family\u2019s latest list') !== -1, behind.head);
+  ok('it warns that acting on it forks the list',
+     behind.hint.indexOf('second list') !== -1, behind.hint);
+  ok('and the button says what it does', behind.action === 'Catch up now');
+
+  /* Order matters: behind outranks everything, because rebuilding from a stale base is
+     the act that mints a rival trip. */
+  ok('behind outranks a picks change',
+     at({ behindSince: BASE - 5 * 60 * 1000, picksChanged: true, keepsTicks: true }).kind === 'behind');
+  ok('and outranks a frozen week',
+     at({ behindSince: BASE - 5 * 60 * 1000, picksChanged: true, shopLive: true }).kind === 'behind');
+
+  const frozen = at({ picksChanged: true, keepsTicks: false, shopLive: true });
+  ok('a live shop with changed recipes is frozen, not offered a rebuild', frozen.kind === 'frozen');
+  ok('and is given no button at all', !frozen.action);
+
+  const upd = at({ picksChanged: true, keepsTicks: true, recipesChanged: true });
+  ok('a same-trip picks change offers an update', upd.action === 'Update the list');
+  ok('and promises the ticks survive', upd.hint.indexOf('already ticked off') !== -1, upd.hint);
+  const fresh = at({ picksChanged: true, keepsTicks: false, recipesChanged: true });
+  ok('a new-trip one says it costs the ticks', fresh.action === 'Make a new list');
+  ok('and that the old list is recoverable', fresh.hint.indexOf('put back') !== -1, fresh.hint);
+  ok('a staple change is not reported as a recipe change',
+     at({ picksChanged: true, keepsTicks: true, recipesChanged: false }).head.indexOf('recipes') === -1);
+  ok('a picks change on an unshared phone is still worth saying — it is actionable here',
+     listFreshness({ backend: null, picksChanged: true, keepsTicks: true, now: BASE }).kind === 'picks');
+}
+
+/* v23.8. The v23.7 version of this counted time since the last SUCCESSFUL read, and
+   pollShoppingNow returns early while the screen is off — so a phone in a pocket between
+   aisles was indistinguishable from one that could not reach the folder, and flashed a
+   warning every time somebody picked it up. A warning follows a failed attempt, never a
+   missing one. */
+group('v23.8 — "cannot reach" counts failed attempts, not elapsed time');
+{
+  const stale = BASE - 10 * 60 * 1000;   // well past FRESHNESS_UNREACHABLE_MS
+  const at = (o) => listFreshness(Object.assign(
+    { backend: 'onedrive', signedIn: true, now: BASE }, o));
+
+  ok('a long silence with no failed attempt says nothing — the phone was in a pocket',
+     at({ lastCheckedAt: stale, checkFailures: 0 }) === null);
+  ok('nor does one failure', at({ lastCheckedAt: stale, checkFailures: 1 }) === null);
+  ok('nor two', at({ lastCheckedAt: stale, checkFailures: 2 }) === null);
+
+  const gone = at({ lastCheckedAt: stale, checkFailures: FRESHNESS_MIN_FAILURES });
+  ok('three failures and a real gap does', gone.kind === 'unreachable');
+  ok('it says what is actually wrong', gone.head.indexOf('reach the family') !== -1, gone.head);
+  ok('and both directions of the cost', gone.hint.indexOf('not on here') !== -1
+     && gone.hint.indexOf('reaching them') !== -1, gone.hint);
+  ok('with a button worth pressing', gone.action === 'Try again');
+
+  /* The other half of the pair: three failures inside one bad second is a blip, not an
+     outage. */
+  ok('three failures without a real gap is still a blip',
+     at({ lastCheckedAt: BASE - 1000, checkFailures: 5 }) === null);
+
+  ok('behind still outranks it',
+     at({ lastCheckedAt: stale, checkFailures: 5, behindSince: BASE - 5 * 60 * 1000 }).kind === 'behind');
+  ok('but it outranks a picks change',
+     at({ lastCheckedAt: stale, checkFailures: 5, picksChanged: true, keepsTicks: true }).kind === 'unreachable');
+  ok('and an unshared phone never reports it — there is nothing to reach',
+     listFreshness({ backend: null, lastCheckedAt: stale, checkFailures: 9, now: BASE }) === null);
+}
+
+group('v23.7 — the "how long ago" wording is coarse on purpose');
+{
+  ok('seconds read as just now', agoText(8000) === 'just now');
+  ok('so does anything inside the poll grace', agoText(44000) === 'just now');
+  ok('a minute is a minute', agoText(60 * 1000) === '1 minute ago');
+  ok('and plurals are respected', agoText(90 * 1000) === '2 minutes ago');
+  ok('hours', agoText(3 * 60 * 60 * 1000) === '3 hours ago');
+  ok('and days', agoText(72 * 60 * 60 * 1000) === '3 days ago');
+}
+
 /* ---------- result ---------- */
+
 
 console.log('\n' + '-'.repeat(48));
 if (fail) {

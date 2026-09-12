@@ -14,8 +14,8 @@ before proposing a feature or starting a review; read this one before changing c
 ## Commands
 
 ```
-npm test                # 322 logic assertions — no dependencies, no browser, ~1s
-npm run test:browser    # 203 browser assertions — needs playwright-core + Chromium
+npm test                # 433 logic assertions — no dependencies, no browser, ~1s
+npm run test:browser    # 210 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
@@ -56,6 +56,33 @@ Consequences:
 
 Each of these has a bug behind it.
 
+**A Wait List `done` set in the aisle is a TICK, and carries `doneTripId`.** `done` was one
+flag doing two jobs with different lifetimes: `syncNeededFromLine` writes it when somebody
+ticks a line in a shop ("it is in the trolley on this trip"), and the Wait List tab writes
+it when somebody decides they do not need the thing ("a statement about the week"). Nothing
+recorded which was which — and because `neededList` is authored data it merges
+trip-independently while `shoppingList` does not, the two came apart the moment two phones
+held different `tripId`s: one phone's aisle ticks were discarded wholesale with its list,
+while those same ticks crossed the Wait List entries off everywhere. The family sees the
+Wait List items struck through and the recipe ingredients untouched, which is exactly the
+bug as reported. `finishShopping` then deleted every `done` entry, so the shop ended by
+binning Wait List items nobody had bought. `doneCountsHere` is now the single reading of
+"is this done, here, now" — every display, the regeneration filter and the finish sweep go
+through it — and the aisle route stamps `doneTripId` while the Wait List tab deliberately
+does not. Absent means a decision, which is also what every build before v23.5 wrote.
+Do not read `n.done` directly. *(v23.5)*
+
+**A merge that swaps the trip is not "catching up".** `describeMerge` reports
+`tripReplaced` and `ticksLost`, and `mergeReport` gives that its own sentence pointing at
+"Put back the list that was replaced". Two lists generated from the same picks look
+identical and are two different trips; `chooseTripWinner` then discards one of them
+wholesale on every poll, and until v23.5 nothing on screen ever said so. The undo has
+existed since v21.8 — what was missing was any reason to reach for it. v23.6 adds the
+surface a status line could not be: `syncAlertState` returns a `conflict` kind, above
+every case but a failed write and on every tab, whose action goes to the Review tab rather
+than the sync modal. A line that scrolls away is not the same as being told. *(v23.5,
+v23.6)*
+
 **An ingredient's shopping unit must be settable, and `SHOPPING_UNIT_OPTIONS` is the whole
 vocabulary.** Until v23.4 nothing in the app could set `shoppingUnit`: every creation site
 wrote `''` and the master-list row offered name, category, aisle and delete — while the
@@ -89,7 +116,9 @@ pruning must not do that: people prune and then carry on planning. Stamped only,
 pantry default would count as a decision. Two functions on purpose; do not tidy them back
 into one. *(v23.3)*
 
-**A decision outlives its trip. A tick does not.** `checked` means "in the trolley" and
+**A decision outlives its trip. A tick does not.** This is the rule `doneTripId` exists to
+extend to the Wait List — see the v23.5 invariant above, which is what happens when a tick
+is stored on an authored collection. `checked` means "in the trolley" and
 belongs to the trip being shopped — v21.8's rule that last trip's ticks must not leak in
 still holds exactly. `removed` and `atHome` are statements about the week and the cupboard,
 still true whichever generation of the list is on screen. `generateShoppingList` carried
@@ -236,15 +265,85 @@ nothing to choose now. The Wait List is the way to add something mid-shop (a sam
 rebuild, so ticks survive), and "Shopping is done" is the way to free the picks again.
 Anything switched off must also LOOK switched off — see `.btn:disabled`. *(v21.9)*
 
-**Opening the Review tab must not rebuild a live list.** The auto-refresh on entry runs
-because somebody opened a tab, and a refresh that starts a new trip discards every tick
-on the current one — that is how a phone that had not caught up wiped a trolley
-mid-shop. `renderReviewTab` refreshes on its own only when the rebuild stays on the same
-trip (which carries ticks across) or there is no progress to lose; otherwise it leaves
-the list alone and says so. `sameTripRebuild()` is shared with `generateShoppingList` so
-the two can never disagree about what is about to happen. Since v21.9 froze the picks,
-reaching that state at all means another device changed them — an older build, or one
-that was offline — so the note explains and offers no button. *(v21.8, v21.9)*
+**Two things build a shopping list: a tap, and a Wait List addition.**
+`generateShoppingList()` has exactly two callers and a source test asserts the count and
+the guards. The Review tab used to rebuild on entry; that was fenced in v21.8 for a live
+trip and again in v23.5 for a device that had not read the folder, and both fences were
+patches on the same mistake — opening a tab is not asking for a list, and a list minted
+because somebody opened a tab is how two phones ended up holding a trip each for what
+everyone thought was one shop. v23.6 removed it; v23.7 put back the single case that is
+safe by CONSTRUCTION rather than by a fence. All four conditions must hold:
+`shoppingListIsStale()`, `sameTripRebuild()` (so the trip and every tick survive, and a
+finished shop is not quietly restarted), an unchanged recipe signature, and
+`pendingWaitListLines()` non-empty. Together they mean this rebuild cannot mint a trip and
+cannot drop a tick — where the old auto-refresh could do anything the button could. Do not
+widen it: a staple amount is edited by the person who then walks to this tab. The tab
+otherwise says which state the list is in and what the button would cost, and says what
+arrived when the exception fires — something appearing under a shopper's thumb unexplained
+is the v21.5 failure in a different coat. *(v21.8, v21.9, v23.6, v23.7)*
+
+**A Wait List entry is "on the list" when a LINE CARRIES ITS ID, not when its name is
+there.** `pendingWaitListLines` checks `neededIds`. A Wait List "milk" added while a recipe
+already needs Milk folds onto that existing line, and until the line carries the entry's id
+`syncNeededFromLine` has nothing to look the entry up by — so ticking it off in the aisle
+crosses nothing off. A name check calls that case satisfied and leaves the two permanently
+out of step. *(v23.7)*
+
+**The shared file is the list; a phone holds a cache, and one strip says when that cache is
+wrong.** Ways to be wrong used to live in three places — two cards on the Review tab, one
+in the sync banner, and "you are behind the shared copy" nowhere at all — so nobody could
+look in one place and know. `listFreshness` ranks them: `behind`, `unreachable`, `frozen`,
+`picks`. `behind` outranks everything because rebuilding from a stale base is the act that
+mints a rival trip. It is pure, like `syncAlertState`, because the wording is the feature.
+The comparison is **mtime against mtime** — `shoppingRemoteModifiedLatest` (what a metadata
+poll saw) against `shoppingRemoteModifiedSeen` (what was merged). `shoppingSeenRemoteAt` is
+a stamp from INSIDE the file and mixing the two invents staleness that is not there.
+`behind` waits out `FRESHNESS_GRACE_MS` because the 5s poll normally fixes it and a warning
+on every tick the other shopper makes is noise. *(v23.7)*
+
+**Silence is the in-step state, and red means the two sync cases and nothing else.**
+`listFreshness` returns null when there is nothing wrong and `renderListFreshness` appends
+nothing — v23.7 kept a permanent line above the trolley saying "in step", which earns
+nothing on a screen people stare at for 45 minutes and dilutes the cases that matter. It
+also had a `local` line for a phone that shares with nobody; that phone is not out of step
+with anybody and `syncAlertState`'s `unlinked` already says it on every tab, so two places
+were saying one thing. `behind` and `unreachable` render as `.alert-card` (red — something
+is wrong with what you are looking at); `frozen` and `picks` stay `.notice-card` (amber —
+there is an update available). Keep red rare or it stops meaning anything. *(v23.8)*
+
+**A warning follows a FAILED attempt, never a missing one.** `unreachable` needs
+`FRESHNESS_MIN_FAILURES` consecutive failures from `noteRemoteCheckFailed` AND
+`FRESHNESS_UNREACHABLE_MS` since the last success — the count rules out a blip, the elapsed
+time rules out three fast retries in one bad second. v23.7 measured time since the last
+success alone, and `pollShoppingNow` returns early while the screen is off, so a phone in a
+pocket between aisles was indistinguishable from one that could not reach the folder and
+flashed red every time somebody picked it up. Only the two genuine read failures in each
+poll — a non-200 and the `catch` — may call `noteRemoteCheckFailed`; the guard returns
+above them (hidden tab, wrong tab, no account, a poll in flight) are not failures, and that
+distinction is the whole fix. *(v23.8)*
+
+**The card that offers a choice between two lists renders before anything that can return
+early.** An import lands on an empty list, which is the branch that returns — and the
+import is the single path where the undo most needs to be on screen. *(v23.6)*
+
+**Whichever trip loses is stashed, on both phones, and choosing is a WRITE.**
+`stashReplacedTrip` used to run only when THIS device's trip was the one replaced, so the
+winning phone had nothing to offer and nothing to say; `mergeRemoteShopping` now stashes
+the remote copy when this device wins, gated on the loser actually having work on it.
+`tripConflict` names the disagreement by calling `chooseTripWinner`, so the card can never
+claim an outcome the merge did not reach. Both buttons supersede: `putBackReplacedList`
+always did, and `keepThisList` is its mirror — "Keep this one" used to only drop the local
+stash, which settles nothing, because the phone holding the other list goes on offering it
+every poll until something supersedes it. A decision that does not supersede is a pause.
+*(v23.6)*
+
+**`tripCode` is a label, never an identifier.** Nothing parses it back, nothing stores it,
+and it is derived from the whole trip id so it changes exactly when the trip does. It
+exists because two lists built from the same picks are identical on screen and are
+different trips — the fork a family could not see, and a whole release went into
+explaining a symptom that four characters would have made obvious. Shown in Sync options
+beside the app version. `tripLabel` takes the device id as an argument rather than reaching
+for `deviceId()`, so it stays pure. *(v23.6)*
 
 **A device that cannot reach the folder has to say so, and the wording is the feature.**
 The sync banner covered a sync that *broke* and could not cover one that was never there:
@@ -383,7 +482,11 @@ for the app to have painted.
 
 ## Releasing
 
-1. Bump `APP_VERSION` — it shows in Settings and is how two phones get compared.
+1. Bump `APP_VERSION` **and `CACHE` in `sw.js`**. `APP_VERSION` shows in Settings and is
+   how two phones get compared; `CACHE` is what drops the previous build's precached
+   manifest and icons. `sw.js` has said "bump CACHE on every release" in a comment since
+   v21.2 and four releases went past it in one session, because this list only ever named
+   `APP_VERSION`. Two version strings, one step.
 2. Both suites green.
 3. Open a PR naming the rollback commit.
 4. Merge to `main`; GitHub Pages publishes it.
@@ -413,6 +516,13 @@ than working around it.
   keeps rather than loses, which is the side to err on. This replaces the two entries that
   used to sit here, which recorded that the picks and the Wait List were last-writer-wins;
   they no longer are.
+
+- **A phone on v23.4 or earlier still crosses its aisle ticks off everyone's Wait List.**
+  It writes no `doneTripId`, so a `done` that arrived from its trolley reads here as a
+  decision about the week and keeps the item off the next list. That is the pre-v23.5
+  behaviour, and it is the safe half of the bug: the item is left off rather than deleted,
+  because `finishShopping` on THIS device now sweeps only what `doneCountsHere` says is
+  this trip's. It self-corrects as devices update.
 
 - **A mixed fleet pollutes `lastCooked` for as long as it lasts.** A phone still on v21.9
   goes on stamping `lastCooked` when it generates a list, so on a household running both
