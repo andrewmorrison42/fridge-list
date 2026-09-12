@@ -85,6 +85,58 @@ every case but a failed write and on every tab, whose action goes to the Review 
 than the sync modal. A line that scrolls away is not the same as being told. *(v23.5,
 v23.6)*
 
+**There is one quantity system: `UNITS`, `parseAmount`, `convertAmount`, `snapMeasureQty`,
+`formatAmount`.** There were three, and all twelve of the review's quantity findings were
+seams between them — recipe entry here, shopping totals two thousand lines away with a
+thinner parser, and a third conversion inside `stapleQtyToShopping` that multiplied where
+`UNIT_ROLLUP` divided. `"1 1/2"` was summable in one and text in another; `"1/0"` was null
+in one and Infinity in the other; `kg` was defined twice in opposite directions; and a
+kitchen measure typed for a gram-shopped staple was dropped because the conversion lived in
+the mL branch only. **`per` in `UNITS` is always TO BASE**, read as a multiplier going down
+and a divisor coming back up, so the kilo factor exists once — a source test asserts that no
+conversion function contains a literal `1000`, because a second copy converts identically
+and would pass every behaviour test in the file. The canonical type is INTERNAL: the wire
+fields (`totalQty`, `unit`, `hasNumeric`; `quantity`, `displayQty`, `displayUnit`) are
+unchanged, because "never change the shape of synced JSON" outranks having a nicer type. Do
+not add a fourth parser, a second unit table, or an inline conversion. *(v24.1)*
+
+**A measured amount is snapped ONCE, and the label and the number come off the same value.**
+`snapMeasureQty` returns `{n, label}` together. There used to be three readings of one typed
+input — validation accepted within a tolerance, formatting labelled within the same
+tolerance against a wider table, and storage converted the RAW input — so `0.35` in a cup
+box was accepted, displayed for ever as "⅓", and shopped as 88 mL where the ⅓ it named is
+83. `validMeasureQty` and `formatMeasureQty` are gone rather than kept as wrappers: a dead
+duplicate of a rule is how the three readings started. `MEASURE_SNAP_TOLERANCE` is a TYPING
+allowance ("0.33" means a third), not a conversion allowance — 0.02 of a cup is 5 mL, which
+is the code accepting what the editor's own message forbids. `measureToShoppingQty` does not
+round: it stored whole millilitres into the recipe file, so ⅛ tsp was 1 against a basis of
+0.625. And `measuredEntry` is a separate function because the decision was welded to reading
+the form, which is why two bite cases for this were SILENT until it came out. *(v24.1)*
+
+**The 1 g = 1 mL rule is for kitchen measures only.** A teaspoon of something shopped in
+grams is what it was agreed for. `2 L` against a gram-shopped ingredient is still null,
+because two litres of flour is not two kilos and a wrong number is worse than a missing one
+— the suite has refused that conversion since v21.4 and caught v24.1's first attempt at
+generalising it. *(v21.4, v24.1)*
+
+**A line total is in the line's unit, and an amount that will not convert is TEXT.**
+`generateShoppingList` fixes the unit when it creates the line and every contributor now
+goes through `amountInUnit`; "1 kg" and "200 g" used to sum to 201 under a label saying g,
+and `rollUpQty` knows nothing about kg so the line never rolled either. What will not
+convert joins `textQtyParts` — not the total and not the bin. The total is then closed at
+six decimals: float addition is order-dependent, both orders render identically, and
+`applyMergedShopping` compares stringified copies, so the invisible tail reads as a change
+and repaints over whoever is typing. *(v24.1)*
+
+**One rendering policy, on both sides of the rollup threshold, and a count is a whole
+piece.** `formatAmount` is the only quantity renderer. `lineQtyText` used to pick between
+`fmtExactQty` and `fmtQty` by whether the amount had reached a kilo, so 999.456 g printed
+"999.46 g" and 1000.456 g printed "1.000456 kg", and 0.991 g printed "1 g" directly beneath
+a comment promising no rounding — `fmtQty` is deleted. A discrete unit ceilings, because a
+shopping list is a buying instruction and nobody can buy 4.5 eggs. A unit that was never set
+counts as counted; an UNKNOWN unit does not, because rounding "1.5 loaf" would be inventing
+a decision. *(v24.1)*
+
 **An ingredient's shopping unit must be settable, and `SHOPPING_UNIT_OPTIONS` is the whole
 vocabulary.** Until v23.4 nothing in the app could set `shoppingUnit`: every creation site
 wrote `''` and the master-list row offered name, category, aisle and delete — while the

@@ -612,6 +612,75 @@ choice was the fix; a clearer dialog would not have been.
 
 ---
 
+## Quantities: one type, three subsystems collapsed into it
+
+Written for v24.1, after the seven-pass review found twelve findings that were all the
+same thing: a quantity was a bare float with its unit carried alongside as a label.
+
+**There were three quantity systems, and every defect was a seam between two of them.**
+Recipe entry had `parseMeasureQty` and a measure table; shopping totals had `parseQty`,
+`fmtQty` and `UNIT_ROLLUP` two thousand lines away; staples had a third conversion inside
+`stapleQtyToShopping`. They disagreed about what a number is (`"1 1/2"` was summable in one
+and text in another), about what a unit is (`kg` was a divisor here and a multiplier there),
+and about which of the three readings of a typed amount was authoritative. Nobody built
+three on purpose; each was added beside the last because the last was somewhere else in the
+file. That is the whole lesson: **a second implementation of a rule is a defect that has not
+happened yet**, and in a single 1.3 MB file with no build step, distance is what lets one be
+written without noticing the other.
+
+**The canonical type is internal, and today's fields are its serialisation.** The obvious
+fix — an exact rational or fixed-point amount carried on the wire — is forbidden by "never
+change the shape of synced JSON", which is not negotiable while family phones run different
+builds. So `UNITS`, `parseAmount`, `convertAmount`, `snapMeasureQty` and `formatAmount` are
+the type, and `totalQty`/`unit`/`hasNumeric` and `quantity`/`displayQty`/`displayUnit` stay
+exactly as they were. Rejected: adding a `unit` object to each line, and storing amounts in
+a canonical base unit. Both are the same shape change the invariants exist to prevent.
+
+**Snapping once is what makes the label and the number agree.** The sharpest defect in the
+group was three readings of one input: validation accepted 0.35 cup as near ⅓, formatting
+labelled it ⅓, and storage converted the raw 0.35 — so a recipe read "⅓ cup" for ever while
+the list was built from 88 mL against the 83 its own label denoted. The fix is not a shared
+tolerance constant; it is that there is one number. `snapMeasureQty` returns the amount and
+its label together and everything downstream takes both, so "stores a number that disagrees
+with the label" is no longer expressible. That is the difference between correcting a defect
+and removing the room for it.
+
+**The tolerance is typing noise, not a conversion allowance.** 0.02 of a cup is 5 mL. The
+editor has always printed "Allowed: whole numbers and ⅛ ¼ ⅓ ½ ⅔ ¾", so anything wider than
+"0.33 means a third" was the code accepting what its own message forbids. 0.005.
+
+**The cross-base rule is narrower than the basis comment reads.** "1 g = 1 mL" applies to
+kitchen measures only. A teaspoon of something shopped in grams is the case it was agreed
+for and the approximation is harmless there; two litres of flour is not two kilos. The
+existing suite caught the first attempt at this, which was permissive enough to convert
+`2 L` to `2000 g` — a refusal that had been deliberate since v21.4 and was nearly lost to a
+tidy-up. When a generalisation makes an old test fail, the old test is the evidence.
+
+**A count is brought up to a whole piece.** `4.5` eggs is not a thing anybody can buy. A
+shopping list is a buying instruction, so `formatAmount` ceilings a discrete unit. An
+*unknown* unit is not treated as discrete: "1.5 loaf" is somebody's free text and rounding
+it would be inventing a decision rather than recording one.
+
+**An amount that will not convert joins the free text.** When a contributor cannot be
+expressed in the line's unit, it is not summed and it is not dropped — it goes to
+`textQtyParts`, the mechanism already there for "a splash". Wrong is worse than missing,
+because the shopper can see text and cannot see a bad total.
+
+**The total is closed at six decimals because the merge compares stringified copies.**
+Float addition is order-dependent, both orders render identically, and `applyMergedShopping`
+decides whether anything changed by comparing JSON — so an invisible tail reads as a change
+and triggers the repaint the v21.0/v21.5 invariant exists to prevent. A display fix would
+not have touched this; the number in the file had to change.
+
+**`measuredEntry` exists because the bite suite refused two cases.** Two of the five defects
+written for the entry-boundary step were SILENT: the decision they describe lived inside
+`collectIngredientRows`' form-reading loop, so the defect could be written back into
+`index.html` with the whole logic suite green. Extracting the decision from the DOM reading
+is what makes them bite. **A decision welded to I/O is a decision no cheap test can reach**,
+and the bite suite is the only thing in this project that says so out loud.
+
+---
+
 ## Honesty in the interface
 
 **A device that cannot reach the folder has to say so, and the wording is the feature.**

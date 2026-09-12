@@ -345,7 +345,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v24.0.1';
+const APP_VERSION = 'v24.1.0';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -3453,10 +3453,17 @@ function renameMasterIngredient(data, ing, newName){
    still kept as text — that part was never the bug. */
 function parseQty(q){ return parseAmount(q); }
 
-function fmtQty(n){
-  if(n === null) return '';
-  if(Math.abs(n - Math.round(n)) < 0.01) return String(Math.round(n));
-  return (Math.round(n*100)/100).toString();
+/* An amount in `from` expressed in `to`, where a blank contributing unit means "already
+   in the line's unit" — the same convention a bare number has always had in a staple
+   amount. null when the two cannot be reconciled, which is the caller's signal that this
+   amount is not summable into that line. */
+function amountInUnit(n, from, to){
+  const f = String(from == null ? '' : from).trim();
+  const t = String(to == null ? '' : to).trim();
+  if(!f || f === t) return n;
+  const kf = unitKey(f), kt = unitKey(t);
+  if(kf !== null && kf === kt) return n;
+  return convertAmount(n, f, t);
 }
 
 // Shopping-category walking order — matches the physical path through the shop,
@@ -3575,8 +3582,17 @@ function generateShoppingList(){
         shoppingCategory: (meta && meta.shoppingCategory) || 'Other',
         totalQty: 0, hasNumeric:false, textQtyParts: [], sources: [], neededIds: [], removed:false, checked:false, source:'recipe'
       };
+      /* v24.1 — P2-05: the line's unit is fixed when the line is created and every
+         contributor used to be added to the total whatever unit it was written in, so
+         "1 kg" from one recipe and "200 g" from another summed to 201 under a label
+         saying g — and rollUpQty knows nothing about kg, so the line never rolled
+         either. Convert into the line's unit; an amount that will not convert is not a
+         number for THIS line and joins the free text, which is the mechanism already
+         here for "a splash". Wrong is worse than missing: the shopper can see text. */
       const qn = parseQty(ing.quantity);
-      if(qn !== null){ lines[key].totalQty += qn * factor; lines[key].hasNumeric = true; }
+      const conv = qn === null ? null : amountInUnit(qn, ing.unit, lines[key].unit);
+      if(conv !== null){ lines[key].totalQty += conv * factor; lines[key].hasNumeric = true; }
+      else if(qn !== null){ lines[key].textQtyParts.push(String(ing.quantity) + (ing.unit ? ' ' + ing.unit : '')); }
       else if(ing.quantity){ lines[key].textQtyParts.push(String(ing.quantity)); }
       if(!lines[key].sources.includes(recipe.name)) lines[key].sources.push(recipe.name);
     });
@@ -3637,7 +3653,11 @@ function generateShoppingList(){
       const qty = stapleQtyFor(meta ? meta.name : name);
       if(lines[key]){
         lines[key].fromStaples = true;
-        if(qty !== null){ lines[key].totalQty += qty; lines[key].hasNumeric = true; }
+        // Same conversion as the recipe contributors: the staple amount is in the
+        // ingredient's shopping unit, which is normally the line's unit but is not when
+        // the line was created from a recipe line carrying free text.
+        const staple = qty === null ? null : amountInUnit(qty, (meta && meta.shoppingUnit) || '', lines[key].unit);
+        if(staple !== null){ lines[key].totalQty += staple; lines[key].hasNumeric = true; }
         return;
       }
       lines[key] = {
@@ -3656,6 +3676,15 @@ function generateShoppingList(){
   // lineMergeKey(line), which is content-based; this one is positional and changes
   // whenever the list is regenerated. Never use it to match lines across devices.
   arr.forEach((l,idx)=> l.key = 'line-' + idx);
+  /* v24.1 — P3-07: close the total at a fixed precision. Adding the same amounts in a
+     different order gives a different float — [100,200,50] scaled by 1/3 comes to
+     116.66666666666666 one way and ...64 the other — and both render as "116.67", so
+     nothing on screen shows it. totalQty travels in the synced file and
+     applyMergedShopping decides whether anything changed by comparing stringified
+     copies, so the invisible tail reads as a change and triggers the object-graph swap
+     and repaint the v21.0/v21.5 invariant exists to prevent. Six decimals is a
+     milligram; two devices now agree bit for bit. */
+  arr.forEach(l=>{ if(l.hasNumeric) l.totalQty = Math.round(l.totalQty * 1e6) / 1e6; });
   // Pantry-at-home (feature-gated): recipe-derived Pantry-category lines start in the
   // "at home" group — the usual case is you already have flour/oil/spices — with a
   // one-tap "Need it" to opt in. Wait List lines and staples are ALWAYS active: the
@@ -4689,26 +4718,51 @@ function rollUpQty(n, unit){
 }
 
 /* Exact decimal with trailing zeros trimmed. The toFixed only clears floating-point
-   noise from the division — a millionth of a kilo is a milligram — it is not a rounding
-   step at any scale a shopping list can see. fmtQty is NOT used here: it rounds to two
-   decimals, which would turn 1001 g into "1 kg". */
+   noise — a millionth of a kilo is a milligram — it is not a rounding step at any scale
+   a shopping list can see. This is now the only number formatter: v24.1 removed fmtQty,
+   which snapped anything within 0.01 of an integer and then rounded to two decimals, so
+   which of the two you got depended on whether the amount had reached a kilo. */
 function fmtExactQty(n){
   return Number(n.toFixed(6)).toString();
+}
+
+/* A unit whose amounts are whole pieces. A unit that was never set has always meant
+   counted here — see unitLabel — and COUNT_UNITS is the rest of the list. An unknown
+   unit is NOT assumed to be counted: "1.5 loaf" is somebody's free text and rounding it
+   up would be inventing a decision. */
+function isDiscreteUnit(unit){
+  const u = String(unit == null ? '' : unit).trim();
+  if(!u) return true;
+  const k = unitKey(u);
+  return !!(k && UNITS[k].discrete);
+}
+
+/* The one rendering of a quantity on the list.
+
+   v24.1: lineQtyText used to choose between two formatters by whether the amount
+   happened to be over a kilo — fmtExactQty above the rollup threshold, which prints
+   exactly, and fmtQty below it, which snapped anything within 0.01 of an integer and
+   then rounded to two decimals. So 999.456 g printed "999.46 g" while 1000.456 g
+   printed "1.000456 kg", and 0.991 g printed "1 g" directly under a comment promising
+   no rounding. One policy now, on both sides of the threshold.
+
+   A counted ingredient is brought UP to a whole piece. A shopping list is a buying
+   instruction and there is no way to buy 4.5 eggs: three eggs in a recipe serving four,
+   picked for six, is five eggs to put in the trolley. */
+function formatAmount(n, unit){
+  if(n === null || n === undefined || typeof n !== 'number' || !isFinite(n)) return '';
+  if(isDiscreteUnit(unit)) return String(Math.ceil(n - 1e-9));
+  const rolled = rollUpQty(n, unit);
+  if(rolled) return fmtExactQty(rolled.qty) + ' ' + rolled.unit;
+  const u = displayUnit(unit);
+  return fmtExactQty(n) + (u ? ' ' + u : '');
 }
 
 // The quantity column for one shopping line: the summed recipe amount, plus any
 // free-text amounts (staple quantities, non-numeric recipe quantities) after a "+".
 function lineQtyText(line){
   let t = '';
-  if(line.hasNumeric){
-    const rolled = rollUpQty(line.totalQty, line.unit);
-    if(rolled){
-      t = fmtExactQty(rolled.qty) + ' ' + rolled.unit;
-    } else {
-      const u = displayUnit(line.unit);
-      t = fmtQty(line.totalQty) + (u ? ' ' + u : '');
-    }
-  }
+  if(line.hasNumeric) t = formatAmount(line.totalQty, line.unit);
   if(line.textQtyParts && line.textQtyParts.length) t += (t ? ' + ' : '') + line.textQtyParts.join(', ');
   return t;
 }
@@ -5946,13 +6000,13 @@ function renderSettingsTab(){
            rather than silently keeping a number nobody typed. */
         const current = stapleQtyFor(name);
         const qtyIn = el('input',{type:'text', inputmode:'decimal',
-                                  value: current === null ? '' : fmtQty(current), placeholder:'qty',
+                                  value: current === null ? '' : fmtExactQty(current), placeholder:'qty',
                                   'aria-label':'Quantity of ' + name,
                                   style:'width:74px;flex:0 0 auto;text-align:center;'});
         const commit = ()=>{
           setStapleQty(name, qtyIn.value);
           const now = stapleQtyFor(name);
-          qtyIn.value = now === null ? '' : fmtQty(now);
+          qtyIn.value = now === null ? '' : fmtExactQty(now);
           persist('recipes');
         };
         qtyIn.addEventListener('blur', commit);

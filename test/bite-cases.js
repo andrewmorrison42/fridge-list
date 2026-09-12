@@ -180,6 +180,32 @@ module.exports = [
              '\' (e.g. 1 ½).\' };'
   },
   {
+    name: 'the list rounds again below the rollup threshold, so 0.991 g prints "1 g" ' +
+          'and 999.456 g prints "999.46" while 1000.456 g prints exactly',
+    find: '  return fmtExactQty(n) + (u ? \' \' + u : \'\');',
+    replace: '  const r = Math.abs(n - Math.round(n)) < 0.01 ? String(Math.round(n)) : ' +
+             '(Math.round(n*100)/100).toString();\n' +
+             '  return r + (u ? \' \' + u : \'\');'
+  },
+  {
+    name: 'a counted ingredient is rendered as a fraction again, so the list asks for ' +
+          '4.5 eggs',
+    find: '  if(isDiscreteUnit(unit)) return String(Math.ceil(n - 1e-9));',
+    replace: '  if(isDiscreteUnit(unit)) return fmtExactQty(n);'
+  },
+  {
+    name: 'contributors are summed whatever unit they were written in, so 1 kg and ' +
+          '200 g come to 201',
+    find: '      const conv = qn === null ? null : amountInUnit(qn, ing.unit, lines[key].unit);',
+    replace: '      const conv = qn;'
+  },
+  {
+    name: 'the line total is left as the float it happened to accumulate to, so two ' +
+          'devices adding the same amounts in different orders write different JSON',
+    find: '  arr.forEach(l=>{ if(l.hasNumeric) l.totalQty = Math.round(l.totalQty * 1e6) / 1e6; });\n',
+    replace: ''
+  },
+  {
     name: 'the staple path converts units itself again, so the measure table is reached ' +
           'from the mL branch only and "1 Cup" is matched case-sensitively',
     find: '  return convertAmount(n, m[2], unit);',

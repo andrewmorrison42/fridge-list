@@ -68,7 +68,8 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProg
                'chooseTripWinner', 'mergeFlag', 'flagStamp', 'mergeShoppingLine',
                'mergeShoppingData', 'lineMergeKey', 'selectionsSignature',
                'recipeSelectionsSignature', 'shoppingListIsStale',
-               'featureOn', 'stapleQtyFor', 'stapleQtyToShopping', 'parseQty', 'fmtQty',
+               'featureOn', 'stapleQtyFor', 'stapleQtyToShopping', 'parseQty',
+               'amountInUnit', 'isDiscreteUnit', 'formatAmount',
                'displayUnit', 'unitLabel', 'stapleUnitLabel', 'lineQtyText', 'findIngredientMeta', 'rollUpQty', 'fmtExactQty',
                'unitKey', 'isMeasure', 'measureNames', 'parseAmount', 'convertAmount',
                'parseMeasureQty', 'snapMeasureQty', 'allowedMeasureText', 'measureToShoppingQty',
@@ -140,7 +141,7 @@ vm.runInContext(
   '             unitLabel, stapleUnitLabel, SHOPPING_UNIT_OPTIONS, UNITS,' +
   '             unitKey, isMeasure, measureNames, parseAmount, convertAmount, rollUpQty,' +
   '             parseMeasureQty, snapMeasureQty, allowedMeasureText, measureToShoppingQty,' +
-  '             measuredEntry,' +
+  '             measuredEntry, amountInUnit, isDiscreteUnit, formatAmount,' +
   '             MEASURE_FRACTIONS, MEASURE_SNAP_TOLERANCE,' +
   '             kitchenMeasureCanon,' +
   '             tripProgress, tripDecisions, tripHasProgress, tripIsLive, tripIsWorkedOn,' +
@@ -172,7 +173,7 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         unitLabel, stapleUnitLabel, SHOPPING_UNIT_OPTIONS, UNITS,
         unitKey, isMeasure, measureNames, parseAmount, convertAmount, rollUpQty,
         parseMeasureQty, snapMeasureQty, allowedMeasureText, measureToShoppingQty,
-        measuredEntry,
+        measuredEntry, amountInUnit, isDiscreteUnit, formatAmount,
         MEASURE_FRACTIONS, MEASURE_SNAP_TOLERANCE,
         kitchenMeasureCanon,
         tripProgress, tripDecisions, tripHasProgress, tripIsLive, tripIsWorkedOn,
@@ -677,6 +678,132 @@ group('what a measured recipe line saves');
   ok('an unreadable amount is refused rather than saved as something',
      measuredEntry('Milk', 'a splash', 'cup', mlMeta).entry === undefined &&
      measuredEntry('Milk', '', 'cup', mlMeta).entry === undefined);
+}
+
+group('one rendering policy, on both sides of the rollup threshold');
+{
+  /* v24.1 — P3-04 and P2-19. lineQtyText used to pick its formatter by whether the
+     amount had reached a kilo: exact above, fmtQty below, which snapped anything within
+     0.01 of an integer and then rounded to two decimals. The comment above fmtExactQty
+     argued for exactness in one branch and said nothing about the other. */
+  ok('a value just under an integer is not snapped to it',
+     formatAmount(0.991, 'g') === '0.991 g' && formatAmount(0.995, 'g') === '0.995 g');
+  ok('a value below the threshold is not rounded to two decimals',
+     formatAmount(999.456, 'g') === '999.456 g');
+  ok('the policy does not change at the threshold',
+     formatAmount(999.456, 'g') === '999.456 g' &&
+     formatAmount(1000.456, 'g') === '1.000456 kg');
+  ok('the old exact cases are unchanged',
+     formatAmount(1001, 'g') === '1.001 kg' && formatAmount(1250, 'g') === '1.25 kg' &&
+     formatAmount(2125, 'mL') === '2.125 L' && formatAmount(1100, 'g') === '1.1 kg');
+
+  /* v24.1 — P3-05: a shopping list is a buying instruction. Three eggs in a recipe
+     serving four, picked for six, is 4.5 — and there is no way to buy 4.5 eggs. */
+  ok('a counted ingredient is brought up to a whole piece',
+     formatAmount(4.5, 'qty') === '5' && formatAmount(1.333, 'qty') === '2');
+  ok('...and an exact count is left alone',
+     formatAmount(3, 'qty') === '3' && formatAmount(6, 'qty') === '6');
+  ok('a unit that was never set counts as counted',
+     formatAmount(4.5, '') === '5' && isDiscreteUnit('') === true);
+  ok('a weight is never brought up to a whole piece',
+     formatAmount(4.5, 'g') === '4.5 g');
+  /* An unknown unit is somebody's free text; rounding it up would be inventing a
+     decision, so it is neither counted nor rolled. */
+  ok('an unknown unit is left exactly as it is',
+     isDiscreteUnit('loaf') === false && formatAmount(1.5, 'loaf') === '1.5 loaf');
+}
+
+group('a line total is in the line\'s unit');
+{
+  /* v24.1 — P2-05. The line's unit is fixed when the line is created and every
+     contributor was added to the total regardless of what unit it was written in. */
+  ok('a contributor in a larger unit converts',
+     amountInUnit(1, 'kg', 'g') === 1000 && amountInUnit(2, 'L', 'mL') === 2000);
+  ok('a blank contributing unit means the line\'s own unit',
+     amountInUnit(5, '', 'g') === 5 && amountInUnit(5, undefined, 'g') === 5);
+  ok('the same unit differently spelled is not a conversion',
+     amountInUnit(5, 'ml', 'mL') === 5 && amountInUnit(5, 'G', 'g') === 5);
+  ok('an unreconcilable unit is not summable',
+     amountInUnit(1, 'loaf', 'g') === null && amountInUnit(1, 'qty', 'g') === null);
+
+  const gramWorld = extra => {
+    setRecipesData({
+      recipes: [
+        { id:'r1', name:'A', servings:4, ingredients:[{ ingredientName:'Flour', quantity:'1', unit:'kg' }] },
+        { id:'r2', name:'B', servings:4, ingredients:[{ ingredientName:'Flour', quantity:'200', unit:'g' }] }
+      ].concat(extra || []),
+      ingredients: [{ name:'Flour', shoppingUnit:'g', aisle:'Pantry', shoppingCategory:'Pantry' }],
+      settings: { features:{}, staples:[], stapleQty:{}, alwaysAtHome:[] }
+    });
+    setReplacedTrip(null);
+    setShoppingData({
+      weekPlan: { selections:[{ recipeId:'r1', servings:4, addedAt:T(0) },
+                              { recipeId:'r2', servings:4, addedAt:T(0) }] },
+      shoppingList: [], neededList: [], lastUpdated: T(0)
+    });
+    generateShoppingList();
+    return sandbox.api.currentLines().find(l => l.ingredientName === 'Flour');
+  };
+
+  {
+    const flour = gramWorld();
+    ok('a kilo and two hundred grams come to 1200 g, not 201',
+       flour.totalQty === 1200, flour.totalQty);
+    ok('...and the line then rolls up, which it could not do at 201',
+       lineQtyText(flour) === '1.2 kg', lineQtyText(flour));
+  }
+  {
+    const flour = gramWorld([{ id:'r3', name:'C', servings:4,
+                               ingredients:[{ ingredientName:'Flour', quantity:'1', unit:'loaf' }] }]);
+    // r3 is not picked, so this only proves the two-recipe case is unaffected by it.
+    ok('an unpicked recipe contributes nothing', flour.totalQty === 1200);
+  }
+
+  /* An amount that will not convert is not silently summed and not silently dropped:
+     it joins the free text, where the shopper can see it. Wrong is worse than missing. */
+  {
+    setRecipesData({
+      recipes: [{ id:'r1', name:'A', servings:4, ingredients:[
+        { ingredientName:'Flour', quantity:'200', unit:'g' },
+        { ingredientName:'Flour', quantity:'1', unit:'loaf' } ] }],
+      ingredients: [{ name:'Flour', shoppingUnit:'g', aisle:'Pantry', shoppingCategory:'Pantry' }],
+      settings: { features:{}, staples:[], stapleQty:{}, alwaysAtHome:[] }
+    });
+    setReplacedTrip(null);
+    setShoppingData({
+      weekPlan: { selections:[{ recipeId:'r1', servings:4, addedAt:T(0) }] },
+      shoppingList: [], neededList: [], lastUpdated: T(0)
+    });
+    generateShoppingList();
+    const flour = sandbox.api.currentLines().find(l => l.ingredientName === 'Flour');
+    ok('an incoherent amount is not added into the total', flour.totalQty === 200);
+    ok('...and is shown as text rather than dropped',
+       lineQtyText(flour) === '200 g + 1 loaf', lineQtyText(flour));
+  }
+
+  /* v24.1 — P3-07: the stored total is closed at a fixed precision, so two devices that
+     iterate the picks in different orders write the same JSON. Both orders render
+     identically either way, so nothing on screen would ever have shown this. */
+  {
+    const scaled = order => {
+      setRecipesData({
+        recipes: [100, 200, 50].map((q,i)=>({ id:'r'+i, name:'R'+i, servings:3,
+          ingredients:[{ ingredientName:'Flour', quantity:String(q), unit:'g' }] })),
+        ingredients: [{ name:'Flour', shoppingUnit:'g', aisle:'Pantry', shoppingCategory:'Pantry' }],
+        settings: { features:{}, staples:[], stapleQty:{}, alwaysAtHome:[] }
+      });
+      setReplacedTrip(null);
+      setShoppingData({
+        weekPlan: { selections: order.map(i=>({ recipeId:'r'+i, servings:1, addedAt:T(0) })) },
+        shoppingList: [], neededList: [], lastUpdated: T(0)
+      });
+      generateShoppingList();
+      return sandbox.api.currentLines().find(l => l.ingredientName === 'Flour').totalQty;
+    };
+    const fwd = scaled([0,1,2]), rev = scaled([2,1,0]);
+    ok('two devices summing in different orders store the same number',
+       JSON.stringify(fwd) === JSON.stringify(rev), [fwd, rev]);
+  }
 }
 
 group('staple amounts are numbers in the shopping unit');
