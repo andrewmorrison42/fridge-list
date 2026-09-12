@@ -6,7 +6,8 @@
   "scripts": {
     "test": "node test/run-tests.js",
     "test:browser": "node test/browser-tests.js",
-    "test:all": "node test/run-tests.js && node test/browser-tests.js",
+    "test:bite": "node test/bite.js",
+    "test:all": "node test/run-tests.js && node test/bite.js && node test/browser-tests.js",
     "postinstall-browser": "playwright install chromium"
   },
   "devDependencies": {

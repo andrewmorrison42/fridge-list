@@ -15,13 +15,15 @@ before proposing a feature or starting a review; read this one before changing c
 
 ```
 npm test                # 485 logic assertions — no dependencies, no browser, ~1s
+npm run test:bite       # puts 9 shipped defects back; the suite must notice every one
 npm run test:browser    # 210 browser assertions — needs playwright-core + Chromium
 npm run test:all
 ```
 
-Both suites must pass before pushing. The logic suite is cheap enough to run
-constantly; run the browser suite before any commit that touches rendering, sync or
-the service worker.
+All three must pass before pushing. The logic suite is cheap enough to run constantly;
+run the browser suite before any commit that touches rendering, sync or the service
+worker. `test:bite` runs the logic suite nine times over, so it takes about ten seconds —
+run it before pushing, and whenever you have just written a test.
 
 ## Working in a 1.3 MB file
 
@@ -457,10 +459,24 @@ Tests **extract the real functions out of `index.html`** by brace-matching and r
 in a VM sandbox, rather than keeping a second copy that would drift. A rename fails
 loudly. Shared constants are pulled from the source the same way.
 
-**Verify a new test fails against the old code.** A test written for this session
-passed against the very bug it was meant to catch, because a button was matched by the
-wrong label and nothing was ever clicked. Checking out the previous version and running
-the suite takes a minute and is the only thing that proves a test bites.
+**Verify a new test fails against the old code — `npm run test:bite`.** A test written
+for one session passed against the very bug it was meant to catch, because a button was
+matched by the wrong label and nothing was ever clicked. In v23.9 it happened twice more:
+one hand-rolled revert was wrong, and one assertion passed vacuously on missing code. In
+v24.0, three guarantees the first sync-clock API was said to make turned out not to be
+guarantees — nothing stopped a call site naming the wrong event, so the reverts sailed
+through and the design looked safer than it was.
+
+`test/bite-cases.js` is the list of defects this project has shipped, each expressed as
+the smallest edit to `index.html` that brings it back; `test/bite.js` applies them one at
+a time and reports any the suite fails to notice. It is the only check here whose passing
+result is a FAILURE of the code under test, so it reads back-to-front on purpose.
+
+**Every release adds a case for anything it claims to make impossible.** That claim is the
+part most likely to be wrong — it was wrong twice in two releases, and only reverting
+caught it both times. A case that does not bite means the test is agreeing with the code
+rather than checking it: fix the test, never the case. A case that no longer matches the
+source is reported STALE rather than skipped; re-point it and confirm it still bites.
 
 **Green is not evidence about the world.** Both v23.2 defects sat under assertions that
 passed — `effectiveAddedAt` and the merge grace window were among the best covered things
@@ -489,10 +505,15 @@ for the app to have painted.
    manifest and icons. `sw.js` has said "bump CACHE on every release" in a comment since
    v21.2 and four releases went past it in one session, because this list only ever named
    `APP_VERSION`. Two version strings, one step.
-2. Both suites green.
-3. Open a PR naming the rollback commit.
-4. Merge to `main`; GitHub Pages publishes it.
-5. If the release settled a question — chose between approaches, rejected a feature,
+2. All three green: `npm test`, `npm run test:bite`, `npm run test:browser`.
+3. **Every behaviour this release claims to make impossible has a case in
+   `test/bite-cases.js`, and it bites.** "This bug cannot happen now" is the claim most
+   likely to be wrong — v23.9 and v24.0 each shipped a structural fix that was less
+   structural than advertised, and both times a by-hand revert was the only thing that
+   noticed. A claim with no case behind it is a comment.
+4. Open a PR naming the rollback commit.
+5. Merge to `main`; GitHub Pages publishes it.
+6. If the release settled a question — chose between approaches, rejected a feature,
    reversed an earlier decision — add it to `docs/DECISIONS.md`. An invariant here says
    what must hold; that file says why, which is what stops the same idea being rebuilt.
    Two features were built and removed inside one week for want of this.

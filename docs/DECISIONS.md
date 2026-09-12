@@ -486,6 +486,31 @@ With that shape all nine reverts bite. An API where the caller reports a fact is
 one where the caller reports a judgement, and "I could not write the bug against this" is
 worth more than any number of assertions about the bug itself.
 
+**Awkward to write wrong is the ceiling, and that is accepted.** The clock cannot stop a
+call site naming the wrong event — `merged()` where `answered()` belongs is still typable,
+it just needs a copy nobody has to hand. Asked whether to push for a design where the call
+site cannot be wrong at all, the answer was that awkward is strong enough. It is worth
+saying why, because the temptation will come back: the remaining gap is a reviewer-visible
+mistake in a named function, not an invisible one spread over twelve call sites, and the
+difference between "impossible" and "conspicuous" here costs more machinery than it buys.
+Do not add a type-tagging scheme or a runtime assertion to close it.
+
+**The write path keeps its loose variables, for now.** `lastWriteError` is set at nine
+sites and `recipesETag` at four, which is the same shape as the two facts this release gave
+owners. It was left deliberately rather than missed: nothing has gone wrong there yet, and
+a third chokepoint added on symmetry alone is a refactor looking for a defect. If a write-
+path bug arrives, this is the first place to look and the answer is already written down.
+
+**And the bite check stops being something somebody remembers to do.** It caught both
+overstated structural claims, and both times only because it happened to be run by hand.
+`test/bite-cases.js` now holds the defects this project has shipped, each as the smallest
+edit that brings it back; `npm run test:bite` puts them back one at a time and reports any
+the suite fails to notice. It is in `test:all` and in the release checklist, and the
+checklist asks for something specific: every behaviour a release claims to make impossible
+gets a case. The claim is the part most likely to be wrong — it was wrong in two releases
+running — so the claim is what gets tested. A case that does not bite means the test agrees
+with the code rather than checking it; fix the test, never the case.
+
 **And a criterion that had to be met rather than argued with.** The plan said `CLAUDE.md`
 must get *shorter* — if the invariants section grew, this was patches again. First pass:
 +29 lines. Second: +9, with the rule count unchanged at 41. Both times the honest reading
