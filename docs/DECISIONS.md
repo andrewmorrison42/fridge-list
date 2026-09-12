@@ -429,6 +429,73 @@ new number.
 A smaller thing the rewrite caught: the old wording read "Not checked for 10 minutes ago."
 It had a passing test — which asserted the substring, not the sentence.
 
+### v24.0 — the audit was right and the fixes were the wrong shape
+
+An audit against the invariants in `CLAUDE.md`, asked for because issues were "drifting in".
+It found nine defects. The first attempt (v23.9) fixed five of them **at five call sites**,
+and was reverted — not because the fixes were wrong, but because the shape was. Its own
+write-up called them "three clocks that were not what they claimed" and then fixed each
+clock separately, which is the exact move this file already warns about one section down:
+*each fix adjusted the guess; the one that ended it removed the guess.*
+
+**What actually generated them.** Two facts about the app lived as loose module variables
+that any call site could advance, with no owner and no way to be wrong loudly:
+
+- *how current is this device* — six variables, and of the twelve `graphFetch` call sites,
+  **three reported anything to them**;
+- *who replaced whom* — `replacedTrip` and a second variable beside it, kept in step by a
+  comment saying they had to be.
+
+Every finding was one instance. So was the v23.1 horizon regression, and the v23.8
+pocket-phone warning, which is how far back the pattern runs.
+
+**Looking at the shape found two more than hunting for instances had.**
+`stampOneDriveTimestamps` issued the *identical* folder request `pollOneDriveForChanges`
+makes, succeeded, and reported nothing — and it runs after every autosave. And
+`getOneDriveFileText` returned `null` for both "not there" and "did not come back", while
+`loadFromOneDriveOrSeed` read that null as an empty folder and PUT this device's whole local
+copy over the file: a transient 500 on the way in could overwrite the family's recipes. Two
+functions issuing one request and answering differently is the generator; neither would have
+turned up by looking for another wrong timestamp.
+
+**The fix is two owners, not a sixth rule.** `makeSyncClock()` and one `replacement`
+record. This is the third time this repo has made that move — `applyMergedShopping` ("one
+way in and out of `shoppingData`") and `mergeAuthored` ("one rule for every collection a
+person authors", replacing seven ad-hoc ones) — so it is a pattern the codebase already
+trusts rather than a new idea.
+
+**The part worth keeping: the first API did not work, and the bite check is what said so.**
+Its events were `read` / `holds` / `absent` / `failed`. Reverting each old defect against it,
+three did not fail a single assertion: nothing stopped a call site from *naming the wrong
+event* — calling `holds()` where it had only metadata, or `failed()` on a 404. The claim
+"these bugs are now unrepresentable" was false, and it was false in the direction that
+flatters the design.
+
+The reshape is the whole lesson. **Make the call site hand over evidence, not a
+conclusion:**
+
+- `answered(status, mtime)` — the call site passes the HTTP status and the clock decides
+  what it meant, so no function decides locally that a 404 means "cannot reach". One
+  decision, in one place, tested once.
+- `merged(mtime, remoteCopy)` — takes the **copy**, not a stamp. A function holding only
+  metadata has nothing to pass, so it cannot claim a copy it has not got.
+- `wrote(mtime)` — separate from `merged()`, because a write teaches this device nothing
+  about anybody else and its horizon must not move.
+
+With that shape all nine reverts bite. An API where the caller reports a fact is safer than
+one where the caller reports a judgement, and "I could not write the bug against this" is
+worth more than any number of assertions about the bug itself.
+
+**And a criterion that had to be met rather than argued with.** The plan said `CLAUDE.md`
+must get *shorter* — if the invariants section grew, this was patches again. First pass:
++29 lines. Second: +9, with the rule count unchanged at 41. Both times the honest reading
+was that improving three rules is not removing any, and the growth was design rationale
+sitting in the file that is supposed to hold rules rather than reasons. Two rules were then
+genuinely deleted, because the clock *enforces* what they used to ask a reader to remember:
+the guard returns cannot reach it, and the merge cannot touch the horizon. 41 rules → 39.
+A refactor that leaves the rule count where it found it has not removed a class of bug; it
+has renamed one.
+
 ### What the arc actually cost
 
 Four structural sync changes in two days, two of them fixing something the previous one

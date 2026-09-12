@@ -345,7 +345,7 @@ const GRAPH_SCOPES = ['Files.ReadWrite.All', 'User.Read'];
 
 // Bumped with every released build — shown in the header, startup status and Sync
 // options so any device can be checked at a glance for which build it's running.
-const APP_VERSION = 'v23.8';
+const APP_VERSION = 'v24.0';
 
 /* ---- v21 concurrent-shopping identity ----
    A stable per-device id, and a skew window for tick conflicts. Two phones in the
@@ -434,51 +434,120 @@ let oneDrivePollTimer = null;
 // reload share it so two merges can never interleave on shoppingData.
 let syncInFlight = false;
 let oneDriveLastModified = {}; // { 'recipes-data.json': isoString, 'shopping-list.json': isoString }
-/* v21.8: the newest shared shopping state this device has actually read. Not the
-   same as shoppingData.lastUpdated, which our own local saves move forward — this
-   only advances when we have genuinely seen someone else's copy, which is what
-   makes it a usable measure of how caught-up this device was. */
-let shoppingSeenRemoteAt = null;
+/* ================= v24.0: one owner for "how current is this device" =================
 
-/* ---- v23.7: is this phone looking at the family's list, or at a copy of it? ----
+   Six facts used to live here as bare module variables — the horizon, two mtimes, and
+   three derived counters — and any call site could move any of them. Between v21.8 and
+   v23.9 that produced the same bug five separate times, each one a different call site
+   advancing one field and not another:
 
-   The shared file is the list. Every phone holds a cache, and nothing on screen has ever
-   said whether that cache is current — so "am I looking at the list?" had no answer, which
-   is the same gap the two-trip fork came through.
+     - the merge adopted the OTHER side's horizon                            (v23.1)
+     - guard returns counted as failed reads, so a phone in a pocket
+       looked like a phone that could not reach the folder                   (v23.8)
+     - a successful write moved the folder's mtime past anything this
+       device had marked as seen, so it reported itself behind its own
+       write, for ever                                                       (v23.9 A)
+     - a 404 counted as "cannot reach" where the folder had answered         (v23.9 F)
+     - basedOn fell back to a local save clock, because the horizon was
+       reachable as a raw variable and lastUpdated was in scope beside it    (v23.9 B)
 
-   These are MODIFIED TIMES from the folder, compared against each other. shoppingSeenRemoteAt
-   is a stamp from INSIDE the file and is not comparable with a file's mtime: mixing the two
-   would invent staleness that is not there. */
-let shoppingRemoteModifiedSeen = null;    // mtime of the copy this device has merged
-let shoppingRemoteModifiedLatest = null;  // newest mtime any metadata poll has seen
-let shoppingBehindSince = null;           // ms when those two first disagreed
-let shoppingLastCheckedAt = null;         // ms of the last successful metadata read
-let shoppingCheckFailures = 0;            // consecutive FAILED metadata reads — see below
+   v23.9 fixed those five where they stood, which is why they came back in new places.
+   The fix is not a sixth rule. Call sites no longer choose WHICH FIELD TO MOVE; they say
+   WHAT HAPPENED, and this decides. The bugs above are then not fixed but unrepresentable:
 
-/* One place that moves all four, so a poll cannot advance one and forget another.
-   `checked` alone (no mtime) records that a read succeeded — which is what separates
-   "in step" from "this may not be the latest, nobody has managed to look". */
-function noteRemoteShoppingStamp(modified, merged){
-  shoppingLastCheckedAt = Date.now();
-  shoppingCheckFailures = 0;
-  if(modified) shoppingRemoteModifiedLatest = modified;
-  if(merged) shoppingRemoteModifiedSeen = merged;
-  const behind = !!(shoppingRemoteModifiedLatest
-                    && shoppingRemoteModifiedLatest !== shoppingRemoteModifiedSeen);
-  if(behind){ if(!shoppingBehindSince) shoppingBehindSince = Date.now(); }
-  else shoppingBehindSince = null;
+     answered(status, mtime)
+              a response came back. THE CALL SITE DOES NOT DECIDE WHAT IT MEANT — it hands
+              over the HTTP status and this maps it, so 404 cannot be counted as "cannot
+              reach the folder" in one function while another reads it as "not created
+              yet". That disagreement, one screen apart, was v23.9 F. A 200 with no mtime
+              is the file missing from a listing: contact, nothing newer out there.
+     merged(mtime, remoteCopy)
+              this device read somebody else's copy and now HOLDS it. Takes the copy
+              itself, not a stamp, so a function that has only metadata in hand cannot
+              reach for this by mistake — which is the v23.9 A regression made awkward to
+              write rather than merely forbidden in a comment.
+     wrote(mtime)
+              this device sent a copy and now holds it. Separate from merged() because a
+              write teaches this device NOTHING about anybody else: its horizon must not
+              move. Folding the two would be v23.9 B in a new place.
+     unreachable()
+              nothing came back at all — a throw. The guard returns above every call site
+              are not attempts and must never reach it.
+
+   merged() and wrote() both move `held` and `latest` TOGETHER, so being behind a copy you
+   are holding cannot be expressed. A write is not a way to fall behind yourself.
+
+   A factory rather than a singleton so the tests can build one, inject a clock and drive
+   event sequences. v23.9 had to asssert three of these by grepping the source, because the
+   state was module-global and the I/O async; they are ordinary behaviour assertions now.
+
+   The two kinds of time in here are NOT interchangeable, and keeping them apart is what
+   the two arguments to holds() are for. A file's mtime comes from the folder; the horizon
+   is a stamp from INSIDE the file. Comparing one to the other invents staleness that is
+   not there — and a local save clock is neither, which is what v23.9 B got wrong. */
+function makeSyncClock(nowFn){
+  const now = nowFn || (()=> Date.now());
+  let horizon = null;    // stamp from INSIDE the newest copy this device has read
+  let held = null;       // mtime of the shopping copy this device HAS
+  let latest = null;     // newest mtime any read has reported
+  let behindSince = null, contactAt = null, failures = 0;
+
+  // Derived, never set from outside: behind means the folder holds something newer than
+  // what this device has. One place computes it, so it cannot be half-updated.
+  const settle = ()=>{
+    if(latest && latest !== held){ if(!behindSince) behindSince = now(); }
+    else behindSince = null;
+  };
+  // Any answer from the folder is contact, including "it is not there".
+  const contact = ()=>{ contactAt = now(); failures = 0; };
+
+  // Only this knows how to hold something. Both public holders go through it, so they
+  // cannot drift apart the way the call sites they replaced did.
+  const take = mtime => {
+    held = mtime;
+    // Never let `latest` sit behind what we hold: that is the state this object exists
+    // to make impossible.
+    if(!latest || tsOf(mtime) >= tsOf(latest)) latest = mtime;
+  };
+
+  return {
+    answered(status, mtime){
+      if(status === 200){ contact(); if(mtime) latest = mtime; settle(); return; }
+      // The folder replied and the file is not there. An answer, not a silence.
+      if(status === 404){ contact(); settle(); return; }
+      failures++;
+    },
+
+    merged(mtime, remoteCopy){
+      contact();
+      if(mtime) take(mtime);
+      const stampInside = remoteCopy && remoteCopy.lastUpdated;
+      if(stampInside && tsOf(stampInside) > tsOf(horizon)) horizon = stampInside;
+      settle();
+    },
+
+    wrote(mtime){ contact(); if(mtime) take(mtime); settle(); },
+
+    unreachable(){ failures++; },
+
+    /* Startup, from the saved copy. Deliberately NOT a contact: reading localStorage is
+       not reaching the folder, and lastContactText's "never" must stay unflattered. */
+    restore(stampInside){ if(stampInside && tsOf(stampInside) > tsOf(horizon)) horizon = stampInside; },
+
+    /* The only way to read the horizon. There is no lastUpdated in this scope to fall
+       back to, which is what makes v23.9 B unrepresentable rather than merely fixed. */
+    horizon(){ return horizon || null; },
+
+    /* One bundle, so renderSyncAlert and freshnessNow stop keeping two hand-written lists
+       of the same facts in step. */
+    snapshot(){
+      return { seenRemoteAt: horizon, behindSince: behindSince,
+               lastCheckedAt: contactAt, checkFailures: failures };
+    }
+  };
 }
 
-/* v23.8: a poll that was ATTEMPTED and failed. The guard returns above every call site —
-   hidden tab, wrong tab, no account, a poll already in flight — are not failures and must
-   never come through here. That distinction is the whole point. v23.7 measured time since
-   the last success instead, and pollShoppingNow returns early while the screen is off, so
-   a phone in a pocket between aisles was indistinguishable from one that could not reach
-   the folder: it flashed a warning every time somebody picked their phone up. A warning
-   follows a failed attempt, never a missing one. */
-function noteRemoteCheckFailed(){
-  shoppingCheckFailures++;
-}
+const syncClock = makeSyncClock();
 let currentTab = 'recipes';
 let editingRecipeId = null; // null = not editing, 'new' = creating
 
@@ -739,7 +808,7 @@ function init(){
   shoppingData = lsS ? JSON.parse(lsS) : defaultShoppingData();
   backfillAuthoredStamps(shoppingData);   // freeze legacy creation times before anything saves
   // Pick the horizon back up from the saved copy — this is the point of persisting it.
-  shoppingSeenRemoteAt = shoppingData.seenRemoteAt || null;
+  syncClock.restore(shoppingData.seenRemoteAt);
   saveRecipesLocal();
   if(!lsS){ saveShoppingLocal(); }
   loadUiState(); // restore the tab/toggles before the first render
@@ -785,7 +854,7 @@ function saveShoppingLocal(){
      which is why every release since v21.8 had to invent another tiebreaker to guess
      around it. Additive: an older build ignores the field and is read as having seen
      nothing, which keeps its items rather than dropping them. */
-  shoppingData.seenRemoteAt = shoppingSeenRemoteAt || shoppingData.seenRemoteAt || null;
+  shoppingData.seenRemoteAt = syncClock.horizon() || shoppingData.seenRemoteAt || null;
   try{ localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData)); }
   catch(e){ storageBlockedReason = 'Could not save locally (' + ((e && e.message) || e) + ').'; setStatus(storageBlockedReason, 'warn'); }
 }
@@ -990,9 +1059,9 @@ function agoText(ms){
   return Math.round(hrs / 24) + ' days ago';
 }
 
-/* Pure. shoppingSeenRemoteAt advances only when a remote copy is actually read, so this
-   line cannot flatter a device that has never managed it. "never" is the word that makes
-   somebody stop. */
+/* Pure. The horizon advances only when a remote copy is actually read — syncClock.restore
+   at startup is deliberately not a contact — so this line cannot flatter a device that has
+   never managed it. "never" is the word that makes somebody stop. */
 function lastContactText(seenRemoteAt, now){
   const t = tsOf(seenRemoteAt);
   if(!t) return 'Last reached the family folder: never.';
@@ -1013,9 +1082,9 @@ function renderSyncAlert(){
     signedIn: !!msalAccount,
     lastWriteError: lastWriteError,
     pendingSince: syncPendingSince,
-    seenRemoteAt: shoppingSeenRemoteAt,
+    seenRemoteAt: syncClock.snapshot().seenRemoteAt,
     startedAt: appStartedAt,
-    tripConflict: tripDisagreement,
+    tripConflict: (replacement && replacement.argued) ? replacement : null,
     now: Date.now()
   });
   // A write failure is never silenced. Everything else can be put aside for the session:
@@ -1343,10 +1412,17 @@ async function resolveOrCreateFridgeListFolder(token){
   return createFridgeListFolder(token);
 }
 
+/* v24.0: absent and failed are different answers, and this used to return null for both.
+   loadFromOneDriveOrSeed reads that null as "not created yet" and PUTs this device's whole
+   local copy over the file — so a transient 500 or a throttle on the way in overwrote the
+   family's recipes with whatever this phone happened to hold. The same shape as the sync
+   clock's absent()/failed() split, on the two files the clock does not govern. */
 async function getOneDriveFileText(driveId, folderItemId, name, token){
   const res = await graphFetch('/drives/' + driveId + '/items/' + folderItemId + ':/' + encodeURIComponent(name) + ':/content', token);
-  if(res.status === 200) return res.text();
-  return null; // 404 = not created yet; anything else logged by caller
+  if(res.status === 200) return { text: await res.text() };
+  if(res.status === 404) return { absent: true };
+  console.warn('read failed', name, res.status);
+  return null;   // did not come back — the caller must NOT treat this as an empty folder
 }
 
 async function writeOneDriveFile(driveId, folderItemId, name, text){
@@ -1383,27 +1459,32 @@ async function loadFromOneDriveOrSeed(){
     // v21.5: only repaint if something actually came back different. Most opens change
     // nothing at all, and every one of those repaints used to be pure interruption.
     let changed = false;
-    const rText = await getOneDriveFileText(driveId, itemId, 'recipes-data.json', token);
-    if(rText){
+    const rRead = await getOneDriveFileText(driveId, itemId, 'recipes-data.json', token);
+    if(rRead && rRead.text){
       const before = JSON.stringify(recipesData);
-      const incoming = migrateIngredientsIfStale(JSON.parse(rText), window.__fmaSeedRecipes);
+      const incoming = migrateIngredientsIfStale(JSON.parse(rRead.text), window.__fmaSeedRecipes);
       if(JSON.stringify(incoming) !== before){
         recipesData = incoming;
         saveRecipesLocal();
         changed = true;
       }
-    } else {
+    } else if(rRead && rRead.absent){
       await writeOneDriveFile(driveId, itemId, 'recipes-data.json', JSON.stringify(recipesData));
     }
-    const sText = await getOneDriveFileText(driveId, itemId, 'shopping-list.json', token);
-    if(sText){
+    /* v24.0: through fetchRemoteShopping, like the poll and the write, so the shopping
+       file has one reader. This used to read the content by itself and then hand the merge
+       oneDriveLastModified['shopping-list.json'] — a mtime some OTHER request had recorded,
+       which at startup may be missing entirely and at any other time may be older than the
+       copy just downloaded. A second-hand fact about which copy you are holding is the
+       shape of every bug the clock exists to end. */
+    const remote = await fetchRemoteShopping(token);
+    if(remote && remote.data){
       // Merge rather than replace, so ticks made on this device while offline/only-local
       // survive reconnection instead of being wiped by the remote copy. applyMergedShopping
       // repaints by itself when the shopping data moved, so only a recipes change is
       // still owed one here.
-      // The folder poll has just restamped this file, so that mtime is what we merged.
-      mergeRemoteShopping(JSON.parse(sText), oneDriveLastModified['shopping-list.json']);
-    } else {
+      mergeRemoteShopping(remote.data, remote.modified);
+    } else if(remote && remote.absent){
       await writeOneDriveFile(driveId, itemId, 'shopping-list.json', JSON.stringify(shoppingData));
     }
     if(changed) repaintWhenSafe();
@@ -1538,21 +1619,37 @@ function stopOneDrivePolling(){
   stopShoppingFastPoll();
 }
 
+/* v24.0: the folder's file listing, and the ONE place that says what that request meant.
+
+   stampOneDriveTimestamps and pollOneDriveForChanges used to issue this identical request
+   and answer differently about what had just happened: the poll reported to the freshness
+   state, the stamp reported nothing at all — and the stamp runs at poll startup and after
+   EVERY autosave. A successful read of the family folder that left "when did this phone
+   last manage it" untouched. Two functions, one request, two answers is how that class of
+   bug is made; one reader with two policies on top is how it stops. */
+async function fetchFolderListing(token){
+  if(!oneDriveFolderRef) return null;
+  const { driveId, itemId } = oneDriveFolderRef;
+  try{
+    const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + '/children?$select=name,lastModifiedDateTime', token);
+    if(res.status !== 200){ syncClock.answered(res.status, null); return null; }
+    const j = await res.json();
+    const items = (j.value || []).filter(i=>
+      i.name === 'recipes-data.json' || i.name === 'shopping-list.json');
+    const shopping = items.find(i=> i.name === 'shopping-list.json');
+    // A 200 whose listing has no shopping-list.json is the file not existing yet: the
+    // folder answered, and there is nothing newer out there. The clock reads a missing
+    // mtime that way, so this does not need a branch of its own.
+    syncClock.answered(200, shopping && shopping.lastModifiedDateTime);
+    return items;
+  }catch(e){ syncClock.unreachable(); console.warn('folder listing failed', e); return null; }
+}
+
 async function stampOneDriveTimestamps(){
-  if(!oneDriveFolderRef) return;
   const token = await getGraphToken();
   if(!token) return;
-  try{
-    const { driveId, itemId } = oneDriveFolderRef;
-    const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + '/children?$select=name,lastModifiedDateTime', token);
-    if(res.status !== 200) return;
-    const j = await res.json();
-    (j.value || []).forEach(item => {
-      if(item.name === 'recipes-data.json' || item.name === 'shopping-list.json'){
-        oneDriveLastModified[item.name] = item.lastModifiedDateTime;
-      }
-    });
-  }catch(e){ /* best-effort; a missed stamp just means one extra poll-triggered pull later */ }
+  const items = await fetchFolderListing(token);
+  (items || []).forEach(i=>{ oneDriveLastModified[i.name] = i.lastModifiedDateTime; });
 }
 
 async function pollOneDriveForChanges(){
@@ -1569,24 +1666,20 @@ async function pollOneDriveForChanges(){
   try{
     const token = await getGraphToken();
     if(!token) return;
-    const { driveId, itemId } = oneDriveFolderRef;
-    const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + '/children?$select=name,lastModifiedDateTime', token);
-    if(res.status !== 200){ noteRemoteCheckFailed(); return; }
-    const j = await res.json();
+    // fetchFolderListing owns the request and the reporting; this owns only the policy.
+    const items = await fetchFolderListing(token);
+    if(!items) return;
     let changed = false;
-    (j.value || []).forEach(item => {
-      if(item.name === 'recipes-data.json' || item.name === 'shopping-list.json'){
-        const prev = oneDriveLastModified[item.name];
-        if(prev && prev !== item.lastModifiedDateTime) changed = true;
-        oneDriveLastModified[item.name] = item.lastModifiedDateTime;
-        if(item.name === 'shopping-list.json') noteRemoteShoppingStamp(item.lastModifiedDateTime, null);
-      }
+    items.forEach(item => {
+      const prev = oneDriveLastModified[item.name];
+      if(prev && prev !== item.lastModifiedDateTime) changed = true;
+      oneDriveLastModified[item.name] = item.lastModifiedDateTime;
     });
     if(changed){
       await loadFromOneDriveOrSeed();
       setStatus('Updated from OneDrive — ' + new Date().toLocaleTimeString(), 'ok');
     }
-  }catch(e){ noteRemoteCheckFailed(); console.warn('OneDrive poll failed', e); }
+  }catch(e){ console.warn('OneDrive poll failed', e); }
   finally{ syncInFlight = false; }
 }
 
@@ -2264,60 +2357,85 @@ function mergeReport(d){
 }
 
 function mergeRemoteShopping(remote, modifiedAt){
-  /* Reading a copy written at T proves this device has now seen the shared state up to T.
-     Work the new horizon out first, merge without touching the inputs, then stamp it onto
-     the result — rather than mutating shoppingData on the way into an otherwise pure
-     merge, which is what let the value be overwritten by the other side's. */
-  const advanced = (remote && remote.lastUpdated && tsOf(remote.lastUpdated) > tsOf(shoppingSeenRemoteAt))
-    ? remote.lastUpdated : shoppingSeenRemoteAt;
+  /* Reading a copy written at T proves this device has now seen the shared state up to T,
+     and holding it proves it is not behind that copy. One event says both, so the horizon
+     can no longer be advanced without the mtime or the other way round. The clock is told
+     BEFORE the merge and read back after, rather than mutating shoppingData on the way
+     into an otherwise pure merge — which is what let the value be overwritten by the
+     other side's in v23.1. modifiedAt is absent on the folder backend, which has no
+     mtimes; the horizon still advances and the contact is still recorded. */
+  syncClock.merged(modifiedAt, remote);
   // Stamp the incoming copy's legacy items against ITS lastUpdated, not ours — the bound
   // has to come from the file the item actually arrived in.
   backfillAuthoredStamps(remote);
-  /* v23.6: before merging, while both copies still exist, work out whether this is a
-     disagreement and keep whichever list is about to be thrown away. applyMergedShopping
-     already stashes when THIS device's trip is the one being replaced; when it WINS, the
-     copy about to be discarded is the remote one and until now nothing kept it, so the
-     winning phone had nothing to offer and nothing to say. Gated on the loser actually
-     having work on it: a fork where neither side has done anything self-heals in silence
-     and is not worth interrupting a shop for. */
+  /* v23.6: before merging, while both copies still exist, keep whichever list is about to
+     be thrown away — including the REMOTE one when this device wins, which until v23.6
+     nothing kept, so the winning phone had nothing to offer and nothing to say. Gated on
+     the loser actually having work on it: a fork where neither side has done anything
+     self-heals in silence and is not worth interrupting a shop for.
+
+     v24.0: BOTH outcomes are recorded here, in one place, with the two facts the rest of
+     the app needs stated rather than inferred from a second variable. */
   const conflict = tripConflict(shoppingData, remote);
   if(conflict && tripHasProgress(conflict.loser)){
-    tripDisagreement = { iWon: conflict.iWon, at: new Date().toISOString() };
-    if(conflict.iWon) stashReplacedTrip(remote);
-  } else if(!conflict){
-    tripDisagreement = null;
+    stashReplacedTrip(conflict.loser, {
+      argued: true,
+      iWon: conflict.iWon,
+      /* Does keeping the list on screen still need a WRITE? Only if another phone is
+         holding the loser and will go on offering it every poll. That is true when this
+         device won; when it loses it adopts the winner outright, and there is then
+         nothing out there to outrank. */
+      rival: conflict.iWon
+    });
+  } else if(!conflict && replacement && replacement.argued){
+    /* The fork is over — somebody chose, or the other phone caught up. The stash STAYS:
+       it is the undo, and the undo is kept until this page closes. What ends is the
+       argument, so the banner stops. Two lifetimes on one record, which is what the two
+       variables this replaced could never keep straight. */
+    replacement.argued = false;
+    replacement.rival = false;
   }
   const merged = mergeShoppingData(shoppingData, remote);
-  shoppingSeenRemoteAt = advanced;
-  if(merged) merged.seenRemoteAt = advanced || null;
+  if(merged) merged.seenRemoteAt = syncClock.horizon();
   const what = describeMerge(shoppingData, merged);
   const applied = applyMergedShopping(merged);
-  /* v23.7: this copy is now merged, so the folder's mtime for it is what this phone is
-     caught up to. One chokepoint rather than three call sites, for the same reason
-     seenRemoteAt is owned here. */
-  if(modifiedAt) noteRemoteShoppingStamp(modifiedAt, modifiedAt);
   // Only speak when the merge actually moved something, and only after it landed.
   if(applied){ const line = mergeReport(what); if(line) setStatus(line, 'ok'); }
   return applied;
 }
 
-/* v21.8: the list someone was shopping from, kept aside when something replaced it.
-   A trip being superseded is a destructive act — it discards ticks that a person
-   walked round a shop to make — and this app's rule is that destructive acts are
-   recoverable rather than merely confirmed. In-session only, like the bulk-delete
-   undo: it covers the minutes in which anyone would notice, and it costs nothing in
-   the synced file. */
-let replacedTrip = null;
+/* ================= v24.0: one record for "who replaced whom" =================
 
-/* v23.6: set while this device knows of two live trips, cleared the moment they agree, so
-   the banner cannot outlive the problem it is reporting. In-session only, like the stash
-   it travels with — a fork that nobody is losing work to is not worth a word, and one
-   that is gets settled in the minutes anybody would notice. */
-let tripDisagreement = null;
+   v21.8 kept the displaced list so it could be put back. v23.6 added a second variable
+   beside it saying whether this device had WON the argument that displaced it, and the
+   only thing keeping the two in step was a comment saying they had to be. They came
+   apart twice:
 
-function stashReplacedTrip(sd){
+     - the banner was cleared only when there was no conflict AT ALL, so a fork whose
+       loser had no work on it left a settled argument sitting on screen — and it is the
+       top case in syncAlertState, above everything but a failed write, on every tab;
+     - "Keep this one" minted a superseding trip whatever the stash was. Superseding is
+       right in one of the three ways a stash appears. When this phone LOST, the list on
+       screen already IS the other phone's trip and the stash is this device's own dead
+       one, so the mint superseded a trip nobody holds, left the actual winner
+       unsuperseded, and put a THIRD trip id into a household arguing about two.
+
+   One record, set in one place and cleared in one place. `rival` is the fact the second
+   variable was groping for, and it is stated rather than inferred: another device is
+   still holding the losing trip and will go on offering it on every poll until something
+   outranks it. That is true only of a remote fork this device won — not of a list this
+   device replaced itself, where the new trip already names what it replaced.
+
+   In-session only, like the bulk-delete undo: it covers the minutes in which anybody
+   would notice, and it costs nothing in the synced file. */
+let replacement = null;
+
+/* The only writer. Every flag defaults false: a bare stash is an undo and claims nothing
+   about an argument, which is the safe reading and the common case. */
+function stashReplacedTrip(sd, opts){
   if(!tripHasProgress(sd)) return;
-  replacedTrip = {
+  const o = opts || {};
+  replacement = {
     weekPlan: JSON.parse(JSON.stringify(sd.weekPlan)),
     shoppingList: JSON.parse(JSON.stringify(sd.shoppingList || [])),
     tripId: tripIdOf(sd),
@@ -2325,9 +2443,20 @@ function stashReplacedTrip(sd){
     // v23.3: a list can now be stashed with nothing ticked — an evening's pruning is
     // work too — so the card has to be able to say what was actually on it.
     decisions: tripDecisions(sd).decisions,
+    /* argued: a remote fork put this here, so there is something to tell somebody about.
+       A list this device replaced itself — a generate, a clear, an import — is an undo and
+       nothing more, and must not raise the banner that says two phones disagree.
+       iWon: which side of that fork this device was on, for the wording.
+       rival: whether keeping the list on screen still needs a write. */
+    argued: !!o.argued,
+    iWon: !!o.iWon,
+    rival: !!o.rival,
     at: new Date().toISOString()
   };
 }
+
+// The only clearer. Both buttons end here, and so does anything that settles the fork.
+function clearReplacement(){ replacement = null; }
 
 /* Returns whether anything actually changed. Callers use that to decide whether the
    change is worth telling the user about. */
@@ -2339,7 +2468,11 @@ function applyMergedShopping(merged){
   // Adopting a different trip from another device: keep what we were holding if
   // anyone had shopped from it, so it can be put back with one tap.
   const wasTrip = tripIdOf(shoppingData), nowTrip = tripIdOf(merged);
-  if(wasTrip && nowTrip && wasTrip !== nowTrip) stashReplacedTrip(shoppingData);
+  /* A bare stash — an undo, with no argument attached. mergeRemoteShopping has already
+     recorded this transition when it was a remote fork, with the two facts it knows and
+     this does not; do not overwrite that with a flagless copy. */
+  if(wasTrip && nowTrip && wasTrip !== nowTrip
+     && !(replacement && replacement.tripId === wasTrip)) stashReplacedTrip(shoppingData);
   shoppingData = merged;
   try{ localStorage.setItem(LS_SHOPPING, JSON.stringify(shoppingData)); }
   catch(e){ storageBlockedReason = 'Could not save locally (' + ((e && e.message) || e) + ').'; }
@@ -2370,13 +2503,26 @@ async function fetchRemoteShopping(token){
   if(!oneDriveFolderRef) return null;
   const { driveId, itemId } = oneDriveFolderRef;
   const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/shopping-list.json', token);
-  if(res.status !== 200) return null; // 404 = not created yet
+  // 404 = not created yet, which is the folder ANSWERING. Anything else is a read that
+  // did not come back. This function has always drawn that line; now it says so, in the
+  // one place that records it, instead of leaving each caller to guess.
+  if(res.status !== 200){
+    syncClock.answered(res.status, null);
+    // `absent` rather than null, so a caller can tell "the folder says it is not there"
+    // from "the read did not come back" — see getOneDriveFileText for why that matters.
+    return res.status === 404 ? { absent: true, etag: null, modified: null, data: null } : null;
+  }
   const meta = await res.json();
+  // Metadata came back, so the folder was reached and this is the newest mtime out there.
+  // NOT merged(): the content may still fail to download, and the caller may choose not to
+  // merge what did. Only whoever ends up holding the copy says so — which is why merged()
+  // wants the copy and this function has none to give.
+  syncClock.answered(200, meta.lastModifiedDateTime);
   let data = null;
   try{
     const dl = meta['@microsoft.graph.downloadUrl'];
     if(dl){ const r = await fetch(dl); if(r.ok) data = await r.json(); }
-  }catch(e){ console.warn('shopping download failed', e); }
+  }catch(e){ syncClock.unreachable(); console.warn('shopping download failed', e); }
   return { etag: meta.eTag, modified: meta.lastModifiedDateTime, data };
 }
 
@@ -2408,7 +2554,13 @@ async function writeShoppingMerged(token){
       // state object out from under a list somebody is actively ticking.
       try{
         const wrote = await res.json();
-        if(wrote && wrote.lastModifiedDateTime) shoppingFastPollStamp = wrote.lastModifiedDateTime;
+        if(wrote && wrote.lastModifiedDateTime){
+          shoppingFastPollStamp = wrote.lastModifiedDateTime;
+          // The copy in the folder is now the one this device sent, so it holds it —
+          // and wrote() rather than merged() because writing taught this device nothing
+          // about anybody else. Its horizon must not move.
+          syncClock.wrote(wrote.lastModifiedDateTime);
+        }
       }catch(e){ /* body already consumed or not JSON — harmless */ }
       return true;
     }
@@ -2445,12 +2597,16 @@ async function pollShoppingNow(force){
     if(!token) return;
     const { driveId, itemId } = oneDriveFolderRef;
     const res = await graphFetch('/drives/' + driveId + '/items/' + itemId + ':/shopping-list.json?$select=lastModifiedDateTime', token);
-    if(res.status !== 200){ noteRemoteCheckFailed(); return; }
+    if(res.status !== 200){ syncClock.answered(res.status, null); return; }
     const meta = await res.json();
-    /* v23.7: record what the folder says BEFORE the unchanged-stamp return. A poll that
+    /* v23.7: report what the folder says BEFORE the unchanged-stamp return. A poll that
        finds nothing new is exactly the poll that proves this phone is in step, and
-       returning first threw that fact away. */
-    noteRemoteShoppingStamp(meta.lastModifiedDateTime, null);
+       returning first threw that fact away.
+       answered(), never merged(): shoppingFastPollStamp below is the mtime this poll ACTED
+       ON, set before the download, so a fetch that then fails leaves it ahead of anything
+       merged. Recognising an mtime is not having the copy — and merged() wants the copy,
+       which this has not downloaded yet. */
+    syncClock.answered(200, meta.lastModifiedDateTime);
     if(!force && shoppingFastPollStamp === meta.lastModifiedDateTime){ updateListFreshness(); return; }
     shoppingFastPollStamp = meta.lastModifiedDateTime;
     const remote = await fetchRemoteShopping(token);
@@ -2460,7 +2616,7 @@ async function pollShoppingNow(force){
         setStatus('Shopping list updated from the other shopper — ' + new Date().toLocaleTimeString(), 'ok');
       }
     }
-  }catch(e){ noteRemoteCheckFailed(); console.warn('fast poll failed', e); }
+  }catch(e){ syncClock.unreachable(); console.warn('fast poll failed', e); }
   finally{ syncInFlight = false; }
 }
 
@@ -2639,7 +2795,8 @@ async function fetchTripHistory(){
       if(!token) return;
       if(!oneDriveFolderRef) oneDriveFolderRef = await resolveFridgeListFolder(token);
       if(!oneDriveFolderRef) return;
-      text = await getOneDriveFileText(oneDriveFolderRef.driveId, oneDriveFolderRef.itemId, TRIPS_FILE, token);
+      const read = await getOneDriveFileText(oneDriveFolderRef.driveId, oneDriveFolderRef.itemId, TRIPS_FILE, token);
+      text = (read && read.text) || null;
     } else if(dirHandle){
       text = await getFileText(dirHandle, TRIPS_FILE);
     } else return;
@@ -2828,11 +2985,11 @@ function adoptImportedShopping(parsed){
                                     parsed.weekPlan || {}, {
     tripId: 'trip:' + now + ':' + deviceId(),
     supersedes: tripIdOf(shoppingData),
-    basedOn: shoppingSeenRemoteAt || shoppingData.lastUpdated || null,
+    basedOn: syncClock.horizon(),
     generatedAt: now
   });
   // The horizon is this device's, never the imported file's — same rule as the merge.
-  imported.seenRemoteAt = shoppingSeenRemoteAt || null;
+  imported.seenRemoteAt = syncClock.horizon();
   applyMergedShopping(imported);   // the one sanctioned way shoppingData changes hands
   return true;
 }
@@ -3567,7 +3724,7 @@ function generateShoppingList(){
        generated by a phone that had never seen the one it is about to overwrite —
        see chooseTripWinner. */
     shoppingData.weekPlan.supersedes = prevTripId || null;
-    shoppingData.weekPlan.basedOn = shoppingSeenRemoteAt || shoppingData.lastUpdated || null;
+    shoppingData.weekPlan.basedOn = syncClock.horizon();
   }
   shoppingData.weekPlan.shoppingDoneAt = null; // a fresh list is an unfinished list
   shoppingData.weekPlan.lastGeneratedRecipeSignature = recipeSelectionsSignature();
@@ -3706,7 +3863,7 @@ function clearedWeekPlan(sd, now, byDevice, seenRemoteAt){
     generatedAt: now,
     tripId: 'trip:' + now + ':' + byDevice,
     supersedes: tripIdOf(sd),
-    basedOn: seenRemoteAt || (sd && sd.lastUpdated) || null,
+    basedOn: seenRemoteAt || null,
     shoppingDoneAt: null,
     // An empty week is not stale — shoppingListIsStale returns false with no selections —
     // so nothing regenerates off these, and the next real generate mints its own trip.
@@ -3740,23 +3897,22 @@ function replacedTripSummary(t){
    carrying the old lines and their ticks. That is the same causal rule the merge uses
    for any other deliberate replacement, rather than a special case bolted beside it. */
 function putBackReplacedList(){
-  if(!replacedTrip) return;
+  if(!replacement) return;
   const msg = 'Put back the list that was replaced?\n\n'
-    + replacedTripSummary(replacedTrip)
+    + replacedTripSummary(replacement)
     + ', and it comes back along with the recipe picks that list was made from.'
     + '\n\nThe list that replaced it goes — on every phone, within a few seconds.';
   if(!confirm(msg)) return;
   const now = new Date().toISOString();
-  shoppingData.weekPlan = Object.assign({}, replacedTrip.weekPlan, {
+  shoppingData.weekPlan = Object.assign({}, replacement.weekPlan, {
     tripId: 'trip:' + now + ':' + deviceId(),
     supersedes: tripIdOf(shoppingData),
-    basedOn: shoppingSeenRemoteAt || shoppingData.lastUpdated || null,
+    basedOn: syncClock.horizon(),
     generatedAt: now,
     shoppingDoneAt: null
   });
-  shoppingData.shoppingList = replacedTrip.shoppingList.map(l=> Object.assign({}, l));
-  replacedTrip = null;
-  tripDisagreement = null;
+  shoppingData.shoppingList = replacement.shoppingList.map(l=> Object.assign({}, l));
+  clearReplacement();
   persist('shopping');
   render();
   setStatus('Put the previous list back, ticks and all.', 'ok');
@@ -3775,19 +3931,34 @@ function putBackReplacedList(){
    so lastGeneratedRecipeSignature still matches and the next rebuild is still a same-trip
    one. */
 function keepThisList(){
-  if(!replacedTrip) return;
-  const now = new Date().toISOString();
-  shoppingData.weekPlan = Object.assign({}, shoppingData.weekPlan, {
-    tripId: 'trip:' + now + ':' + deviceId(),
-    supersedes: replacedTrip.tripId,
-    basedOn: shoppingSeenRemoteAt || shoppingData.lastUpdated || null,
-    generatedAt: now
-  });
-  replacedTrip = null;
-  tripDisagreement = null;
-  persist('shopping');
+  if(!replacement) return;
+  /* v24.0: mint a superseding trip only while something out there is still offering the
+     other list — which is what `rival` records, set in the one place that can know it.
+
+     v23.6 minted in every case, and superseding is right in only one of the three ways a
+     stash appears. When this phone LOST a fork, the list on screen already IS the other
+     phone's trip and the stash is this device's own dead one: the mint superseded a trip
+     nobody holds, left the actual winner unsuperseded, and put a third trip id into a
+     household arguing about two. And when the replacement was local — a generate, a
+     clear, an import — the trip on screen already names what it replaced, because
+     generateShoppingList and clearedWeekPlan set supersedes themselves. In both, keeping
+     this list is settled by letting the stash go. */
+  const rival = replacement.rival;
+  if(rival){
+    const now = new Date().toISOString();
+    shoppingData.weekPlan = Object.assign({}, shoppingData.weekPlan, {
+      tripId: 'trip:' + now + ':' + deviceId(),
+      supersedes: replacement.tripId,
+      basedOn: syncClock.horizon(),
+      generatedAt: now
+    });
+  }
+  clearReplacement();
+  if(rival) persist('shopping');
   render();
-  setStatus('Kept this list. The other one is replaced on every phone.', 'ok');
+  setStatus(rival
+    ? 'Kept this list. The other one is replaced on every phone.'
+    : 'Kept this list. The other copy is not offered here again.', 'ok');
 }
 
 function shoppingListIsStale(){
@@ -4359,7 +4530,7 @@ function renderStartTab(){
         // Review tab's "Put back the list that was replaced" is then the way back.
         stashReplacedTrip(shoppingData);
         shoppingData.weekPlan = clearedWeekPlan(
-          shoppingData, new Date().toISOString(), deviceId(), shoppingSeenRemoteAt);
+          shoppingData, new Date().toISOString(), deviceId(), syncClock.horizon());
         shoppingData.shoppingList = [];
         persist('shopping');
         render();
@@ -4556,12 +4727,13 @@ function generateNowButton(label){
    with the one button that fixes it. Kept in a fixed container so the 5s poll can rewrite
    the text without repainting the tab — the same reason updateShopProgress exists. */
 function freshnessNow(picks){
+  const snap = syncClock.snapshot();
   return listFreshness({
     backend: syncBackend(),
     signedIn: syncBackend() === 'onedrive' ? !!msalAccount : true,
-    behindSince: shoppingBehindSince,
-    lastCheckedAt: shoppingLastCheckedAt,
-    checkFailures: shoppingCheckFailures,
+    behindSince: snap.behindSince,
+    lastCheckedAt: snap.lastCheckedAt,
+    checkFailures: snap.checkFailures,
     picksChanged: !!(picks && picks.picksChanged),
     keepsTicks: !!(picks && picks.keepsTicks),
     recipesChanged: !!(picks && picks.recipesChanged),
@@ -4640,16 +4812,16 @@ function renderReviewTab(){
      pruned — instead of asking people to tell two identical things apart. Both buttons
      now WRITE: keeping a list is as deliberate as putting one back, and a decision that
      does not supersede the other trip is not a decision, it is a pause. */
-  if(replacedTrip && tripIdOf(shoppingData) !== replacedTrip.tripId){
-    const iWon = !!(tripDisagreement && tripDisagreement.iWon);
+  if(replacement && tripIdOf(shoppingData) !== replacement.tripId){
+    const iWon = !!replacement.iWon;
     const card = el('div',{class:'card notice-card'});
     card.appendChild(el('p',{style:'margin-top:0;'},[ el('strong',{},[ iWon
       ? 'Another phone has a different shopping list.'
       : 'The list you had been working on was replaced.' ])]));
     card.appendChild(el('p',{class:'muted', style:'margin-top:0;'},[ iWon
       ? 'This phone\u2019s list is the one on screen and is the one being used. The other '
-        + 'one is kept until this page is closed \u2014 ' + lowerFirst(replacedTripSummary(replacedTrip)) + '.'
-      : replacedTripSummary(replacedTrip) + ', and is kept until this page is closed \u2014 whether it was replaced here or from another phone.'
+        + 'one is kept until this page is closed \u2014 ' + lowerFirst(replacedTripSummary(replacement)) + '.'
+      : replacedTripSummary(replacement) + ', and is kept until this page is closed \u2014 whether it was replaced here or from another phone.'
     ]));
     const backBtn = el('button',{class:'btn'},[ iWon
       ? 'Use the other phone\u2019s list instead' : 'Put back the list that was replaced' ]);

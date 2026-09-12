@@ -75,7 +75,7 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProg
                'recipeHistoryLabel', 'recipeHistoryTime', 'daysSinceStamp', 'daysSinceCooked',
                'daysSincePlanned', 'migrateCookedStamps',
                'cookRateSummary', 'atHomeStreaks', 'clearedWeekPlan',
-               'sameTripRebuild', 'stashReplacedTrip', 'generateShoppingList',
+               'sameTripRebuild', 'stashReplacedTrip', 'clearReplacement', 'generateShoppingList',
                'mergeAuthored', 'resolveAuthoredItem', 'otherSideDropped',
                'effectiveAddedAt', 'authoredHorizons', 'describeMerge', 'mergeReport',
                'lastAuthoredAt', 'noteRemoved', 'mergeTombstones', 'pruneTombstones',
@@ -83,15 +83,21 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProg
                'syncAlertState', 'lastContactText',
                'doneCountsHere', 'syncNeededFromLine',
                'tripParts', 'tripCode', 'tripLabel', 'tripConflict', 'keepThisList',
-               'pendingWaitListLines', 'listFreshness', 'agoText'];
+               'pendingWaitListLines', 'listFreshness', 'agoText',
+               // v24.0: the one owner of "how current is this device". A factory, so a
+               // test can build its own and drive event sequences — which is what turns
+               // v23.9's three source assertions into behaviour assertions.
+               'makeSyncClock'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
 vm.runInContext(
   'const TICK_TIE_WINDOW_MS = ' + TICK_TIE_WINDOW_MS + ';\n' +
   'let shoppingData = null;\n' +
-  'let replacedTrip = null;\n' +
-  'let shoppingSeenRemoteAt = null;\n' +
+  'let replacement = null;\n' +
+  // v24.0: the app's single instance. Tests that need their own build one with
+  // makeSyncClock(nowFn); everything extracted from index.html shares this one.
+  'const syncClock = makeSyncClock();\n' +
   // The two genuine I/O calls on the rebuild path. Everything that DECIDES anything is
   // still the real function out of index.html.
   'function persist(){}\n' +
@@ -127,7 +133,7 @@ vm.runInContext(
   '             tripProgress, tripDecisions, tripHasProgress, tripIsLive, tripIsWorkedOn,' +
   '             chooseTripWinner, TRIP_LIVE_WINDOW_MS,' +
   '             sameTripRebuild, stashReplacedTrip, generateShoppingList,' +
-  '             getReplacedTrip: () => replacedTrip, setReplacedTrip: t => { replacedTrip = t; },' +
+  '             getReplacedTrip: () => replacement, setReplacedTrip: t => { replacement = t; },' +
   '             currentShopping: () => shoppingData,' +
   '             currentLines: () => (shoppingData && shoppingData.shoppingList) || [],' +
   '             tripRecordFromShopping, mergeTripHistory, pruneTripHistory, TRIP_HISTORY_MAX,' +
@@ -142,6 +148,7 @@ vm.runInContext(
   '             tripParts, tripCode, tripLabel, tripConflict, keepThisList,' +
   '             pendingWaitListLines, listFreshness, agoText,' +
   '             FRESHNESS_GRACE_MS, FRESHNESS_UNREACHABLE_MS, FRESHNESS_MIN_FAILURES,' +
+  '             makeSyncClock, syncClock,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -166,6 +173,7 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         tripParts, tripCode, tripLabel, tripConflict, keepThisList,
         pendingWaitListLines, listFreshness, agoText,
         FRESHNESS_GRACE_MS, FRESHNESS_UNREACHABLE_MS, FRESHNESS_MIN_FAILURES,
+        makeSyncClock, syncClock,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -1950,8 +1958,10 @@ group('v23.6 — keeping a list settles it, rather than pausing the argument');
   const mine = listFor([line('milk', { checked: true, checkedAt: T(100) })], T(200),
                        { tripId: 'trip:mine', basedOn: T(0) });
   setShoppingData(mine);
-  setReplacedTrip({ tripId: 'trip:theirs', ticks: 3, decisions: 3,
-                    weekPlan: { tripId: 'trip:theirs' }, shoppingList: [] });
+  /* The state this button exists for: a fork this phone WON, so the other phone is still
+     holding the losing trip and offering it on every poll. `rival` is that fact. */
+  setReplacedTrip({ tripId: 'trip:theirs', ticks: 3, decisions: 3, argued: true, iWon: true,
+                    rival: true, weekPlan: { tripId: 'trip:theirs' }, shoppingList: [] });
   keepThisList();
   const after = sandbox.api.currentShopping();
   ok('a new trip is minted', tripIdOf(after) !== 'trip:mine');
@@ -1964,6 +1974,65 @@ group('v23.6 — keeping a list settles it, rather than pausing the argument');
   const theirs = listFor([line('milk')], T(300), { tripId: 'trip:theirs', basedOn: T(0) });
   const c = tripConflict(after, theirs);
   ok('and it beats the other list outright, even from the older file', c.iWon === true);
+  setReplacedTrip(null);
+}
+
+/* v24.0. v23.6 minted in every case; superseding is right in one of the three ways a
+   stash appears, and `rival` is the fact that tells them apart. */
+group('v24.0 — keeping a list that nothing is arguing with does not mint a trip');
+{
+  /* This phone LOST: the list on screen IS the other phone's, and the stash is this
+     device's own dead trip. Minting superseded a trip nobody holds, left the real winner
+     unsuperseded, and made a third id out of a two-way argument. */
+  const theirsHeldHere = listFor([line('milk', { checked: true, checkedAt: T(100) })], T(200),
+                                 { tripId: 'trip:theirs', basedOn: T(0) });
+  setShoppingData(theirsHeldHere);
+  setReplacedTrip({ tripId: 'trip:mine-dead', ticks: 2, decisions: 2, argued: true,
+                    iWon: false, rival: false,
+                    weekPlan: { tripId: 'trip:mine-dead' }, shoppingList: [] });
+  keepThisList();
+  const after = sandbox.api.currentShopping();
+  ok('the trip on screen is left exactly as it is', tripIdOf(after) === 'trip:theirs');
+  ok('nothing is superseded — the winner was never in question',
+     after.weekPlan.supersedes === undefined);
+  ok('and the stash still goes', getReplacedTrip() === null);
+
+  /* A local replacement — generate, clear, import. The trip on screen already names what
+     it replaced, so there is nothing for this button to add. */
+  const localGen = listFor([line('flour')], T(300),
+                           { tripId: 'trip:new', supersedes: 'trip:old', basedOn: T(0) });
+  setShoppingData(localGen);
+  setReplacedTrip({ tripId: 'trip:old', ticks: 0, decisions: 4,
+                    weekPlan: { tripId: 'trip:old' }, shoppingList: [] });
+  keepThisList();
+  const after2 = sandbox.api.currentShopping();
+  ok('a locally replaced list keeps the lineage generateShoppingList already wrote',
+     tripIdOf(after2) === 'trip:new' && after2.weekPlan.supersedes === 'trip:old');
+  setReplacedTrip(null);
+}
+
+/* The other half of the record: an undo and an argument have different lifetimes, and
+   two module variables could never keep that straight. */
+group('v24.0 — the stash outlives the argument, on one record');
+{
+  const sd = listFor([line('milk', { checked: true, checkedAt: T(100) })], T(200),
+                     { tripId: 'trip:mine' });
+  setShoppingData(sd);
+  stashReplacedTrip(sd, { argued: true, iWon: true, rival: true });
+  const r = getReplacedTrip();
+  ok('a fork raises the banner', !!(r && r.argued));
+  ok('and marks the other phone as still offering its list', r.rival === true);
+
+  // What a clean merge does: the argument ends, the undo does not.
+  r.argued = false; r.rival = false;
+  ok('a settled fork stops the banner', getReplacedTrip().argued === false);
+  ok('but the list is still there to put back', !!getReplacedTrip().shoppingList);
+
+  // A bare stash claims nothing at all.
+  stashReplacedTrip(sd, {});
+  const bare = getReplacedTrip();
+  ok('a stash with no argument attached never raises the banner', bare.argued === false);
+  ok('and never asks for a write', bare.rival === false);
   setReplacedTrip(null);
 }
 
@@ -2122,6 +2191,196 @@ group('v23.8 — "cannot reach" counts failed attempts, not elapsed time');
      at({ lastCheckedAt: stale, checkFailures: 5, picksChanged: true, keepsTicks: true }).kind === 'unreachable');
   ok('and an unshared phone never reports it — there is nothing to reach',
      listFreshness({ backend: null, lastCheckedAt: stale, checkFailures: 9, now: BASE }) === null);
+}
+
+/* ---- v24.0: the sync clock ----
+
+   v23.9 found five defects in "how current is this device" and fixed them at five call
+   sites. Three of its assertions had to be SOURCE assertions — grep index.html for a call
+   shape — because the state was module-global and the I/O async. The clock is a factory,
+   so those are ordinary behaviour assertions now: build one, drive events, read the
+   snapshot. That change is the point; the fixes are what falls out of it. */
+group('v24.0 — an answer says what is out there, and nothing about what this device has');
+{
+  const c = makeSyncClock(()=> BASE);
+  c.merged('M0', { lastUpdated: T(0) });
+  ok('holding a copy is not being behind it', c.snapshot().behindSince === null);
+
+  c.answered(200, 'M1');
+  ok('a newer copy out there does put this device behind', c.snapshot().behindSince !== null);
+  // The regression v23.9's first attempt nearly shipped: recognising an mtime is not
+  // having the copy, so no number of answers can clear this.
+  c.answered(200, 'M1'); c.answered(200, 'M1');
+  ok('and no amount of hearing about it clears that — only holding it does',
+     c.snapshot().behindSince !== null);
+  c.merged('M1', { lastUpdated: T(100) });
+  ok('holding it does', c.snapshot().behindSince === null);
+}
+
+group('v24.0 — a write is not a way to fall behind yourself');
+{
+  // The v23.9 A scenario, end to end, as behaviour rather than as a grep.
+  const c = makeSyncClock(()=> BASE);
+  c.merged('M0', { lastUpdated: T(0) });   // read and merged the shared copy
+  c.wrote('M1');                           // this device wrote; the folder's mtime moved
+  c.answered(200, 'M1');                   // the next poll sees its own write
+  ok('a phone in step with its own write stays in step', c.snapshot().behindSince === null);
+  ok('and the strip says nothing at all',
+     listFreshness(Object.assign({ backend: 'onedrive', signedIn: true, now: BASE + 60000 },
+                                 c.snapshot())) === null);
+  // A write teaches this device nothing about anybody else, so the horizon must not move.
+  ok('but writing does not advance the horizon', c.horizon() === T(0));
+}
+
+group('v24.0 — the folder answering is not the folder failing');
+{
+  /* The call site hands over the status and this decides what it meant, so 404 cannot be
+     "not created yet" in one function and "cannot reach the folder" in another. */
+  const c = makeSyncClock(()=> BASE);
+  c.answered(500, null); c.answered(503, null); c.unreachable();
+  ok('failed reads accumulate', c.snapshot().checkFailures === 3);
+  ok('and with no contact at all there is nothing to date the warning from',
+     c.snapshot().lastCheckedAt === null);
+
+  // A 404 is an answer: fetchRemoteShopping has always read it as "not created yet".
+  c.answered(404, null);
+  ok('a file that is not there yet clears the failure count',
+     c.snapshot().checkFailures === 0);
+  ok('and counts as contact', c.snapshot().lastCheckedAt === BASE);
+  ok('so the strip stays quiet',
+     listFreshness(Object.assign({ backend: 'onedrive', signedIn: true,
+                                  now: BASE + 60 * 60 * 1000 }, c.snapshot())) === null);
+}
+
+group('v24.0 — the horizon is a fact about the shared folder, or it is nothing');
+{
+  const c = makeSyncClock(()=> BASE);
+  ok('a device that has read nothing claims nothing', c.horizon() === null);
+
+  // Restoring from localStorage is not reaching the folder — lastContactText's "never"
+  // must stay unflattered.
+  c.restore(T(500));
+  ok('a restored horizon is remembered', c.horizon() === T(500));
+  ok('but restoring is not contact', c.snapshot().lastCheckedAt === null);
+  ok('and lastContactText still says never',
+     lastContactText(null, BASE).indexOf('never') !== -1);
+
+  c.merged('M1', { lastUpdated: T(100) });
+  ok('and the horizon never goes backwards', c.horizon() === T(500));
+  c.merged('M2', { lastUpdated: T(900) });
+  ok('only forwards', c.horizon() === T(900));
+  c.wrote('M3');
+  ok('and a write never moves it at all — it taught this device nothing',
+     c.horizon() === T(900));
+}
+
+/* The consequence in the rule that reads it. Every pre-v24.0 test handed basedOn in as a
+   literal, so nothing ever asked where the value came from — and it came from a local save
+   clock that ratchets on every save, so the phone that had read NOTHING wrote the freshest
+   claim in the household and won chooseTripWinner's third rule against every phone that
+   had read something. */
+group('v24.0 — a device with no horizon makes no claim about how caught-up it is');
+{
+  setRecipesData({ recipes: [{ id: 'r1', name: 'Soup', servings: 4, ingredients: [] }],
+                   ingredients: [], settings: { features: {}, staples: [], stapleQty: {} } });
+  const weekOf = trip => ({ lastUpdated: T(9e6), seenRemoteAt: null, neededList: [], shoppingList: [],
+    weekPlan: { selections: [{ recipeId: 'r1', servings: 4, addedAt: T(0), changedAt: T(0) }],
+                tripId: trip, generatedAt: T(0) } });
+
+  setShoppingData(weekOf('trip:before'));
+  generateShoppingList();
+  ok('a phone that has never read the folder claims nothing',
+     sandbox.api.currentShopping().weekPlan.basedOn === null);
+
+  // Note what is NOT reachable from generateShoppingList any more: there is no
+  // shoppingData.lastUpdated fallback to reach for, because syncClock.horizon() is the
+  // only way to ask and lastUpdated is not in its scope.
+  syncClock.merged('M9', { lastUpdated: T(5000) });
+  setShoppingData(weekOf('trip:before2'));
+  generateShoppingList();
+  ok('and one that has claims exactly what it read',
+     sandbox.api.currentShopping().weekPlan.basedOn === T(5000));
+  noStaples();
+
+  /* Neither trip is worked on, so chooseTripWinner's rule 3 decides. The caught-up phone
+     must win; with the old fallback the stale one carried `now` and took it. */
+  const staleDevice = { lastUpdated: T(9e6), shoppingList: [],
+    weekPlan: { tripId: 'trip:stale', generatedAt: T(9e6), basedOn: null, selections: [] } };
+  const caughtUp = { lastUpdated: T(1000), shoppingList: [],
+    weekPlan: { tripId: 'trip:caught', generatedAt: T(1000), basedOn: T(900), selections: [] } };
+  ok('a fork between a stale phone and a caught-up one goes to the caught-up one',
+     chooseTripWinner(staleDevice, caughtUp, Date.parse(T(9e6)), Date.parse(T(1000)),
+                      staleDevice, BASE + 9e6) === caughtUp);
+}
+
+/* ---- v24.0: the structure, not the instances ----
+
+   Source assertions, and deliberately so: the rule is about how many places can touch this
+   state and whether every folder request reports what it meant — which no runtime test can
+   see. v23.9 fixed five call sites; these are what stop a sixth appearing. */
+group('v24.0 — nothing owns this state but the clock');
+{
+  const gone = ['shoppingSeenRemoteAt', 'shoppingRemoteModifiedSeen',
+                'shoppingRemoteModifiedLatest', 'shoppingBehindSince',
+                'shoppingLastCheckedAt', 'shoppingCheckFailures', 'tripDisagreement'];
+  gone.forEach(name=>{
+    ok(name + ' is not a module variable any more',
+       !(new RegExp('\\blet\\s+' + name + '\\b').test(html)));
+  });
+  // The clock's own fields live in its closure; nothing outside can name them.
+  ok('the clock keeps its fields to itself',
+     !/\bsyncClock\.(horizon|held|latest|behindSince|failures)\s*=/.test(html));
+  /* A function that has only metadata in hand cannot claim to hold a copy: merged() wants
+     the copy itself. That is the v23.9-A regression made awkward to write rather than
+     forbidden in a comment — and the reason the poll reports through answered(). */
+  ok('nothing claims to hold a copy it has not got',
+     (html.match(/syncClock\.merged\(/g) || []).length === 1);
+  ok('and only the write says it wrote',
+     (html.match(/syncClock\.wrote\(/g) || []).length === 1);
+  ok('and there is exactly one instance of it',
+     (html.match(/=\s*makeSyncClock\(/g) || []).length === 1);
+}
+
+group('v24.0 — every folder request says what it meant');
+{
+  /* Split index.html into top-level functions and check the ones that actually talk to the
+     folder about the shopping file. A thirteenth call site added later without a clock
+     event fails here rather than silently under-reporting, which is how all five v23.9
+     defects got in. */
+  const fns = {};
+  const re = /\n(?:async )?function ([a-zA-Z_][\w]*)\s*\(/g;
+  let m, marks = [];
+  while((m = re.exec(html))) marks.push({ name: m[1], at: m.index });
+  marks.forEach((mark, i)=>{
+    fns[mark.name] = html.slice(mark.at, i + 1 < marks.length ? marks[i + 1].at : html.length);
+  });
+
+  const talksToFolder = Object.keys(fns).filter(n=>
+    /graphFetch\(/.test(fns[n]) && /shopping-list\.json/.test(fns[n]));
+  ok('the shopping file is reached from a known, small set of functions',
+     talksToFolder.length >= 3 && talksToFolder.length <= 5, talksToFolder);
+  talksToFolder.forEach(n=>{
+    ok(n + '() reports to the clock',
+       /syncClock\.(answered|merged|wrote|unreachable)\(/.test(fns[n]));
+  });
+
+  /* The folder listing is one request with one reporting rule. stampOneDriveTimestamps
+     and pollOneDriveForChanges used to issue it separately and answer differently about
+     what had just happened — and the stamp, which runs after every autosave, answered
+     nothing at all. */
+  ok('the folder listing has exactly one caller of graphFetch',
+     (html.match(/children\?\$select=name,lastModifiedDateTime/g) || []).length === 1);
+  ok('and both pollers go through it',
+     /fetchFolderListing\(token\)/.test(fns['stampOneDriveTimestamps'])
+     && /fetchFolderListing\(token\)/.test(fns['pollOneDriveForChanges']));
+
+  /* absent and failed are different answers on the two files the clock does not govern
+     too: reading null for both is what let a transient 500 overwrite the family's recipes
+     with whatever this phone happened to hold. */
+  ok('a read that did not come back is not read as an empty folder',
+     /if\(res\.status === 404\) return \{ absent: true \};/.test(fns['getOneDriveFileText']));
+  ok('and the recipe load only creates the file when the folder says it is not there',
+     /rRead && rRead\.absent/.test(fns['loadFromOneDriveOrSeed']));
 }
 
 group('v23.7 — the "how long ago" wording is coarse on purpose');

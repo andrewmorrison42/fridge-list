@@ -1327,7 +1327,7 @@ async function suiteImportRespectsTheMerge(browser) {
      back. Neither suite referenced importData at all. */
   const file = instrument('import-hook.html',
     'window.__t = { adopt: adoptImportedShopping, sd: () => shoppingData,'
-    + ' replaced: () => replacedTrip, merge: mergeShoppingData };');
+    + ' replaced: () => replacement, merge: mergeShoppingData };');
   const srv = await serve(8187, file);
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
