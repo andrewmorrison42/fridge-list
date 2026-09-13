@@ -10,6 +10,15 @@ rapid prototyping, and its sync design is the specific thing this rebuild
 means to get right. Read this before designing anything; edit it freely,
 it's yours.
 
+This is a deliberate clean-slate rebuild, not a refactor: the goal is to
+stop building on top of prior design iterations and accumulated cruft, even
+where the old app's behaviour was acceptable. Section 4.5 (carry-over of
+uncooked menu items) is a genuinely new feature with no equivalent in the
+existing app, and its owners expect it to change the behaviour of menu
+selection, ingredient state and shopping-list generation together — it
+should be treated as a first-class part of the design, not bolted on
+afterward.
+
 Anything marked **(open)** is a question the interview didn't settle —
 resolve it before treating that section as final.
 
@@ -140,12 +149,21 @@ to prevent.
   independent shops running at once.
 - Sync state must be visibly trustworthy — a device must be able to
   show the user how current its data is, rather than imply falsely
-  that it's up to date.
+  that it's up to date. Staleness is acceptable as long as it's visible
+  and there is a way to correct it without losing anyone's work.
+- **Hard guarantee: a tick is never lost.** Once a menu item is added
+  to the plan, or a shopping-list item is ticked off during a shop, no
+  later sync, reconciliation, merge, or regeneration may cause that
+  tick to disappear or silently revert — on any device, under any
+  ordering of events. This is a correctness requirement, not a
+  best-effort one, and should be the first thing tested against any
+  proposed sync design.
 - A short propagation delay between devices is acceptable; silent,
   permanent loss or an incorrect overwrite of someone's work is not.
 - There must be an explicit "reconcile now" action for when two
   shoppers rejoin each other, defaulting to an automatic union of both
-  sides' ticks and additions, and surfacing:
+  sides' ticks and additions (never a one-sided overwrite that could
+  drop a tick), and surfacing:
   - items ticked redundantly by both sides (informational), and
   - items neither side ticked off (a gap needing a decision).
 - Adding an item to a shop already in progress must not disrupt or
