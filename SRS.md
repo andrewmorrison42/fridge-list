@@ -146,14 +146,37 @@ A menu selection's status shall be one of: **Planned**, **Cooked**,
   over, or Flagged) at any time, which is how a Flagged entry is
   deliberately dropped.
 - **FR-MENU-7.** When a shopping list is (re)generated and it includes a
-  **Carried over** entry, the system shall not automatically add that
-  entry's ingredients to the new shopping list. Instead, for each such
-  ingredient, the system shall prompt the user to decide whether it is
-  still needed for this shop (default: needed) before including or
-  excluding the corresponding shopping-list line. *(URS §4.5 — the URS
-  leaves open whether this decision should be remembered for next time;
-  this requirement assumes it is asked fresh every time it recurs.
-  **(assumed)**, see URS §10.)*
+  **Carried over** entry, the system shall not fold that entry's
+  ingredients into the ordinary combined shopping-list lines (FR-LIST-2)
+  unchecked. Instead:
+  1. Any ingredient needed *only* by one or more **Carried over**
+     entries (i.e. no current **Planned** menu selection or staple also
+     needs it) shall be shown in a distinct **"Carried over —
+     check before buying"** section of the shopping list, separate
+     from the main grouped list (FR-LIST-6). This exists as a reminder
+     that the ingredient may already have been used for something else
+     in the intervening week, even though it was originally bought or
+     earmarked for the carried-over recipe.
+  2. From that section, a user may move an ingredient onto the main
+     shopping list (it is still needed, buy it) or dismiss it (it's
+     still on hand, don't buy it this shop). Neither action is
+     required before the list can be used — the section is a prompt,
+     not a block.
+  3. An ingredient needed by a **Carried over** entry *and* by a
+     current **Planned** entry or staple is already on the main list
+     via that other source and shall not additionally appear in the
+     carried-over section — it is being bought regardless, so there is
+     nothing to check.
+  *(URS §4.5. Supersedes the earlier draft of this requirement, which
+  specified a per-ingredient yes/no prompt; the stakeholder's revision
+  is a visible reminder list rather than a gate, on the grounds that the
+  real risk is a carried-over ingredient having been silently consumed
+  by an unrelated meal, not merely forgotten. This also resolves the
+  open question in URS §10 about whether the decision should be
+  "remembered": there is no yes/no decision being remembered any more —
+  dismissing an item from the section only affects the current shop, and
+  it is free to reappear next time if the entry is still Carried over
+  and still unresolved.)*
 
 ### 5.5 Wait List
 
@@ -312,9 +335,12 @@ made to keep this document unambiguous; those assumptions are marked
 **(assumed)** in place and should be confirmed, not silently treated as
 decided:
 
-- [ ] Should the "already have this as surplus" decision on a
-      carried-over ingredient (FR-MENU-7) be remembered, or asked fresh
-      each time? Assumed: asked fresh.
+- [x] Should the "already have this as surplus" decision on a
+      carried-over ingredient be remembered, or asked fresh each time?
+      **Resolved:** neither — FR-MENU-7 replaces the per-ingredient
+      decision with a standing reminder section; there is no decision
+      to remember, since dismissing an item only affects the current
+      shop.
 - [ ] Is one week the right carry-over period for every recipe
       (FR-MENU-5), or should it vary? Assumed: uniform one week.
 - [ ] Any appetite for basic spend tracking in a later phase?
