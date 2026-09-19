@@ -39,6 +39,10 @@ function ok(name, cond, detail) {
 }
 function group(name) { console.log('\n' + name); }
 
+/* The source of one function, for the assertions that are about what the code SAYS rather
+   than what it returns — see the v24.0 sync-clock group and the v24.1 one at the end. */
+const fnSource = extract;
+
 /* Pull `function <name>(...) { ... }` out of index.html by matching braces. */
 function extract(name) {
   const start = html.indexOf('function ' + name + '(');
@@ -87,7 +91,11 @@ const FUNCS = ['tsOf', 'tripIdOf', 'tripProgress', 'tripDecisions', 'tripHasProg
                // v24.0: the one owner of "how current is this device". A factory, so a
                // test can build its own and drive event sequences — which is what turns
                // v23.9's three source assertions into behaviour assertions.
-               'makeSyncClock'];
+               'makeSyncClock',
+               // v24.1: the ranking behind the app's own suggestion panel. The panel
+               // itself needs a browser; which five names it offers, and in what order,
+               // does not.
+               'suggestionMatches'];
 
 const sandbox = { console };
 vm.createContext(sandbox);
@@ -125,6 +133,7 @@ vm.runInContext(
   extractConst('FRESHNESS_GRACE_MS') + '\n' +
   extractConst('FRESHNESS_UNREACHABLE_MS') + '\n' +
   extractConst('FRESHNESS_MIN_FAILURES') + '\n' +
+  extractConst('SUGGEST_LIMIT') + '\n' +
   FUNCS.map(extract).join('\n\n') + '\n' +
   'this.api = { mergeShoppingData, selectionsSignature, shoppingListIsStale, lineMergeKey,' +
   '             tripIdOf, parseQty, lineQtyText, displayUnit, stapleQtyToShopping, stapleQtyFor,' +
@@ -149,6 +158,7 @@ vm.runInContext(
   '             pendingWaitListLines, listFreshness, agoText,' +
   '             FRESHNESS_GRACE_MS, FRESHNESS_UNREACHABLE_MS, FRESHNESS_MIN_FAILURES,' +
   '             makeSyncClock, syncClock,' +
+  '             suggestionMatches, SUGGEST_LIMIT,' +
   '             setShoppingData: d => { shoppingData = d; },' +
   '             setRecipesData: d => { recipesData = d; } };',
   sandbox
@@ -173,7 +183,7 @@ const { mergeShoppingData, selectionsSignature, shoppingListIsStale, tripIdOf,
         tripParts, tripCode, tripLabel, tripConflict, keepThisList,
         pendingWaitListLines, listFreshness, agoText,
         FRESHNESS_GRACE_MS, FRESHNESS_UNREACHABLE_MS, FRESHNESS_MIN_FAILURES,
-        makeSyncClock, syncClock,
+        makeSyncClock, syncClock, suggestionMatches, SUGGEST_LIMIT,
         setShoppingData, setRecipesData } = sandbox.api;
 
 // Most tests don't care about staples; give them an inert default.
@@ -2420,6 +2430,138 @@ group('v23.7 — the "how long ago" wording is coarse on purpose');
   ok('and plurals are respected', agoText(90 * 1000) === '2 minutes ago');
   ok('hours', agoText(3 * 60 * 60 * 1000) === '3 hours ago');
   ok('and days', agoText(72 * 60 * 60 * 1000) === '3 days ago');
+}
+
+/* ---- v24.1: the suggestion list the app draws for itself ----
+
+   The defect was not in any pure function. Chrome for Android draws a <datalist> popup as
+   an Android view over the page and drew it with no background of its own, so on the Wait
+   List the five matching ingredients landed unreadably on top of the list underneath.
+   Nothing in a stylesheet reaches it, and iOS Safari never showed it because Safari puts
+   those suggestions in the keyboard strip instead — so half the household saw a working
+   feature and half could not use the tab.
+
+   What a logic suite CAN hold is the half that is not painting: which names are offered
+   and in what order, and — as source assertions, in the same bargain the sync clock makes
+   above — that nothing asks a browser to draw one of these again. */
+
+group('v24.1 — which suggestions are offered, and in what order');
+{
+  // The five the seed really holds for "flour", which is what the reported screenshot showed.
+  const names = ['Cornflour', 'Flour (Plain)', 'Flour (Self Raising)', 'Rice flour',
+                 'Besan flour', 'Butter'];
+
+  ok('an empty box suggests nothing', suggestionMatches(names, '').items.length === 0);
+  ok('and neither does whitespace', suggestionMatches(names, '   ').items.length === 0);
+
+  /* The ranking is the reason this is not a one-liner. Alphabetical alone put "Besan
+     flour" above "Flour (Plain)" for somebody who had typed "flour", so the thing they
+     were reaching for was never the thing offered first. */
+  const flour = suggestionMatches(names, 'flour');
+  ok('what you typed the start of comes first',
+     flour.items.slice(0, 2).join('|') === 'Flour (Plain)|Flour (Self Raising)', flour.items);
+  ok('then the rest of the matches, alphabetically',
+     flour.items.slice(2).join('|') === 'Besan flour|Cornflour|Rice flour', flour.items);
+  ok('a name that does not contain it at all is not offered',
+     flour.items.indexOf('Butter') < 0, flour.items);
+  ok('and nothing is claimed to be hidden when nothing is',
+     flour.more === 0, flour);
+
+  ok('case is ignored', suggestionMatches(names, 'CORNFL').items.join('|') === 'Cornflour');
+  ok('so is padding', suggestionMatches(names, '  rice ').items.join('|') === 'Rice flour');
+
+  /* 443 ingredients behind one box: the panel shows a handful and SAYS it is holding
+     more, rather than offering a wall or silently cutting it off. */
+  const capped = suggestionMatches(names, 'flour', 2);
+  ok('the panel is capped', capped.items.length === 2, capped);
+  ok('and counts what it did not show', capped.more === 3, capped);
+  ok('the cap has a real default', typeof SUGGEST_LIMIT === 'number' && SUGGEST_LIMIT > 0,
+     SUGGEST_LIMIT);
+
+  ok('no list at all is not a crash', suggestionMatches(null, 'x').items.length === 0);
+  ok('nor are holes in one',
+     suggestionMatches(['a', null, undefined, 'ab'], 'a').items.join('|') === 'a|ab');
+}
+
+group('v24.1 — nothing is left for a browser to draw');
+{
+  /* A <datalist> anywhere is the bug back. This is the ratchet: a new box added with
+     `list:` fails here and is told to use attachSuggestions() instead. */
+  ok('nothing creates a <datalist> element', !/el\(\s*['"]datalist['"]/.test(html));
+  ok('and no input hands its suggestions to the browser',
+     !/el\('input',\s*\{[^}]*\blist\s*:/.test(html));
+
+  // Lookbehind so the declaration is not counted as one of its own call sites — the
+  // same shape as the generateShoppingList() count above.
+  /* Removing the datalist closed seven ways to summon Chrome for Android's popup and left
+     the AUTOFILL one — the same Android view — on every other text box in the app. One rule
+     in el(), because thirty call sites that must remember is how this came back. */
+  ok('every text-like box refuses browser suggestions, decided in one place',
+     /tag === 'input' && AUTOFILLABLE_INPUT\.test\(e\.type\) && !e\.hasAttribute\('autocomplete'\)/
+       .test(fnSource('el')));
+
+  const wired = html.match(/(?<!function )attachSuggestions\(\w+, \w+\)/g) || [];
+  ok('all seven boxes that had one are wired to the app’s own panel',
+     wired.length === 7, wired);
+
+  const attach = fnSource('attachSuggestions');
+  /* Picking a suggestion has to be indistinguishable from typing it: wireUnitControls
+     fills the unit in from the master list off these very events, and a recipe line whose
+     unit silently stopped arriving is the v23.4 bug wearing a different coat. */
+  ok('picking one fires input', /dispatchEvent\(new Event\('input'/.test(attach));
+  ok('and change', /dispatchEvent\(new Event\('change'/.test(attach));
+  /* A click fires after the box has lost focus, by which time focusout has closed the
+     panel — the classic way a suggestion list becomes untappable on a phone, which is
+     the one platform this whole change is for. */
+  ok('a suggestion is taken on pointerdown, with the default prevented',
+     /'pointerdown',\s*\(e\)=>\{\s*e\.preventDefault\(\);\s*choose\(name\)/.test(attach));
+  /* Enter belongs to the box until somebody arrows onto a row. Taking it always would
+     make it impossible to add anything the master list has never heard of, which is half
+     of what the Wait List is for. */
+  ok('Enter is only taken once a row is actually highlighted',
+     /suggestOpen\.active >= 0/.test(attach));
+
+  /* choose() is itself one of the things listening for the event it fires. Without this
+     the panel reopens straight over the box it has just filled in. Found by the browser
+     suite on its first run, not by reading the diff. */
+  ok('picking a suggestion does not redraw the panel on its own event',
+     /if\(!echoing\) draw\(\)/.test(attach));
+
+  /* All five below were found by the release review, not by the suite that shipped with
+     the first cut of this change. Every assertion it had was either about suggestionMatches
+     — a pure ranking function that was never the bug — or a regex asserting some line
+     exists. None of them asked where the panel ENDS UP, which is the only thing the family
+     experiences. The browser suite asks now; these hold the shape in place. */
+  const repos = fnSource('suggestReposition');
+  /* Two viewports, and conflating them is how the panel ends up behind the keyboard. A
+     fixed element is POSITIONED against the layout viewport, but the room actually on
+     screen is the VISUAL one — and iOS Safari shrinks only the second, and fires no resize
+     when the keyboard opens. Measured: 315px of "room" below a box with a keyboard over it. */
+  ok('the room on screen is measured against the visual viewport, not the layout one',
+     /vv \? vv\.offsetTop \+ vv\.height : window\.innerHeight/.test(repos)
+     && /const below = viewBottom - r\.bottom/.test(repos));
+  /* Nothing fires scroll or resize when the sync banner appears above #app or a status line
+     wraps in the sticky header, and no repaint rescues it either — safeToRepaint() refuses
+     while a box is focused, which is exactly when a panel is open. Left pinned, the box
+     slides down UNDER the panel and a tap where somebody is typing hits a suggestion. */
+  ok('the panel is re-measured every frame while it is open',
+     /suggestFrame = requestAnimationFrame\(suggestTrack\)/.test(fnSource('suggestTrack')));
+  ok('and opening one starts that loop',
+     /if\(fresh\) suggestFrame = requestAnimationFrame\(suggestTrack\)/.test(attach));
+  /* addStaple() and addTerm() empty the box and refocus without re-rendering. Checked in
+     one place rather than at those two call sites, so the next one need not remember. */
+  ok('a box cleared by something other than typing loses its panel',
+     /input\.value !== suggestOpen\.query/.test(repos));
+  ok('an open panel is not printed', /class:'suggest-panel no-print'/.test(attach));
+  ok('and a box with no matches closes only its own panel',
+     /if\(!found\.items\.length\)\{ if\(mine\) closeSuggestions\(\); return; \}/.test(attach));
+
+  /* An orphaned panel anchored to an input that no longer exists is the same shape of
+     bug as the detached row closures of v21.0 — render() rebuilds the tab from scratch. */
+  ok('a tab rebuild takes the panel with it', /closeSuggestions\(\)/.test(fnSource('render')));
+  ok('so does closing a modal', /closeSuggestions\(\)/.test(fnSource('closeModal')));
+  ok('and a panel whose box has gone closes itself',
+     /isConnected/.test(fnSource('suggestReposition')));
 }
 
 /* ---------- result ---------- */

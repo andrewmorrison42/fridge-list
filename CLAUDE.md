@@ -58,6 +58,54 @@ Consequences:
 
 Each of these has a bug behind it.
 
+**No box in this app asks a browser to draw it a list — and `<datalist>` was only half of
+that.** Chrome for Android draws its AUTOFILL suggestions with the same Android view it used
+for `<datalist>`, so removing the datalist from seven boxes closed seven ways to summon that
+popup and left the autofill one on the other twenty-one — the reported bug, one tab across.
+`el()` sets `autocomplete="off"` on every text-like input it builds, which is every one in
+the app: the only two raw `createElement('input')` calls are file pickers. Nothing here wants
+a browser-remembered value — no login, no address, no payment field — and the only completion
+worth having is the panel the app draws itself. Decided in `el()` rather than at thirty call
+sites, and a browser suite walks every tab asserting no box forgot, because a rule nobody can
+forget beats a rule everybody has to remember. An explicit `autocomplete` in `attrs` still
+wins. *(v24.1)*
+
+**A suggestion list is the app's to draw, and `<datalist>` is never the answer.** That popup
+belongs to the browser, and Chrome for Android draws it as an Android view over the page with
+no background of its own: five ingredient names painted straight onto the Wait List
+underneath, both unreadable, and the family stopped using the box. No stylesheet here reaches
+it. iOS Safari never showed the fault because Safari draws no panel at all — it puts the
+suggestions in the keyboard strip — so half the household had a working feature and half did
+not, and the report that came back was "it works on my phone". `attachSuggestions` is the one
+way these boxes get a list; all seven go through it and a source test counts them, so a new
+box added with `list:` fails the suite rather than shipping the bug again. Four things it does
+that look incidental and are not. It takes a suggestion on `pointerdown` with the default
+prevented: a `click` arrives after the box has lost focus, by which time `focusout` has closed
+the panel, and the list is untappable on the one platform this is all for. It fires `input`
+and `change` so `wireUnitControls` still fills the unit in from the master list — and ignores
+its own echo, or the panel reopens over the box it has just filled. It leaves Enter alone
+until somebody has arrowed onto a row, because the Wait List exists to write down things the
+master list has never heard of. And `render()` and `closeModal()` close it, because it is
+anchored to an input they are about to destroy — an orphaned panel is the v21.0 detached-row
+bug in a different coat. *(v24.1)*
+
+**A panel pinned to coordinates is a panel in the wrong place, and there are two viewports.**
+Both halves were wrong in the first cut of v24.1 and the release review caught both. The
+panel is `position:fixed` at a rect measured from its box, and plenty moves that box without
+firing scroll or resize: `renderSyncAlert` draws above `#app` on a 60s timer and after every
+write, a long `setStatus` line wraps inside the sticky header, a finder chip lands in the
+input's own row. Nothing rescues it either — `safeToRepaint()` refuses while a box is
+focused, which is exactly when a panel is open — so the box slides down UNDERNEATH the panel
+and a tap where somebody is typing lands on a suggestion. That is the reported bug recreated
+by the fix for it. `suggestTrack` re-measures every frame while open, and does nothing unless
+something moved. Separately: a fixed element is POSITIONED against the layout viewport, but
+the room actually on screen is the VISUAL one. iOS Safari does not shrink the layout viewport
+for the keyboard and fires no resize, so `innerHeight` reported 315px of space below a box
+with a keyboard over it, the flip-above branch could never fire, and the panel rendered
+entirely behind the keyboard — on the half of the household that had a working feature
+before. Measure room with `visualViewport`; keep `innerHeight` for the `bottom` coordinate
+itself. *(v24.1)*
+
 **A Wait List `done` set in the aisle is a TICK, and carries `doneTripId`.** `done` was one
 flag doing two jobs with different lifetimes: `syncNeededFromLine` writes it when somebody
 ticks a line in a shop ("it is in the trolley on this trip"), and the Wait List tab writes

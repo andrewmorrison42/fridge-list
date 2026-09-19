@@ -589,6 +589,104 @@ the family stops reporting it.
 
 ---
 
+### v24.1 — the popup the page did not own
+
+Reported from an Android phone: typing into the Wait List box painted the matching
+ingredients on top of the list underneath, both see-through, unusable. Reported alongside
+"it does not happen on Safari", which is the detail that made it look like a Chrome bug to
+work around and was in fact the whole diagnosis.
+
+Nothing in the page was drawing it. These boxes were `<input list=…>` + `<datalist>`, and a
+datalist popup is the **browser's** to draw — on Android an Android view composited over the
+web contents, outside anything a stylesheet can address. The app's own part was correct
+throughout: the five names offered were exactly the five master ingredients matching
+"flour". Every check that could be made from the page came back clean — no rule targeting
+`option` or `datalist`, no ancestor of the input creating a compositing or stacking context,
+the repaint guards holding.
+
+**Safari was not a control, and reading it as one cost the first half of the diagnosis.**
+iOS Safari does not render a datalist panel at all; it surfaces the suggestions in the
+keyboard accessory strip. So "works in Safari" never meant "Safari renders the same thing
+correctly" — it meant Safari renders something else. Two phones in one household disagreed
+about whether a feature worked, and both were right. Worth remembering the next time a
+platform difference looks like one platform being broken: check that both are drawing the
+same thing before treating either as the baseline.
+
+**What was rejected.** Styling the popup — impossible, it is not in the page. Declaring
+`color-scheme` and hoping — kept, because a page with a hardcoded light palette should say
+so and it is the only lever left over the native `<select>` popups the app still uses, but
+it was never going to be the fix here; the phone was in light mode. Fixing only the Wait
+List box — rejected: the same defect sat on all seven boxes, including both of the recipe
+editor's, and leaving six of them would have meant two suggestion mechanisms in a codebase
+whose whole argument is that one collection gets one rule.
+
+**What replaced it.** `attachSuggestions()`: one function, seven call sites, a panel this
+stylesheet owns. The input element and how every caller reads `.value` back are unchanged,
+which is what kept the diff to the boxes themselves. It is positioned `fixed` off `<body>`
+rather than absolutely inside a wrapper, because each of the seven lives in a differently
+laid-out flex row and wrapping them would have meant seven layout changes to fix a
+rendering bug.
+
+**The bug the browser suite caught and review would not have.** `choose()` fires `input`
+and `change` so that everything already listening to these boxes — `wireUnitControls` fills
+the recipe line's unit in from the master list — carries on unchanged. But `attachSuggestions`
+is itself one of those listeners, so picking a suggestion redrew the panel straight over the
+box it had just filled in. The logic suite could not see it; the source assertions could not
+see it; it took an assertion about what was on screen after a tap. This is method 1 of "How
+to review this codebase" arriving from the other direction: the code faithfully implemented
+its stated intent, and the intent had not noticed it was talking to itself.
+
+**Ranking, while the list was ours anyway.** The old popup was a flat match, so typing
+"flour" offered "Besan flour" before "Flour (Plain)". Prefix matches now lead, the rest
+follow alphabetically, and the panel caps at eight and says how many it is holding back
+rather than silently truncating a 443-entry master list.
+
+**Seven boxes was the wrong unit of work, and "is this consistent?" is what exposed it.**
+The change as first written replaced every `<datalist>` and stopped. But Chrome for Android
+draws its *autofill* suggestions with the **same Android view** it uses for datalist
+suggestions — so the popup that painted itself over the Wait List was still one keystroke
+away on the other twenty-one text boxes in the app. The fix looked complete because the unit
+had been chosen as "places that use the broken feature" rather than "places that can summon
+the broken widget". `el()` now sets `autocomplete="off"` on every text-like input it builds;
+it is a genuine chokepoint, because the only inputs that skip it are two `type=file` pickers.
+Worth generalising: when a fix is scoped to the call sites of an API, check whether the
+failure actually belongs to the API or to something underneath it that other call sites can
+reach by another route.
+
+The `<select>` popups were checked and deliberately left: Android renders those as a modal
+dialog, a different widget, and `color-scheme: light` now governs them.
+
+**What the release review found, and why it matters more than the fix.** Two defects that
+each re-created the reported symptom, and the reviewer's summary of why the tests missed
+them is the part worth keeping: *every new assertion was either about `suggestionMatches` — a
+pure ranking function that was never the bug — or a source regex asserting that a particular
+line exists. Not one asked where the panel ends up.* The browser suite measured background
+colour, opacity and hit-testing at the instant the panel opened, on a desktop-shaped viewport
+with no keyboard and no reflow: the one geometry in which the panel is always right. The
+claim being made was "the family can read and tap these on a phone" and the evidence offered
+was "the CSS says `background:#fff`".
+
+The two defects are now invariants in `CLAUDE.md` — the panel must track its box every frame,
+and available room is a visual-viewport question. Three smaller ones came with them: a box
+emptied by `addStaple`/`addTerm` kept a stale panel that refilled it on the next tap; the
+panel printed; the "…and N more" line was itself clipped by the max-height it was explaining.
+This is the second consecutive release where the separate pass found something real, and the
+second where method 1 — follow the data, don't re-read the documentation — is what found it.
+The evidence-bearing field here was the box's bounding rect, and the question that did the
+work was "who refreshes it, and is that all of them".
+
+**One thing the review could not settle, and neither can this entry.** The diagnosis — Chrome
+drawing the popup with no background of its own — was never confirmed on the device. The
+reviewer offered Chrome for Android's Auto Dark Theme as at least as good a fit. The
+screenshot argues against it: the page renders light, and Auto Dark Theme would have inverted
+it. But `color-scheme: light` is now declared regardless, and if that turns out to have been
+the actual fix, the entry to correct is this one. Note it is a user-visible change in its own
+right: anyone who had been reading the app under Chrome's auto-dark now gets it bright white.
+Drawing the panel ourselves is right either way, which is why the uncertainty did not hold
+the release.
+
+---
+
 ## Safety: recoverable beats confirmed
 
 **A dialog is not a safety mechanism.** v19.0 removed a bulk ingredient delete that had one.
