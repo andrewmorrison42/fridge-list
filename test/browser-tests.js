@@ -1703,6 +1703,67 @@ async function suiteCountedUnitReadsAsEach(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+/* v24.1 — no box anywhere in the app invites the browser to draw a list.
+
+   Chrome for Android draws its AUTOFILL suggestions with the same Android view it used for
+   <datalist>: the one that painted itself over the Wait List with no background. Taking the
+   datalist off seven boxes and stopping there would have left that popup reachable from
+   every other text box in the app — the reported bug, one tab across.
+
+   This walks the real DOM on every tab rather than grepping the source, because the claim
+   is about what a phone can be made to do, not about what a line of code says. */
+async function suiteNoBrowserSuggestionsAnywhere(browser) {
+  group('v24.1 — no text box anywhere asks the browser for suggestions');
+  const srv = await serve(8193);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  const audit = (where) => page.evaluate((w) => {
+    const kinds = ['text', 'search', 'number', 'tel', 'email', 'url'];
+    const boxes = [...document.querySelectorAll('input')].filter(i => kinds.includes(i.type));
+    const bad = [];
+    boxes.forEach(i => {
+      const id = w + ': "' + (i.placeholder || i.className || i.type) + '"';
+      if (i.getAttribute('autocomplete') !== 'off') bad.push(id + ' allows autofill');
+      if (i.hasAttribute('list')) bad.push(id + ' has list=');
+    });
+    return { seen: boxes.length, lists: document.querySelectorAll('datalist').length, bad };
+  }, where);
+  try {
+    await page.goto('http://localhost:8193/', { waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+
+    let total = 0, listsAnywhere = 0;
+    for (const tab of ['recipes', 'start', 'review', 'needed', 'menu', 'settings']) {
+      await page.click('#mainNav button[data-tab="' + tab + '"]');
+      await page.waitForTimeout(500);
+      const r = await audit(tab);
+      total += r.seen; listsAnywhere += r.lists;
+      ok(tab + ' tab: every text box refuses browser suggestions', r.bad.length === 0, r.bad);
+    }
+
+    // The recipe editor holds two of the seven and only exists inside a modal.
+    await page.evaluate(async () => {
+      document.querySelector('#mainNav button[data-tab="recipes"]').click();
+      await new Promise(r => setTimeout(r, 700));
+      const add = [...document.querySelectorAll('button')]
+        .find(b => /add recipe|new recipe/i.test(b.textContent));
+      if (add) add.click();
+      await new Promise(r => setTimeout(r, 600));
+    });
+    const modal = await audit('recipe editor');
+    ok('the recipe editor opened', modal.seen > 3, modal);
+    ok('recipe editor: every box refuses browser suggestions', modal.bad.length === 0, modal.bad);
+    total += modal.seen; listsAnywhere += modal.lists;
+
+    /* A sweep that matched nothing would pass. CLAUDE.md records a test that did exactly
+       that, so say how many boxes were actually looked at. */
+    ok('and that was a real sweep, not an empty one', total > 20, total);
+    ok('no <datalist> exists anywhere in the rendered app', listsAnywhere === 0, listsAnywhere);
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 /* v24.1 — the suggestion panel belongs to the app, and it is opaque.
 
    The reported bug: on Android, Chrome draws the <datalist> popup as an Android view over
@@ -2020,7 +2081,7 @@ async function suiteSuggestionsAreDrawnByTheApp(browser) {
                          suiteClearedWeekStaysCleared,
                          suitePruningSurvivesAddingARecipe,
                          suiteIngredientUnits, suiteCountedUnitReadsAsEach,
-                         suiteSuggestionsAreDrawnByTheApp,
+                         suiteSuggestionsAreDrawnByTheApp, suiteNoBrowserSuggestionsAnywhere,
                          suiteUnsyncedPhoneSaysSo,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }

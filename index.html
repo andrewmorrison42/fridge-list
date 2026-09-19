@@ -4050,6 +4050,17 @@ function rerenderPreservingScroll(){
   requestAnimationFrame(()=>window.scrollTo(0, y));
 }
 
+/* v24.1: Chrome for Android draws its AUTOFILL suggestions with the same Android view it
+   used for <datalist> — the one that painted itself over the Wait List with no background.
+   Taking the datalist off seven boxes removed seven ways to summon that popup and left the
+   autofill one on every text box in the app, which is a patch rather than a fix. Nothing
+   here wants a browser-remembered value: there is no login, no address and no payment field
+   anywhere in it, and the only completion worth having is the panel the app draws itself.
+   Applied in el() rather than at thirty call sites, because the lesson this codebase keeps
+   relearning is that a rule nobody can forget beats a rule everybody has to remember. An
+   explicit autocomplete in attrs still wins. */
+const AUTOFILLABLE_INPUT = /^(text|search|number|tel|email|url)$/;
+
 function el(tag, attrs, children){
   const e = document.createElement(tag);
   if(attrs) Object.entries(attrs).forEach(([k,v])=>{
@@ -4058,6 +4069,8 @@ function el(tag, attrs, children){
     else if(k.startsWith('on')) e.addEventListener(k.slice(2), v);
     else e.setAttribute(k, v);
   });
+  if(tag === 'input' && AUTOFILLABLE_INPUT.test(e.type) && !e.hasAttribute('autocomplete'))
+    e.setAttribute('autocomplete', 'off');
   (children||[]).forEach(c=>{ if(c) e.appendChild(typeof c==='string'?document.createTextNode(c):c); });
   return e;
 }

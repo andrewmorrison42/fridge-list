@@ -641,6 +641,21 @@ its stated intent, and the intent had not noticed it was talking to itself.
 follow alphabetically, and the panel caps at eight and says how many it is holding back
 rather than silently truncating a 443-entry master list.
 
+**Seven boxes was the wrong unit of work, and "is this consistent?" is what exposed it.**
+The change as first written replaced every `<datalist>` and stopped. But Chrome for Android
+draws its *autofill* suggestions with the **same Android view** it uses for datalist
+suggestions — so the popup that painted itself over the Wait List was still one keystroke
+away on the other twenty-one text boxes in the app. The fix looked complete because the unit
+had been chosen as "places that use the broken feature" rather than "places that can summon
+the broken widget". `el()` now sets `autocomplete="off"` on every text-like input it builds;
+it is a genuine chokepoint, because the only inputs that skip it are two `type=file` pickers.
+Worth generalising: when a fix is scoped to the call sites of an API, check whether the
+failure actually belongs to the API or to something underneath it that other call sites can
+reach by another route.
+
+The `<select>` popups were checked and deliberately left: Android renders those as a modal
+dialog, a different widget, and `color-scheme: light` now governs them.
+
 **What the release review found, and why it matters more than the fix.** Two defects that
 each re-created the reported symptom, and the reviewer's summary of why the tests missed
 them is the part worth keeping: *every new assertion was either about `suggestionMatches` — a

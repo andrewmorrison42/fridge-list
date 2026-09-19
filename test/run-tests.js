@@ -2493,6 +2493,13 @@ group('v24.1 — nothing is left for a browser to draw');
 
   // Lookbehind so the declaration is not counted as one of its own call sites — the
   // same shape as the generateShoppingList() count above.
+  /* Removing the datalist closed seven ways to summon Chrome for Android's popup and left
+     the AUTOFILL one — the same Android view — on every other text box in the app. One rule
+     in el(), because thirty call sites that must remember is how this came back. */
+  ok('every text-like box refuses browser suggestions, decided in one place',
+     /tag === 'input' && AUTOFILLABLE_INPUT\.test\(e\.type\) && !e\.hasAttribute\('autocomplete'\)/
+       .test(fnSource('el')));
+
   const wired = html.match(/(?<!function )attachSuggestions\(\w+, \w+\)/g) || [];
   ok('all seven boxes that had one are wired to the app’s own panel',
      wired.length === 7, wired);

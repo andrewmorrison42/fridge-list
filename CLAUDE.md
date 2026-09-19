@@ -58,6 +58,18 @@ Consequences:
 
 Each of these has a bug behind it.
 
+**No box in this app asks a browser to draw it a list — and `<datalist>` was only half of
+that.** Chrome for Android draws its AUTOFILL suggestions with the same Android view it used
+for `<datalist>`, so removing the datalist from seven boxes closed seven ways to summon that
+popup and left the autofill one on the other twenty-one — the reported bug, one tab across.
+`el()` sets `autocomplete="off"` on every text-like input it builds, which is every one in
+the app: the only two raw `createElement('input')` calls are file pickers. Nothing here wants
+a browser-remembered value — no login, no address, no payment field — and the only completion
+worth having is the panel the app draws itself. Decided in `el()` rather than at thirty call
+sites, and a browser suite walks every tab asserting no box forgot, because a rule nobody can
+forget beats a rule everybody has to remember. An explicit `autocomplete` in `attrs` still
+wins. *(v24.1)*
+
 **A suggestion list is the app's to draw, and `<datalist>` is never the answer.** That popup
 belongs to the browser, and Chrome for Android draws it as an Android view over the page with
 no background of its own: five ingredient names painted straight onto the Wait List

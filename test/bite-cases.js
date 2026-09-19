@@ -140,6 +140,12 @@ module.exports = [
     replace: "      b.addEventListener('click', ()=> choose(name));"
   },
   {
+    name: 'text boxes go back to inviting Chrome\u2019s autofill popup \u2014 the same ' +
+          'Android view the datalist used, so the bug returns one tab across',
+    find: "  if(tag === 'input' && AUTOFILLABLE_INPUT.test(e.type) && !e.hasAttribute('autocomplete'))\n    e.setAttribute('autocomplete', 'off');\n",
+    replace: ''
+  },
+  {
     name: 'the room on screen is measured with innerHeight again, so with a keyboard up ' +
           'the panel renders entirely behind it',
     find: '  const viewBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;',
