@@ -101,5 +101,54 @@ module.exports = [
           'that LOST supersedes its own dead trip',
     find: '  const rival = replacement.rival;',
     replace: '  const rival = true;'
+  },
+  /* ---- v24.1: the app draws its own suggestion list ---- */
+  {
+    name: 'the suggestion panel goes back to being the browser’s to draw, so Chrome ' +
+          'for Android paints it over the page with no background',
+    find: "  const ingInput = el('input',{type:'text', placeholder:'type an ingredient, press Add', autocomplete:'off', style:'min-width:180px;'});",
+    replace: "  const ingInput = el('input',{type:'text', placeholder:'type an ingredient, press Add', list:'finder-ingredient-suggestions', autocomplete:'off', style:'min-width:180px;'});"
+  },
+  {
+    name: 'the Wait List box loses its panel and goes back to a datalist, which is the ' +
+          'reported bug exactly',
+    find: '  attachSuggestions(input, knownIngredientNames);\n',
+    replace: "  input.setAttribute('list', 'fridge-ingredient-suggestions');\n"
+  },
+  {
+    name: 'suggestions are ranked alphabetically again, so typing "flour" buries ' +
+          '"Flour (Plain)" under "Besan flour"',
+    find: '  const all = starts.sort(cmp).concat(contains.sort(cmp));',
+    replace: '  const all = starts.concat(contains).sort(cmp);'
+  },
+  {
+    name: 'picking a suggestion stops looking like typing, so the unit no longer fills ' +
+          'in from the master list',
+    find: "    input.dispatchEvent(new Event('input', { bubbles:true }));\n",
+    replace: ''
+  },
+  {
+    name: 'Enter always takes a suggestion, so nothing the master list has never heard ' +
+          'of can be added to the Wait List',
+    find: 'suggestOpen.input === input && suggestOpen.active >= 0){',
+    replace: 'suggestOpen.input === input){'
+  },
+  {
+    name: 'a suggestion is taken on click, so the box loses focus first and the panel ' +
+          'closes from under the finger',
+    find: "      b.addEventListener('pointerdown', (e)=>{ e.preventDefault(); choose(name); });",
+    replace: "      b.addEventListener('click', ()=> choose(name));"
+  },
+  {
+    name: 'picking a suggestion redraws on its own event, so the panel reopens straight ' +
+          'over the box it has just filled in',
+    find: "  input.addEventListener('input', ()=>{ if(!echoing) draw(); });",
+    replace: "  input.addEventListener('input', draw);"
+  },
+  {
+    name: 'a tab rebuild leaves the panel behind, anchored to an input that no longer ' +
+          'exists',
+    find: '  // The panel is anchored to an input in the tab that is about to be destroyed.\n  closeSuggestions();\n',
+    replace: ''
   }
 ];

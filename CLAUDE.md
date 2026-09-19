@@ -58,6 +58,25 @@ Consequences:
 
 Each of these has a bug behind it.
 
+**A suggestion list is the app's to draw, and `<datalist>` is never the answer.** That popup
+belongs to the browser, and Chrome for Android draws it as an Android view over the page with
+no background of its own: five ingredient names painted straight onto the Wait List
+underneath, both unreadable, and the family stopped using the box. No stylesheet here reaches
+it. iOS Safari never showed the fault because Safari draws no panel at all — it puts the
+suggestions in the keyboard strip — so half the household had a working feature and half did
+not, and the report that came back was "it works on my phone". `attachSuggestions` is the one
+way these boxes get a list; all seven go through it and a source test counts them, so a new
+box added with `list:` fails the suite rather than shipping the bug again. Four things it does
+that look incidental and are not. It takes a suggestion on `pointerdown` with the default
+prevented: a `click` arrives after the box has lost focus, by which time `focusout` has closed
+the panel, and the list is untappable on the one platform this is all for. It fires `input`
+and `change` so `wireUnitControls` still fills the unit in from the master list — and ignores
+its own echo, or the panel reopens over the box it has just filled. It leaves Enter alone
+until somebody has arrowed onto a row, because the Wait List exists to write down things the
+master list has never heard of. And `render()` and `closeModal()` close it, because it is
+anchored to an input they are about to destroy — an orphaned panel is the v21.0 detached-row
+bug in a different coat. *(v24.1)*
+
 **A Wait List `done` set in the aisle is a TICK, and carries `doneTripId`.** `done` was one
 flag doing two jobs with different lifetimes: `syncNeededFromLine` writes it when somebody
 ticks a line in a shop ("it is in the trolley on this trip"), and the Wait List tab writes

@@ -589,6 +589,60 @@ the family stops reporting it.
 
 ---
 
+### v24.1 — the popup the page did not own
+
+Reported from an Android phone: typing into the Wait List box painted the matching
+ingredients on top of the list underneath, both see-through, unusable. Reported alongside
+"it does not happen on Safari", which is the detail that made it look like a Chrome bug to
+work around and was in fact the whole diagnosis.
+
+Nothing in the page was drawing it. These boxes were `<input list=…>` + `<datalist>`, and a
+datalist popup is the **browser's** to draw — on Android an Android view composited over the
+web contents, outside anything a stylesheet can address. The app's own part was correct
+throughout: the five names offered were exactly the five master ingredients matching
+"flour". Every check that could be made from the page came back clean — no rule targeting
+`option` or `datalist`, no ancestor of the input creating a compositing or stacking context,
+the repaint guards holding.
+
+**Safari was not a control, and reading it as one cost the first half of the diagnosis.**
+iOS Safari does not render a datalist panel at all; it surfaces the suggestions in the
+keyboard accessory strip. So "works in Safari" never meant "Safari renders the same thing
+correctly" — it meant Safari renders something else. Two phones in one household disagreed
+about whether a feature worked, and both were right. Worth remembering the next time a
+platform difference looks like one platform being broken: check that both are drawing the
+same thing before treating either as the baseline.
+
+**What was rejected.** Styling the popup — impossible, it is not in the page. Declaring
+`color-scheme` and hoping — kept, because a page with a hardcoded light palette should say
+so and it is the only lever left over the native `<select>` popups the app still uses, but
+it was never going to be the fix here; the phone was in light mode. Fixing only the Wait
+List box — rejected: the same defect sat on all seven boxes, including both of the recipe
+editor's, and leaving six of them would have meant two suggestion mechanisms in a codebase
+whose whole argument is that one collection gets one rule.
+
+**What replaced it.** `attachSuggestions()`: one function, seven call sites, a panel this
+stylesheet owns. The input element and how every caller reads `.value` back are unchanged,
+which is what kept the diff to the boxes themselves. It is positioned `fixed` off `<body>`
+rather than absolutely inside a wrapper, because each of the seven lives in a differently
+laid-out flex row and wrapping them would have meant seven layout changes to fix a
+rendering bug.
+
+**The bug the browser suite caught and review would not have.** `choose()` fires `input`
+and `change` so that everything already listening to these boxes — `wireUnitControls` fills
+the recipe line's unit in from the master list — carries on unchanged. But `attachSuggestions`
+is itself one of those listeners, so picking a suggestion redrew the panel straight over the
+box it had just filled in. The logic suite could not see it; the source assertions could not
+see it; it took an assertion about what was on screen after a tap. This is method 1 of "How
+to review this codebase" arriving from the other direction: the code faithfully implemented
+its stated intent, and the intent had not noticed it was talking to itself.
+
+**Ranking, while the list was ours anyway.** The old popup was a flat match, so typing
+"flour" offered "Besan flour" before "Flour (Plain)". Prefix matches now lead, the rest
+follow alphabetically, and the panel caps at eight and says how many it is holding back
+rather than silently truncating a 443-entry master list.
+
+---
+
 ## Safety: recoverable beats confirmed
 
 **A dialog is not a safety mechanism.** v19.0 removed a bulk ingredient delete that had one.

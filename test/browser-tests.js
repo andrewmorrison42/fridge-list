@@ -1703,6 +1703,162 @@ async function suiteCountedUnitReadsAsEach(browser) {
   } finally { await ctx.close(); await srv.close(); }
 }
 
+/* v24.1 — the suggestion panel belongs to the app, and it is opaque.
+
+   The reported bug: on Android, Chrome draws the <datalist> popup as an Android view over
+   the page, and drew it with no background of its own. The five matching ingredients and
+   the Wait List underneath were painted on top of each other and the tab stopped being
+   usable. No stylesheet reaches that popup, and iOS Safari never showed the fault at all
+   because Safari puts those suggestions in the keyboard strip instead — so half the
+   household had a working feature and half did not, and both were right.
+
+   Nothing about it was visible to a logic test: the right five names were being offered
+   the whole time. This is the suite that looks at what is actually on the glass — is there
+   a panel, is it ours, is it opaque, and is it the thing your finger lands on. */
+async function suiteSuggestionsAreDrawnByTheApp(browser) {
+  group('v24.1 — the suggestion panel is the app’s, and it covers what is under it');
+  const srv = await serve(8192);
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errs = []; watchErrors(page, errs);
+  const box = '#app input[type=text]';
+  const panels = () => page.evaluate(() => document.querySelectorAll('.suggest-panel').length);
+  try {
+    await page.goto('http://localhost:8192/', { waitUntil: 'domcontentloaded' });
+    await waitForApp(page);
+    await page.click('#mainNav button[data-tab="needed"]');
+    await page.waitForTimeout(400);
+
+    /* --- the panel is in the page, and it is ours --- */
+    await page.click(box);
+    await page.keyboard.type('flour');
+    await page.waitForSelector('.suggest-panel', { timeout: 5000 });
+
+    const shown = await page.evaluate(() =>
+      [...document.querySelectorAll('.suggest-panel .suggest-item')].map(b => b.textContent.trim()));
+    ok('the app offers the master-list matches itself', shown.length === 5, shown);
+    ok('and the ones you typed the start of lead',
+       shown.slice(0, 2).join('|') === 'Flour (Plain)|Flour (Self Raising)', shown);
+
+    /* The bug, stated as a test. Any alpha below 1 is the fault — and so is a panel that
+       is not actually the thing at those coordinates, which is what "see-through" meant
+       for the person trying to tap it. */
+    const paint = await page.evaluate(() => {
+      const p = document.querySelector('.suggest-panel');
+      const item = p.querySelector('.suggest-item');
+      const r = item.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return {
+        panelBg: getComputedStyle(p).backgroundColor,
+        itemBg: getComputedStyle(item).backgroundColor,
+        opacity: getComputedStyle(p).opacity,
+        hitIsOurs: !!hit && !!hit.closest('.suggest-panel'),
+        hitWas: hit ? hit.className || hit.tagName : null
+      };
+    });
+    // rgb(...) has no alpha; rgba(...) must carry a 1. "transparent" arrives as rgba(0,0,0,0).
+    const opaque = c => {
+      const m = /^rgba?\(([^)]+)\)$/.exec(c || '');
+      if (!m) return false;
+      const parts = m[1].split(',').map(s => parseFloat(s));
+      return parts.length < 4 || parts[3] === 1;
+    };
+    ok('the panel has a solid background', opaque(paint.panelBg), paint);
+    ok('and so does every row', opaque(paint.itemBg), paint);
+    ok('nothing is faded by opacity', paint.opacity === '1', paint);
+    ok('tapping where a suggestion is drawn hits the suggestion, not the page beneath',
+       paint.hitIsOurs, paint);
+
+    /* --- tapping one fills the box --- */
+    const target = page.locator('.suggest-panel .suggest-item', { hasText: 'Rice flour' });
+    ok('the suggestion is really there to tap', await target.count() === 1);
+    await target.click();
+    await page.waitForTimeout(300);
+    ok('tapping it fills the box',
+       await page.evaluate(() => document.querySelector('#app input[type=text]').value) === 'Rice flour');
+    ok('and closes the panel', await panels() === 0);
+
+    ok('and it goes on the Wait List like anything else',
+       await clickButtonByText(page, 'Add to wait list')
+       && (await readShopping(page)).neededList.some(n => n.text === 'Rice flour'));
+
+    /* --- Enter still belongs to the box until somebody arrows onto a row ---
+       The Wait List exists so that a thing the master list has never heard of can be
+       written down. Taking Enter for the panel would quietly make that impossible. */
+    await page.click(box);
+    await page.keyboard.type('flour');
+    await page.waitForSelector('.suggest-panel');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(600);
+    const texts = (await readShopping(page)).neededList.map(n => n.text);
+    ok('Enter with nothing highlighted adds exactly what was typed',
+       texts.indexOf('flour') >= 0 && texts.indexOf('Flour (Plain)') < 0, texts);
+
+    await page.click(box);
+    await page.keyboard.type('flour');
+    await page.waitForSelector('.suggest-panel');
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(300);
+    ok('but arrowing onto a row and pressing Enter takes the row',
+       await page.evaluate(() => document.querySelector('#app input[type=text]').value) === 'Flour (Plain)');
+    ok('and that does not also add it', await panels() === 0
+       && !(await readShopping(page)).neededList.some(n => n.text === 'Flour (Plain)'));
+
+    /* --- a rebuilt tab does not leave a panel floating over the new one ---
+       Clicked from inside the page rather than with the mouse on purpose: a real tap would
+       be caught by the dismiss-on-tap-outside handler, and what needs proving here is that
+       render() itself takes the panel down. That is the v21.0 detached-closure shape of
+       bug — something left on screen wired to a tab that no longer exists. */
+    // The box still holds the name the arrow keys took above; start from empty.
+    await page.fill(box, '');
+    await page.click(box);
+    await page.keyboard.type('flour');
+    await page.waitForSelector('.suggest-panel');
+    await page.evaluate(() => document.querySelector('#mainNav button[data-tab="settings"]').click());
+    await page.waitForTimeout(500);
+    ok('a tab rebuild takes the panel with it', await panels() === 0);
+
+    /* --- picking a suggestion is indistinguishable from typing it ---
+       wireUnitControls fills the recipe line's unit in from the master list off the input
+       event. If tapping a suggestion does not fire one, the unit silently stops arriving. */
+    const counted = await page.evaluate(() =>
+      (JSON.parse(localStorage.getItem('fma_recipes_v4')).ingredients
+        .find(i => i.shoppingUnit === 'qty') || {}).name);
+    ok('the seed has a counted ingredient to test with', !!counted, counted);
+
+    await page.evaluate(async () => {
+      document.querySelector('#mainNav button[data-tab="recipes"]').click();
+      await new Promise(r => setTimeout(r, 800));
+      const add = [...document.querySelectorAll('button')]
+        .find(b => /add recipe|new recipe/i.test(b.textContent));
+      if (add) add.click();
+      await new Promise(r => setTimeout(r, 600));
+    });
+    const nameBox = page.locator('.ing-name-input').first();
+    ok('the recipe editor opened', await nameBox.count() === 1);
+    await nameBox.click();
+    await page.keyboard.type(counted.slice(0, 6));
+    await page.waitForSelector('.suggest-panel', { timeout: 5000 });
+    const exact = page.locator('.suggest-panel .suggest-item')
+      .filter({ hasText: new RegExp('^' + counted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$') });
+    ok('the counted ingredient is offered in the editor too', await exact.count() === 1, counted);
+    await exact.click();
+    await page.waitForTimeout(400);
+    const filled = await page.evaluate(() => {
+      const n = document.querySelector('.ing-name-input');
+      const row = n.closest('.ingredient-editor-row') || n.parentElement;
+      const u = row.querySelector('.unit-input');
+      return { name: n.value, unit: u ? u.value : null, truth: u ? (u.dataset.unit || null) : null };
+    });
+    ok('tapping a suggestion fills the name in', filled.name === counted, filled);
+    ok('and the unit still arrives with it, as it does when you type',
+       filled.unit === 'each' && filled.truth === 'qty', filled);
+
+    ok('no console errors', errs.length === 0, errs);
+  } finally { await ctx.close(); await srv.close(); }
+}
+
 (async () => {
   console.log('Chromium: ' + EXECUTABLE);
   const browser = await chromium.launch({ executablePath: EXECUTABLE, args: ['--no-sandbox'] });
@@ -1718,6 +1874,7 @@ async function suiteCountedUnitReadsAsEach(browser) {
                          suiteClearedWeekStaysCleared,
                          suitePruningSurvivesAddingARecipe,
                          suiteIngredientUnits, suiteCountedUnitReadsAsEach,
+                         suiteSuggestionsAreDrawnByTheApp,
                          suiteUnsyncedPhoneSaysSo,
                          suitePrinting, suiteOfflineAndSession]) {
       try { await suite(browser); }
