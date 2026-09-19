@@ -140,6 +140,35 @@ module.exports = [
     replace: "      b.addEventListener('click', ()=> choose(name));"
   },
   {
+    name: 'the room on screen is measured with innerHeight again, so with a keyboard up ' +
+          'the panel renders entirely behind it',
+    find: '  const viewBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;',
+    replace: '  const viewBottom = window.innerHeight;'
+  },
+  {
+    name: 'the panel stops tracking the box, so the sync banner appearing above it leaves ' +
+          'the panel sitting on top of what somebody is typing into',
+    find: '    if(fresh) suggestFrame = requestAnimationFrame(suggestTrack);\n',
+    replace: ''
+  },
+  {
+    name: 'a box emptied by addStaple() keeps its panel, so tapping a row refills it with ' +
+          'the staple just added',
+    find: '  if(input.value !== suggestOpen.query){ closeSuggestions(); return; }\n',
+    replace: ''
+  },
+  {
+    name: 'an open suggestion panel prints on the shopping list',
+    find: "class:'suggest-panel no-print'",
+    replace: "class:'suggest-panel'"
+  },
+  {
+    name: 'a box with no matches tears down whatever panel happens to be open, including ' +
+          'another box\u2019s',
+    find: '    if(!found.items.length){ if(mine) closeSuggestions(); return; }',
+    replace: '    if(!found.items.length){ closeSuggestions(); return; }'
+  },
+  {
     name: 'picking a suggestion redraws on its own event, so the panel reopens straight ' +
           'over the box it has just filled in',
     find: "  input.addEventListener('input', ()=>{ if(!echoing) draw(); });",

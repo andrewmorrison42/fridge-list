@@ -641,6 +641,35 @@ its stated intent, and the intent had not noticed it was talking to itself.
 follow alphabetically, and the panel caps at eight and says how many it is holding back
 rather than silently truncating a 443-entry master list.
 
+**What the release review found, and why it matters more than the fix.** Two defects that
+each re-created the reported symptom, and the reviewer's summary of why the tests missed
+them is the part worth keeping: *every new assertion was either about `suggestionMatches` — a
+pure ranking function that was never the bug — or a source regex asserting that a particular
+line exists. Not one asked where the panel ends up.* The browser suite measured background
+colour, opacity and hit-testing at the instant the panel opened, on a desktop-shaped viewport
+with no keyboard and no reflow: the one geometry in which the panel is always right. The
+claim being made was "the family can read and tap these on a phone" and the evidence offered
+was "the CSS says `background:#fff`".
+
+The two defects are now invariants in `CLAUDE.md` — the panel must track its box every frame,
+and available room is a visual-viewport question. Three smaller ones came with them: a box
+emptied by `addStaple`/`addTerm` kept a stale panel that refilled it on the next tap; the
+panel printed; the "…and N more" line was itself clipped by the max-height it was explaining.
+This is the second consecutive release where the separate pass found something real, and the
+second where method 1 — follow the data, don't re-read the documentation — is what found it.
+The evidence-bearing field here was the box's bounding rect, and the question that did the
+work was "who refreshes it, and is that all of them".
+
+**One thing the review could not settle, and neither can this entry.** The diagnosis — Chrome
+drawing the popup with no background of its own — was never confirmed on the device. The
+reviewer offered Chrome for Android's Auto Dark Theme as at least as good a fit. The
+screenshot argues against it: the page renders light, and Auto Dark Theme would have inverted
+it. But `color-scheme: light` is now declared regardless, and if that turns out to have been
+the actual fix, the entry to correct is this one. Note it is a user-visible change in its own
+right: anyone who had been reading the app under Chrome's auto-dark now gets it bright white.
+Drawing the panel ourselves is right either way, which is why the uncertainty did not hold
+the release.
+
 ---
 
 ## Safety: recoverable beats confirmed

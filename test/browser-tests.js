@@ -1819,6 +1819,116 @@ async function suiteSuggestionsAreDrawnByTheApp(browser) {
     await page.waitForTimeout(500);
     ok('a tab rebuild takes the panel with it', await panels() === 0);
 
+    /* --- a box cleared by something other than typing does not keep its panel ---
+       addStaple() and addTerm() both empty the box and refocus it without re-rendering.
+       The panel left behind is about a query that no longer exists, and tapping one of its
+       rows refills the box with the thing you have just added. */
+    await page.waitForTimeout(300);
+    const stapleBox = 'input[placeholder="ingredient name…"]';
+    ok('the staples box is there', await page.locator(stapleBox).count() === 1);
+    await page.click(stapleBox);
+    await page.keyboard.type('flour');
+    await page.waitForSelector('.suggest-panel', { timeout: 5000 });
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(400);
+    ok('adding a staple closes the panel that was open over it', await panels() === 0);
+    ok('and the staple was really added',
+       await page.evaluate(() => (JSON.parse(localStorage.getItem('fma_recipes_v4'))
+         .settings.staples || []).some(s => /^flour$/i.test(s))));
+
+    /* --- the panel follows the box when something ABOVE it changes the layout ---
+       The sync banner is rendered above #app on a 60s timer and after every write, and a
+       long status line wraps inside the sticky header. Neither fires scroll or resize, and
+       a repaint cannot rescue it either: safeToRepaint() deliberately refuses while a box
+       is focused, which is exactly when a panel is open. Pinned to stale coordinates, the
+       box slides down UNDERNEATH the panel and a tap where somebody is typing lands on a
+       suggestion — the reported symptom, recreated by the fix for it. */
+    await page.click('#mainNav button[data-tab="needed"]');
+    await page.waitForTimeout(400);
+    await page.fill(box, '');
+    await page.click(box);
+    await page.keyboard.type('flour');
+    await page.waitForSelector('.suggest-panel');
+    const moved = await page.evaluate(async () => {
+      const inp = document.querySelector('#app input[type=text]');
+      const app = document.getElementById('app');
+      const was = { box: inp.getBoundingClientRect().top,
+                    panel: document.querySelector('.suggest-panel').getBoundingClientRect().top };
+      const shim = document.createElement('div');
+      shim.style.cssText = 'height:150px;';
+      app.parentNode.insertBefore(shim, app);
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+      const p = document.querySelector('.suggest-panel');
+      if (!p) { shim.remove(); return { gone: true }; }
+      const br = inp.getBoundingClientRect(), pr = p.getBoundingClientRect();
+      const over = document.elementFromPoint(br.left + br.width / 2, br.top + br.height / 2);
+      const out = {
+        boxMovedBy: br.top - was.box,
+        panelMovedBy: pr.top - was.panel,
+        panelCoversTheBox: pr.top < br.bottom,
+        overTheBox: over ? (over.className || over.tagName) : null
+      };
+      shim.remove();
+      return out;
+    });
+    ok('the layout change really did move the box', moved.boxMovedBy >= 140, moved);
+    ok('and the panel moved with it', Math.abs(moved.panelMovedBy - moved.boxMovedBy) <= 2, moved);
+    ok('so it never ends up on top of the box being typed into', !moved.panelCoversTheBox, moved);
+    ok('and a tap where the box is drawn still reaches the box',
+       moved.overTheBox === 'INPUT', moved);
+
+    /* --- it says what it is, and says what it is holding back --- */
+    await page.fill(box, '');
+    await page.click(box);
+    await page.keyboard.type('a');
+    await page.waitForSelector('.suggest-panel');
+    const aria = await page.evaluate(() => {
+      const inp = document.querySelector('#app input[type=text]');
+      const p = document.querySelector('.suggest-panel');
+      const first = p.querySelector('.suggest-item');
+      const more = p.querySelector('.suggest-more');
+      const pr = p.getBoundingClientRect();
+      const mr = more ? more.getBoundingClientRect() : null;
+      return {
+        role: inp.getAttribute('role'), expanded: inp.getAttribute('aria-expanded'),
+        controls: inp.getAttribute('aria-controls'), panelId: p.id,
+        listbox: p.getAttribute('role'), option: first.getAttribute('role'),
+        optionId: !!first.id, tab: first.getAttribute('tabindex'),
+        rows: p.querySelectorAll('.suggest-item').length,
+        hasMore: !!more,
+        moreText: more ? more.textContent : null,
+        // Sticky: the panel is capped to the room on screen, so the line saying how much is
+        // hidden must not be the thing scrolled out of sight.
+        moreIsVisible: !!mr && mr.bottom <= pr.bottom + 1 && mr.top >= pr.top
+      };
+    });
+    ok('the box announces itself as a combobox', aria.role === 'combobox', aria);
+    ok('and says the list is open', aria.expanded === 'true', aria);
+    ok('and points at it', !!aria.controls && aria.controls === aria.panelId, aria);
+    ok('the panel is a listbox of options', aria.listbox === 'listbox' && aria.option === 'option', aria);
+    ok('each row can be named to a screen reader', aria.optionId, aria);
+    ok('but no row is a tab stop — the box keeps the focus', aria.tab === '-1', aria);
+    ok('a query with more matches than fit is capped', aria.rows === 8, aria);
+    ok('and says how many it is holding back', aria.hasMore && /more/.test(aria.moreText), aria);
+    ok('where that line can actually be seen', aria.moreIsVisible, aria);
+
+    const arrowed = await page.evaluate(() => {
+      const inp = document.querySelector('#app input[type=text]');
+      inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      const id = inp.getAttribute('aria-activedescendant');
+      const row = id ? document.getElementById(id) : null;
+      return { id, selected: row ? row.getAttribute('aria-selected') : null };
+    });
+    ok('arrowing onto a row names it to a screen reader',
+       !!arrowed.id && arrowed.selected === 'true', arrowed);
+
+    /* An open panel is not part of the shopping list. Reachable through the browser's own
+       print command — the app's own buttons dismiss it with a tap first. */
+    await page.emulateMedia({ media: 'print' });
+    ok('an open panel does not print',
+       await page.evaluate(() => getComputedStyle(document.querySelector('.suggest-panel')).display) === 'none');
+    await page.emulateMedia({ media: null });
+
     /* --- picking a suggestion is indistinguishable from typing it ---
        wireUnitControls fills the recipe line's unit in from the master list off the input
        event. If tapping a suggestion does not fire one, the unit silently stops arriving. */
@@ -1854,6 +1964,42 @@ async function suiteSuggestionsAreDrawnByTheApp(browser) {
     ok('tapping a suggestion fills the name in', filled.name === counted, filled);
     ok('and the unit still arrives with it, as it does when you type',
        filled.unit === 'each' && filled.truth === 'qty', filled);
+
+    /* --- with little room below, the panel goes above the box rather than off-screen ---
+       The case the software keyboard creates. Measuring the available room with
+       innerHeight said there were 315px below a box that had a keyboard over it, so the
+       flip branch could never fire and the panel rendered entirely behind the keyboard —
+       on iOS, where the layout viewport does not shrink and no resize event is sent. */
+    // The recipe editor above is still open, and its backdrop swallows nav clicks.
+    await page.evaluate(() => {
+      const c = [...document.querySelectorAll('#modalRoot button')]
+        .find(b => b.textContent.trim() === 'Cancel');
+      if (c) c.click();
+    });
+    await page.waitForTimeout(400);
+    await page.click('#mainNav button[data-tab="needed"]');
+    await page.waitForTimeout(300);
+    await page.setViewportSize({ width: 412, height: 420 });
+    await page.waitForTimeout(200);
+    await page.evaluate(() => document.querySelector('#app input[type=text]')
+      .scrollIntoView({ block: 'end' }));
+    await page.waitForTimeout(200);
+    await page.fill(box, '');
+    await page.click(box);
+    await page.keyboard.type('flour');
+    await page.waitForSelector('.suggest-panel');
+    await page.waitForTimeout(200);
+    const tight = await page.evaluate(() => {
+      const inp = document.querySelector('#app input[type=text]');
+      const p = document.querySelector('.suggest-panel');
+      const br = inp.getBoundingClientRect(), pr = p.getBoundingClientRect();
+      return { boxBottom: br.bottom, boxTop: br.top, panelTop: pr.top, panelBottom: pr.bottom,
+               vh: window.innerHeight, flipped: p.style.bottom !== '' };
+    });
+    ok('with no room below, the panel goes above the box', tight.flipped, tight);
+    ok('and sits entirely on screen', tight.panelTop >= 0 && tight.panelBottom <= tight.vh + 1, tight);
+    ok('without covering the box', tight.panelBottom <= tight.boxTop + 1, tight);
+    await page.setViewportSize({ width: 1280, height: 800 });
 
     ok('no console errors', errs.length === 0, errs);
   } finally { await ctx.close(); await srv.close(); }

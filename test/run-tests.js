@@ -2520,6 +2520,35 @@ group('v24.1 — nothing is left for a browser to draw');
   ok('picking a suggestion does not redraw the panel on its own event',
      /if\(!echoing\) draw\(\)/.test(attach));
 
+  /* All five below were found by the release review, not by the suite that shipped with
+     the first cut of this change. Every assertion it had was either about suggestionMatches
+     — a pure ranking function that was never the bug — or a regex asserting some line
+     exists. None of them asked where the panel ENDS UP, which is the only thing the family
+     experiences. The browser suite asks now; these hold the shape in place. */
+  const repos = fnSource('suggestReposition');
+  /* Two viewports, and conflating them is how the panel ends up behind the keyboard. A
+     fixed element is POSITIONED against the layout viewport, but the room actually on
+     screen is the VISUAL one — and iOS Safari shrinks only the second, and fires no resize
+     when the keyboard opens. Measured: 315px of "room" below a box with a keyboard over it. */
+  ok('the room on screen is measured against the visual viewport, not the layout one',
+     /vv \? vv\.offsetTop \+ vv\.height : window\.innerHeight/.test(repos)
+     && /const below = viewBottom - r\.bottom/.test(repos));
+  /* Nothing fires scroll or resize when the sync banner appears above #app or a status line
+     wraps in the sticky header, and no repaint rescues it either — safeToRepaint() refuses
+     while a box is focused, which is exactly when a panel is open. Left pinned, the box
+     slides down UNDER the panel and a tap where somebody is typing hits a suggestion. */
+  ok('the panel is re-measured every frame while it is open',
+     /suggestFrame = requestAnimationFrame\(suggestTrack\)/.test(fnSource('suggestTrack')));
+  ok('and opening one starts that loop',
+     /if\(fresh\) suggestFrame = requestAnimationFrame\(suggestTrack\)/.test(attach));
+  /* addStaple() and addTerm() empty the box and refocus without re-rendering. Checked in
+     one place rather than at those two call sites, so the next one need not remember. */
+  ok('a box cleared by something other than typing loses its panel',
+     /input\.value !== suggestOpen\.query/.test(repos));
+  ok('an open panel is not printed', /class:'suggest-panel no-print'/.test(attach));
+  ok('and a box with no matches closes only its own panel',
+     /if\(!found\.items\.length\)\{ if\(mine\) closeSuggestions\(\); return; \}/.test(attach));
+
   /* An orphaned panel anchored to an input that no longer exists is the same shape of
      bug as the detached row closures of v21.0 — render() rebuilds the tab from scratch. */
   ok('a tab rebuild takes the panel with it', /closeSuggestions\(\)/.test(fnSource('render')));

@@ -77,6 +77,23 @@ master list has never heard of. And `render()` and `closeModal()` close it, beca
 anchored to an input they are about to destroy — an orphaned panel is the v21.0 detached-row
 bug in a different coat. *(v24.1)*
 
+**A panel pinned to coordinates is a panel in the wrong place, and there are two viewports.**
+Both halves were wrong in the first cut of v24.1 and the release review caught both. The
+panel is `position:fixed` at a rect measured from its box, and plenty moves that box without
+firing scroll or resize: `renderSyncAlert` draws above `#app` on a 60s timer and after every
+write, a long `setStatus` line wraps inside the sticky header, a finder chip lands in the
+input's own row. Nothing rescues it either — `safeToRepaint()` refuses while a box is
+focused, which is exactly when a panel is open — so the box slides down UNDERNEATH the panel
+and a tap where somebody is typing lands on a suggestion. That is the reported bug recreated
+by the fix for it. `suggestTrack` re-measures every frame while open, and does nothing unless
+something moved. Separately: a fixed element is POSITIONED against the layout viewport, but
+the room actually on screen is the VISUAL one. iOS Safari does not shrink the layout viewport
+for the keyboard and fires no resize, so `innerHeight` reported 315px of space below a box
+with a keyboard over it, the flip-above branch could never fire, and the panel rendered
+entirely behind the keyboard — on the half of the household that had a working feature
+before. Measure room with `visualViewport`; keep `innerHeight` for the `bottom` coordinate
+itself. *(v24.1)*
+
 **A Wait List `done` set in the aisle is a TICK, and carries `doneTripId`.** `done` was one
 flag doing two jobs with different lifetimes: `syncNeededFromLine` writes it when somebody
 ticks a line in a shop ("it is in the trolley on this trip"), and the Wait List tab writes

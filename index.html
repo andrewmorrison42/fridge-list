@@ -109,8 +109,8 @@ textarea{width:100%;resize:vertical;}
 .suggest-item{display:block;width:100%;text-align:left;background:#fff;border:none;
   padding:11px 13px;font-size:.95rem;color:var(--ink);cursor:pointer;line-height:1.25;}
 .suggest-item:hover,.suggest-item.active{background:var(--chip);color:var(--accent-dark);}
-.suggest-more{padding:7px 13px;font-size:.74rem;color:var(--muted);font-style:italic;
-  border-top:1px solid var(--border);background:#fff;}
+.suggest-more{position:sticky;bottom:0;padding:7px 13px;font-size:.74rem;color:var(--muted);
+  font-style:italic;border-top:1px solid var(--border);background:#fff;}
 .tag{display:inline-block;background:var(--chip);color:var(--accent-dark);font-size:.72rem;padding:2px 8px;border-radius:20px;margin-right:4px;}
 .section-title{font-size:1rem;font-weight:700;margin:0 0 10px;color:var(--accent-dark);}
 .recipe-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px;}
@@ -4106,13 +4106,38 @@ function suggestionMatches(names, query, limit){
    and wrapping each one to get a positioning context would have meant seven layout
    changes to fix a rendering bug. */
 let suggestOpen = null;
+let suggestSeq = 0;
+
+let suggestFrame = 0;
 
 function closeSuggestions(){
   if(!suggestOpen) return;
+  const input = suggestOpen.input;
   if(suggestOpen.panel.parentNode) suggestOpen.panel.parentNode.removeChild(suggestOpen.panel);
-  window.removeEventListener('scroll', suggestReposition, true);
-  window.removeEventListener('resize', suggestReposition);
+  if(suggestFrame) cancelAnimationFrame(suggestFrame);
+  suggestFrame = 0;
   suggestOpen = null;
+  input.setAttribute('aria-expanded', 'false');
+  input.removeAttribute('aria-activedescendant');
+}
+
+/* Re-measure every frame while a panel is open.
+
+   It is fixed at coordinates taken from the box once, and plenty moves the box
+   without firing scroll or resize — the sync banner appearing above #app (a 60s timer, and
+   every write), a long status line wrapping in the sticky header, a chip landing in the
+   finder's own row. Measured, a stale panel does not merely look wrong: the box slides down
+   underneath it, so a tap where somebody is typing lands on a suggestion instead. That is
+   the reported symptom recreated by the fix for it.
+
+   A frame loop rather than a ResizeObserver because it cannot miss a cause, and it runs
+   only while a panel is open — seconds at a time, and it does no work at all unless
+   something actually moved. */
+function suggestTrack(){
+  suggestFrame = 0;
+  if(!suggestOpen) return;
+  suggestReposition();
+  if(suggestOpen) suggestFrame = requestAnimationFrame(suggestTrack);
 }
 
 function suggestReposition(){
@@ -4121,19 +4146,39 @@ function suggestReposition(){
   // The tab was rebuilt under it. A panel anchored to an element that is gone is the
   // orphan this whole change is about; never leave one on screen.
   if(!input.isConnected){ closeSuggestions(); return; }
+  /* The box was emptied or rewritten by something that is not typing: addStaple() and
+     addTerm() both clear it and refocus without re-rendering, and the panel left behind
+     is about a query that no longer exists — tapping one of its rows refills the box with
+     the thing you just added. Checked here rather than fixed at those two call sites, so
+     the next place that clears a box does not have to remember. */
+  if(input.value !== suggestOpen.query){ closeSuggestions(); return; }
+
   const r = input.getBoundingClientRect();
-  // innerHeight, not visualViewport: position:fixed resolves against the layout viewport,
-  // so measuring against the visual one puts the panel in the wrong place with a keyboard up.
-  const vh = window.innerHeight;
-  const below = vh - r.bottom - 8, above = r.top - 8;
-  // With a keyboard up there can be nothing below the box at all. Flip rather than
-  // render a two-pixel sliver off the bottom of the screen.
+  /* Two different viewports, and conflating them is how the panel ends up behind the
+     keyboard. A fixed element is POSITIONED against the layout viewport, so `top`/`bottom`
+     below are in those coordinates — but the room actually on screen is the VISUAL
+     viewport, and iOS Safari does not shrink the layout viewport for the keyboard or fire
+     resize when it opens. Measuring the space with innerHeight told the panel there were
+     315px below a box that had 21px of keyboard over it. */
+  const vv = window.visualViewport;
+  const viewTop = vv ? vv.offsetTop : 0;
+  const viewBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
+  const below = viewBottom - r.bottom - 8, above = r.top - viewTop - 8;
+  // With a keyboard up there can be nothing below the box at all. Flip rather than render
+  // a sliver underneath it.
   const flip = below < 140 && above > below;
+  const room = Math.max(96, Math.floor(flip ? above : below));
+
+  // Nothing moved: don't touch the style and don't invalidate layout sixty times a second.
+  const at = [r.top, r.left, r.width, room, flip].join(',');
+  if(at === suggestOpen.at) return;
+  suggestOpen.at = at;
+
   const panel = suggestOpen.panel;
-  panel.style.maxHeight = Math.max(96, Math.floor(flip ? above : below)) + 'px';
+  panel.style.maxHeight = room + 'px';
   panel.style.width = Math.round(r.width) + 'px';
   panel.style.left = Math.round(Math.max(4, Math.min(r.left, window.innerWidth - r.width - 4))) + 'px';
-  if(flip){ panel.style.top = ''; panel.style.bottom = Math.round(vh - r.top + 4) + 'px'; }
+  if(flip){ panel.style.top = ''; panel.style.bottom = Math.round(window.innerHeight - r.top + 4) + 'px'; }
   else    { panel.style.bottom = ''; panel.style.top = Math.round(r.bottom + 4) + 'px'; }
 }
 
@@ -4150,6 +4195,11 @@ document.addEventListener('pointerdown', (e)=>{
    registered — Enter is handed on or intercepted by listener order. */
 function attachSuggestions(input, names){
   const namesOf = typeof names === 'function' ? names : (()=> names);
+  /* <datalist> was announced natively ("N suggestions available"); a div full of buttons is
+     not, unless it says what it is. */
+  input.setAttribute('role', 'combobox');
+  input.setAttribute('aria-autocomplete', 'list');
+  input.setAttribute('aria-expanded', 'false');
 
   /* Picking has to look like typing to everything downstream — but this function is one
      of the things listening, and redrawing on its own event reopens the panel straight
@@ -4171,28 +4221,37 @@ function attachSuggestions(input, names){
 
   function draw(){
     const found = suggestionMatches(namesOf(), input.value, SUGGEST_LIMIT);
-    if(!found.items.length){ closeSuggestions(); return; }
-    if(suggestOpen && suggestOpen.input !== input) closeSuggestions();
+    const mine = !!suggestOpen && suggestOpen.input === input;
+    // A box with no matches closes ITS OWN panel and nobody else's.
+    if(!found.items.length){ if(mine) closeSuggestions(); return; }
+    if(suggestOpen && !mine) closeSuggestions();
     const fresh = !suggestOpen;
-    const panel = fresh ? el('div',{class:'suggest-panel', role:'listbox'}) : suggestOpen.panel;
+    const panel = fresh
+      ? el('div',{class:'suggest-panel no-print', role:'listbox', id:'suggest-' + (++suggestSeq)})
+      : suggestOpen.panel;
     panel.innerHTML = '';
-    found.items.forEach(name=>{
-      const b = el('button',{class:'suggest-item', type:'button', role:'option'},[String(name)]);
+    found.items.forEach((name, i)=>{
+      const b = el('button',{class:'suggest-item', type:'button', role:'option',
+                             id: panel.id + '-' + i, 'aria-selected':'false',
+                             // An option is not a tab stop; the box keeps the focus throughout.
+                             tabindex:'-1'},[String(name)]);
       /* pointerdown, not click, and the default prevented: a click fires after the box
          has already lost focus, and the focusout below would have closed the panel from
          under the finger. That is the classic way a suggestion list becomes untappable. */
       b.addEventListener('pointerdown', (e)=>{ e.preventDefault(); choose(name); });
       panel.appendChild(b);
     });
+    /* Sticky, not merely last: max-height is whatever the screen allows, so with a keyboard
+       up the line saying how much is hidden was itself the thing scrolled out of sight. */
     if(found.more) panel.appendChild(el('div',{class:'suggest-more'},
       ['…and ' + found.more + ' more — keep typing']));
-    if(fresh){
-      document.body.appendChild(panel);
-      window.addEventListener('scroll', suggestReposition, true);
-      window.addEventListener('resize', suggestReposition);
-    }
-    suggestOpen = { panel, input, items: found.items, active: -1 };
+    if(fresh) document.body.appendChild(panel);
+    suggestOpen = { panel, input, items: found.items, active: -1, query: input.value, at: null };
+    input.setAttribute('aria-expanded', 'true');
+    input.setAttribute('aria-controls', panel.id);
+    input.removeAttribute('aria-activedescendant');
     suggestReposition();
+    if(fresh) suggestFrame = requestAnimationFrame(suggestTrack);
   }
 
   function highlight(delta){
@@ -4200,8 +4259,13 @@ function attachSuggestions(input, names){
     const n = suggestOpen.items.length;
     let a = suggestOpen.active + delta;
     suggestOpen.active = a < 0 ? n - 1 : (a >= n ? 0 : a);
-    Array.prototype.forEach.call(suggestOpen.panel.querySelectorAll('.suggest-item'),
-      (b,i)=> b.classList.toggle('active', i === suggestOpen.active));
+    Array.prototype.forEach.call(suggestOpen.panel.querySelectorAll('.suggest-item'), (b,i)=>{
+      const on = i === suggestOpen.active;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-selected', on ? 'true' : 'false');
+      // A screen reader follows the box's focus, so the moved row has to be named from here.
+      if(on) input.setAttribute('aria-activedescendant', b.id);
+    });
     return true;
   }
 
